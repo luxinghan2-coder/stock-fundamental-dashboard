@@ -6,7 +6,6 @@ import yfinance as yf
 
 
 def clean_number(value):
-    """安全转换为数字。"""
     try:
         if value is None:
             return None
@@ -26,7 +25,6 @@ def clean_number(value):
 
 
 def safe_div(a, b):
-    """安全除法。"""
     a = clean_number(a)
     b = clean_number(b)
 
@@ -35,58 +33,99 @@ def safe_div(a, b):
 
     result = a / b
 
-    if not math.isfinite(result):
-        return None
-
-    return result
+    return result if math.isfinite(result) else None
 
 
 def normalize_symbol(symbol):
-    """标准化股票代码。"""
     symbol = str(symbol or "").strip().upper()
 
-    # 常见 A 股代码
+    # A股
     if symbol.isdigit():
         if len(symbol) == 6:
-            return symbol + ".SS" if symbol.startswith(("6", "9")) else symbol + ".SZ"
+            if symbol.startswith(("6", "9")):
+                return symbol + ".SS"
+            return symbol + ".SZ"
 
-    # 港股
-    if symbol.isdigit() and len(symbol) <= 5:
-        return symbol.zfill(4) + ".HK"
+        # 港股
+        if len(symbol) <= 5:
+            return symbol.zfill(4) + ".HK"
 
     return symbol
 
 
-def get_row(df, names):
-    """从财务报表中寻找指定项目。"""
+def find_row(df, names):
     if df is None or df.empty:
         return None
 
     for name in names:
         if name in df.index:
-            try:
-                row = df.loc[name]
-                return row
-            except Exception:
-                pass
+            return df.loc[name]
 
     return None
 
 
+def get_latest_value(row):
+    if row is None:
+        return None
+
+    try:
+        values = row.dropna()
+
+        if len(values) == 0:
+            return None
+
+        return clean_number(values.iloc[0])
+
+    except Exception:
+        return None
+
+
+def get_latest_price(ticker):
+    """
+    不使用 ticker.info。
+    直接从 history 获取最新价格。
+    """
+
+    try:
+        history = ticker.history(
+            period="5d",
+            auto_adjust=False
+        )
+
+        if history is None or history.empty:
+            return None
+
+        close = history["Close"].dropna()
+
+        if close.empty:
+            return None
+
+        return clean_number(close.iloc[-1])
+
+    except Exception:
+        return None
+
+
+def get_price_history(ticker):
+    try:
+        history = ticker.history(
+            period="1y",
+            auto_adjust=False
+        )
+
+        if history is None or history.empty:
+            return None
+
+        return history
+
+    except Exception:
+        return None
+
+
 def calculate_dividend_yield(ticker, price):
     """
-    使用最近12个月实际分红记录计算 TTM 股息率。
-
-    公式：
-
-    TTM股息率 =
-    最近12个月实际每股分红合计
-    ÷ 当前股价
-    × 100
-
-    注意：
-    不使用 Yahoo 的 dividendYield 字段，
-    避免出现 32% 这类单位错误。
+    使用最近12个月实际现金分红计算股息率。
+    不使用 ticker.info。
     """
 
     price = clean_number(price)
@@ -97,361 +136,338 @@ def calculate_dividend_yield(ticker, price):
     try:
         dividends = ticker.dividends
 
-        if dividends is None:
-            return None
-
-        if dividends.empty:
+        if dividends is None or dividends.empty:
             return None
 
         dividends = dividends.dropna()
 
-        if len(dividends) == 0:
+        if dividends.empty:
             return None
 
-        try:
-            dividends.index = pd.to_datetime(dividends.index)
-        except Exception:
-            return None
+        dividends.index = pd.to_datetime(
+            dividends.index
+        )
 
         latest_date = dividends.index.max()
 
-        if pd.isna(latest_date):
-            return None
-
-        one_year_ago = latest_date - pd.Timedelta(days=365)
-
-        recent_dividends = dividends[
-            dividends.index > one_year_ago
-        ]
-
-        if recent_dividends.empty:
-            return None
-
-        ttm_dividend = clean_number(
-            recent_dividends.sum()
+        start_date = (
+            latest_date -
+            pd.Timedelta(days=365)
         )
 
-        if ttm_dividend is None:
+        recent = dividends[
+            dividends.index > start_date
+        ]
+
+        if recent.empty:
             return None
 
-        if ttm_dividend < 0:
+        annual_dividend = clean_number(
+            recent.sum()
+        )
+
+        if annual_dividend is None:
             return None
 
-        dividend_yield = (
-            ttm_dividend / price
-        ) * 100
-
-        if not math.isfinite(dividend_yield):
-            return None
-
-        return dividend_yield
+        return (
+            annual_dividend /
+            price *
+            100
+        )
 
     except Exception:
         return None
 
 
-def build_current_metrics(ticker):
+def get_income_statement(ticker):
     """
-    获取当前股票基本面数据。
+    独立获取年度利润表。
     """
 
     try:
-        info = ticker.info or {}
+        data = ticker.get_income_stmt(
+            freq="yearly"
+        )
+
+        if data is None or data.empty:
+            return None
+
+        return data
+
     except Exception:
-        info = {}
-
-    # 当前价格
-    price = clean_number(
-        info.get("currentPrice")
-    )
-
-    if price is None:
-        price = clean_number(
-            info.get("regularMarketPrice")
-        )
-
-    # 公司信息
-    company = (
-        info.get("longName")
-        or info.get("shortName")
-        or ticker.ticker
-    )
-
-    exchange = (
-        info.get("exchange")
-        or info.get("fullExchangeName")
-    )
-
-    currency = (
-        info.get("currency")
-        or ""
-    )
-
-    # 市值
-    market_cap = clean_number(
-        info.get("marketCap")
-    )
-
-    # PE
-    pe = clean_number(
-        info.get("trailingPE")
-    )
-
-    if pe is None:
-        pe = clean_number(
-            info.get("forwardPE")
-        )
-
-    # PB
-    pb = clean_number(
-        info.get("priceToBook")
-    )
-
-    # ROE
-    roe_raw = clean_number(
-        info.get("returnOnEquity")
-    )
-
-    roe = None
-
-    if roe_raw is not None:
-        roe = roe_raw * 100
-
-    # ROE / PB
-    roe_pb = safe_div(
-        roe,
-        pb
-    )
-
-    # PE / ROE
-    pe_roe = safe_div(
-        pe,
-        roe
-    )
-
-    # 营收
-    revenue = clean_number(
-        info.get("totalRevenue")
-    )
-
-    # 净利润
-    net_income = clean_number(
-        info.get("netIncomeToCommon")
-    )
-
-    if net_income is None:
-        net_income = clean_number(
-            info.get("netIncome")
-        )
-
-    # 毛利率
-    gross_margin_raw = clean_number(
-        info.get("grossMargins")
-    )
-
-    gross_margin = None
-
-    if gross_margin_raw is not None:
-        gross_margin = gross_margin_raw * 100
-
-    # 自由现金流
-    free_cash_flow = clean_number(
-        info.get("freeCashflow")
-    )
-
-    # 负债率
-    debt_ratio = None
-
-    total_debt = clean_number(
-        info.get("totalDebt")
-    )
-
-    total_assets = clean_number(
-        info.get("totalAssets")
-    )
-
-    if (
-        total_debt is not None
-        and total_assets is not None
-        and total_assets != 0
-    ):
-        debt_ratio = (
-            total_debt / total_assets
-        ) * 100
-
-    # 股息率
-    # 只使用实际分红记录计算
-    dividend_yield = calculate_dividend_yield(
-        ticker,
-        price
-    )
-
-    return {
-        "price": price,
-        "market_cap": market_cap,
-        "valuation": {
-            "pe": pe,
-            "pb": pb,
-            "roe": roe,
-            "roe_pb": roe_pb,
-            "pe_roe": pe_roe
-        },
-        "fundamentals": {
-            "revenue": revenue,
-            "net_income": net_income,
-            "gross_margin": gross_margin,
-            "free_cash_flow": free_cash_flow,
-            "dividend_yield": dividend_yield,
-            "debt_ratio": debt_ratio
-        },
-        "company": company,
-        "exchange": exchange,
-        "currency": currency
-    }
+        return None
 
 
-def empty_roe_result():
-    """没有足够历史数据时返回标准空结构。"""
-
-    return {
-        "years": [],
-        "stats": {
-            "count": 0,
-            "average": None,
-            "median": None,
-            "std_dev": None,
-            "range": None,
-            "max": None,
-            "min": None
-        },
-        "definition": (
-            "ROE = 年度净利润 / "
-            "((期初股东权益 + 期末股东权益) / 2)"
-        ),
-        "std_definition": "15年有效年度ROE的样本标准差"
-    }
-
-
-def build_roe_history(ticker):
+def get_balance_sheet(ticker):
     """
-    根据年度财务报表计算历史 ROE。
+    独立获取年度资产负债表。
+    """
 
-    ROE =
-    年度净利润
-    ÷
+    try:
+        data = ticker.get_balance_sheet(
+            freq="yearly"
+        )
+
+        if data is None or data.empty:
+            return None
+
+        return data
+
+    except Exception:
+        return None
+
+
+def get_cashflow(ticker):
+    """
+    独立获取年度现金流量表。
+    """
+
+    try:
+        data = ticker.get_cash_flow(
+            freq="yearly"
+        )
+
+        if data is None or data.empty:
+            return None
+
+        return data
+
+    except Exception:
+        return None
+
+
+def get_latest_financial_value(df, names):
+    row = find_row(df, names)
+    return get_latest_value(row)
+
+
+def calculate_current_roe(
+    income,
+    balance
+):
+    """
+    当前年度 ROE：
+
+    净利润 /
     ((期初股东权益 + 期末股东权益) / 2)
-
-    最多返回最近15个有效年度。
     """
-
-    try:
-        income = ticker.income_stmt
-    except Exception:
-        income = None
-
-    try:
-        balance = ticker.balance_sheet
-    except Exception:
-        balance = None
 
     if income is None or balance is None:
-        return empty_roe_result()
+        return None
 
-    if income.empty or balance.empty:
-        return empty_roe_result()
-
-    # 净利润
-    net_income_row = get_row(
+    net_income_row = find_row(
         income,
         [
             "Net Income",
-            "NetIncome",
-            "Net Income Common Stockholders"
+            "Net Income Common Stockholders",
+            "NetIncome"
         ]
     )
 
-    # 股东权益
-    equity_row = get_row(
+    equity_row = find_row(
         balance,
         [
             "Stockholders Equity",
-            "StockholdersEquity",
             "Common Stock Equity",
             "Total Equity Gross Minority Interest"
         ]
     )
 
-    if net_income_row is None or equity_row is None:
-        return empty_roe_result()
+    if net_income_row is None:
+        return None
+
+    if equity_row is None:
+        return None
 
     try:
-        dates = list(income.columns)
+        income_dates = sorted(
+            list(income.columns),
+            key=lambda x: pd.Timestamp(x)
+        )
+
+        balance_dates = sorted(
+            list(balance.columns),
+            key=lambda x: pd.Timestamp(x)
+        )
+
+        if not income_dates:
+            return None
+
+        latest_income_date = income_dates[-1]
+
+        net_income = clean_number(
+            net_income_row.get(
+                latest_income_date
+            )
+        )
+
+        if net_income is None:
+            return None
+
+        # 找对应的期末权益
+        matching_dates = [
+            d for d in balance_dates
+            if pd.Timestamp(d) <=
+            pd.Timestamp(latest_income_date)
+        ]
+
+        if not matching_dates:
+            return None
+
+        end_date = matching_dates[-1]
+
+        end_index = balance_dates.index(
+            end_date
+        )
+
+        if end_index == 0:
+            return None
+
+        begin_date = balance_dates[
+            end_index - 1
+        ]
+
+        equity_end = clean_number(
+            equity_row.get(end_date)
+        )
+
+        equity_begin = clean_number(
+            equity_row.get(begin_date)
+        )
+
+        if equity_end is None or equity_begin is None:
+            return None
+
+        average_equity = (
+            equity_begin +
+            equity_end
+        ) / 2
+
+        if average_equity == 0:
+            return None
+
+        return (
+            net_income /
+            average_equity *
+            100
+        )
+
     except Exception:
-        return empty_roe_result()
+        return None
 
-    records = []
 
-    # 按日期排序
+def calculate_roe_history(
+    income,
+    balance
+):
+    """
+    计算最近15个有效年度 ROE。
+    """
+
+    if income is None or balance is None:
+        return {
+            "years": [],
+            "stats": empty_stats()
+        }
+
+    net_income_row = find_row(
+        income,
+        [
+            "Net Income",
+            "Net Income Common Stockholders",
+            "NetIncome"
+        ]
+    )
+
+    equity_row = find_row(
+        balance,
+        [
+            "Stockholders Equity",
+            "Common Stock Equity",
+            "Total Equity Gross Minority Interest"
+        ]
+    )
+
+    if net_income_row is None:
+        return {
+            "years": [],
+            "stats": empty_stats()
+        }
+
+    if equity_row is None:
+        return {
+            "years": [],
+            "stats": empty_stats()
+        }
+
     try:
         dates = sorted(
-            dates,
+            list(income.columns),
             key=lambda x: pd.Timestamp(x)
         )
     except Exception:
-        pass
+        return {
+            "years": [],
+            "stats": empty_stats()
+        }
 
-    for current_date in dates:
+    records = []
+
+    for date in dates:
 
         try:
-            current_ts = pd.Timestamp(current_date)
-            year = current_ts.year
+            year = pd.Timestamp(date).year
         except Exception:
             continue
 
-        try:
-            net_income = clean_number(
-                net_income_row.get(current_date)
-            )
-        except Exception:
-            net_income = None
+        net_income = clean_number(
+            net_income_row.get(date)
+        )
 
         if net_income is None:
             continue
 
-        # 当前年度期末权益
-        try:
-            equity_end = clean_number(
-                equity_row.get(current_date)
-            )
-        except Exception:
-            equity_end = None
+        # 找当前年度对应的权益
+        balance_dates = sorted(
+            list(balance.columns),
+            key=lambda x: pd.Timestamp(x)
+        )
 
-        if equity_end is None:
-            continue
-
-        # 找前一个年度的权益
-        previous_dates = [
-            d for d in dates
-            if pd.Timestamp(d) < current_ts
+        matching = [
+            d for d in balance_dates
+            if pd.Timestamp(d) <=
+            pd.Timestamp(date)
         ]
 
-        if not previous_dates:
+        if not matching:
             continue
 
-        previous_date = previous_dates[-1]
+        end_date = matching[-1]
+        end_index = balance_dates.index(
+            end_date
+        )
 
-        try:
-            equity_begin = clean_number(
-                equity_row.get(previous_date)
-            )
-        except Exception:
-            equity_begin = None
+        if end_index == 0:
+            continue
 
-        if equity_begin is None:
+        begin_date = balance_dates[
+            end_index - 1
+        ]
+
+        equity_end = clean_number(
+            equity_row.get(end_date)
+        )
+
+        equity_begin = clean_number(
+            equity_row.get(begin_date)
+        )
+
+        if equity_end is None or equity_begin is None:
             continue
 
         average_equity = (
-            equity_begin + equity_end
+            equity_begin +
+            equity_end
         ) / 2
 
         if average_equity == 0:
@@ -459,8 +475,9 @@ def build_roe_history(ticker):
 
         roe = (
             net_income /
-            average_equity
-        ) * 100
+            average_equity *
+            100
+        )
 
         if not math.isfinite(roe):
             continue
@@ -475,107 +492,450 @@ def build_roe_history(ticker):
             }
         )
 
-    if not records:
-        return empty_roe_result()
-
-    # 最近15年
     records = records[-15:]
 
-    roe_values = [
+    values = [
         x["roe"]
         for x in records
-        if x.get("roe") is not None
     ]
 
-    if not roe_values:
-        return empty_roe_result()
+    if not values:
+        return {
+            "years": [],
+            "stats": empty_stats()
+        }
 
-    average_roe = sum(roe_values) / len(roe_values)
+    average = sum(values) / len(values)
 
-    median_roe = median(roe_values)
+    med = median(values)
 
-    if len(roe_values) >= 2:
-        std_dev = stdev(roe_values)
-    else:
-        std_dev = None
+    std = (
+        stdev(values)
+        if len(values) >= 2
+        else None
+    )
 
-    roe_max = max(roe_values)
-    roe_min = min(roe_values)
-    roe_range = roe_max - roe_min
+    maximum = max(values)
+    minimum = min(values)
 
     return {
         "years": records,
         "stats": {
-            "count": len(roe_values),
-            "average": average_roe,
-            "median": median_roe,
-            "std_dev": std_dev,
-            "range": roe_range,
-            "max": roe_max,
-            "min": roe_min
-        },
-        "definition": (
-            "ROE = 年度净利润 / "
-            "((期初股东权益 + 期末股东权益) / 2)"
-        ),
-        "std_definition": "15年有效年度ROE的样本标准差"
+            "count": len(values),
+            "average": average,
+            "median": med,
+            "std_dev": std,
+            "range": maximum - minimum,
+            "max": maximum,
+            "min": minimum
+        }
+    }
+
+
+def empty_stats():
+    return {
+        "count": 0,
+        "average": None,
+        "median": None,
+        "std_dev": None,
+        "range": None,
+        "max": None,
+        "min": None
     }
 
 
 def build_dashboard(symbol):
-    """
-    构建完整股票基本面驾驶舱数据。
-    """
 
-    original_symbol = str(symbol or "").strip()
+    original_symbol = str(
+        symbol or ""
+    ).strip()
 
     if not original_symbol:
-        raise ValueError("请输入股票代码")
+        raise ValueError(
+            "请输入股票代码"
+        )
 
-    normalized_symbol = normalize_symbol(
+    symbol = normalize_symbol(
         original_symbol
     )
 
+    ticker = yf.Ticker(symbol)
+
+    # =========================
+    # 1. 价格
+    # =========================
+
+    price = get_latest_price(
+        ticker
+    )
+
+    # =========================
+    # 2. 财务报表
+    # =========================
+
+    income = get_income_statement(
+        ticker
+    )
+
+    balance = get_balance_sheet(
+        ticker
+    )
+
+    cashflow = get_cashflow(
+        ticker
+    )
+
+    # =========================
+    # 3. 营收
+    # =========================
+
+    revenue = get_latest_financial_value(
+        income,
+        [
+            "Total Revenue",
+            "Operating Revenue"
+        ]
+    )
+
+    # =========================
+    # 4. 净利润
+    # =========================
+
+    net_income = get_latest_financial_value(
+        income,
+        [
+            "Net Income",
+            "Net Income Common Stockholders"
+        ]
+    )
+
+    # =========================
+    # 5. 毛利率
+    # =========================
+
+    gross_profit = get_latest_financial_value(
+        income,
+        [
+            "Gross Profit"
+        ]
+    )
+
+    gross_margin = None
+
+    if (
+        gross_profit is not None
+        and revenue is not None
+        and revenue != 0
+    ):
+        gross_margin = (
+            gross_profit /
+            revenue *
+            100
+        )
+
+    # =========================
+    # 6. 自由现金流
+    # =========================
+
+    operating_cashflow = get_latest_financial_value(
+        cashflow,
+        [
+            "Operating Cash Flow",
+            "Total Cash From Operating Activities"
+        ]
+    )
+
+    capex = get_latest_financial_value(
+        cashflow,
+        [
+            "Capital Expenditure",
+            "Capital Expenditure Reported"
+        ]
+    )
+
+    free_cash_flow = None
+
+    if (
+        operating_cashflow is not None
+        and capex is not None
+    ):
+        # Yahoo通常把资本开支记为负数
+        free_cash_flow = (
+            operating_cashflow +
+            capex
+        )
+
+    # =========================
+    # 7. 资产负债率
+    # =========================
+
+    total_assets = get_latest_financial_value(
+        balance,
+        [
+            "Total Assets"
+        ]
+    )
+
+    total_debt = get_latest_financial_value(
+        balance,
+        [
+            "Total Debt",
+            "Total Debt And Equity"
+        ]
+    )
+
+    debt_ratio = None
+
+    if (
+        total_debt is not None
+        and total_assets is not None
+        and total_assets != 0
+    ):
+        debt_ratio = (
+            total_debt /
+            total_assets *
+            100
+        )
+
+    # =========================
+    # 8. ROE
+    # =========================
+
+    roe = calculate_current_roe(
+        income,
+        balance
+    )
+
+    # =========================
+    # 9. PE / PB
+    # =========================
+
+    pe = None
+    pb = None
+
+    # 不依赖 ticker.info
+    # 使用市场价格 + 财务数据自行计算
+
+    if (
+        price is not None
+        and net_income is not None
+        and net_income != 0
+    ):
+        # 先尝试获取流通股本
+        try:
+            shares = ticker.get_shares_full(
+                start=pd.Timestamp.now() -
+                pd.Timedelta(days=30)
+            )
+
+            if shares is not None and not shares.empty:
+                shares = shares.dropna()
+
+                if not shares.empty:
+                    latest_shares = clean_number(
+                        shares.iloc[-1]
+                    )
+
+                    if (
+                        latest_shares is not None
+                        and latest_shares > 0
+                    ):
+                        market_cap = (
+                            price *
+                            latest_shares
+                        )
+
+                        pe = safe_div(
+                            market_cap,
+                            net_income
+                        )
+
+        except Exception:
+            pass
+
+    # =========================
+    # 10. PB
+    # =========================
+
+    equity = get_latest_financial_value(
+        balance,
+        [
+            "Stockholders Equity",
+            "Common Stock Equity"
+        ]
+    )
+
+    if (
+        equity is not None
+        and equity > 0
+        and price is not None
+    ):
+        try:
+            shares = ticker.get_shares_full(
+                start=pd.Timestamp.now() -
+                pd.Timedelta(days=30)
+            )
+
+            if shares is not None and not shares.empty:
+                shares = shares.dropna()
+
+                if not shares.empty:
+                    latest_shares = clean_number(
+                        shares.iloc[-1]
+                    )
+
+                    if (
+                        latest_shares is not None
+                        and latest_shares > 0
+                    ):
+                        market_cap = (
+                            price *
+                            latest_shares
+                        )
+
+                        pb = safe_div(
+                            market_cap,
+                            equity
+                        )
+
+        except Exception:
+            pass
+
+    # =========================
+    # 11. 股息率
+    # =========================
+
+    dividend_yield = calculate_dividend_yield(
+        ticker,
+        price
+    )
+
+    # =========================
+    # 12. 衍生指标
+    # =========================
+
+    roe_pb = safe_div(
+        roe,
+        pb
+    )
+
+    pe_roe = safe_div(
+        pe,
+        roe
+    )
+
+    # =========================
+    # 13. 15年ROE
+    # =========================
+
+    roe_history = calculate_roe_history(
+        income,
+        balance
+    )
+
+    # =========================
+    # 14. 公司名称
+    # =========================
+
+    company = symbol
+
     try:
-        ticker = yf.Ticker(
-            normalized_symbol
-        )
-    except Exception as exc:
-        raise ValueError(
-            f"无法创建股票对象：{exc}"
+        fast_info = ticker.fast_info
+
+        if fast_info is not None:
+            company = (
+                getattr(
+                    ticker,
+                    "ticker",
+                    None
+                )
+                or symbol
+            )
+
+    except Exception:
+        pass
+
+    # =========================
+    # 返回
+    # =========================
+
+    market_cap = None
+
+    try:
+        shares = ticker.get_shares_full(
+            start=pd.Timestamp.now() -
+            pd.Timedelta(days=30)
         )
 
-    current = build_current_metrics(
-        ticker
-    )
+        if shares is not None and not shares.empty:
+            shares = shares.dropna()
 
-    roe_history = build_roe_history(
-        ticker
-    )
+            if not shares.empty:
+                latest_shares = clean_number(
+                    shares.iloc[-1]
+                )
+
+                if (
+                    latest_shares is not None
+                    and price is not None
+                ):
+                    market_cap = (
+                        price *
+                        latest_shares
+                    )
+
+    except Exception:
+        pass
 
     return {
         "query": original_symbol,
-        "symbol": normalized_symbol,
-        "company": current["company"],
-        "exchange": current["exchange"],
-        "currency": current["currency"],
+        "symbol": symbol,
+        "company": company,
+        "exchange": None,
+        "currency": None,
 
-        "market": {
-            "price": current["price"],
-            "market_cap": current["market_cap"]
+        "market_data": {
+            "price": price,
+            "market_cap": market_cap
         },
 
-        "valuation": current["valuation"],
+        "valuation": {
+            "pe": pe,
+            "pb": pb,
+            "roe": roe,
+            "roe_pb": roe_pb,
+            "pe_roe": pe_roe
+        },
 
-        "fundamentals": current["fundamentals"],
+        "fundamentals": {
+            "revenue": revenue,
+            "net_income": net_income,
+            "gross_margin": gross_margin,
+            "free_cash_flow": free_cash_flow,
+            "dividend_yield": dividend_yield,
+            "debt_ratio": debt_ratio
+        },
 
-        "roe_15y": roe_history,
+        "roe_15y": {
+            "years": roe_history["years"],
+            "stats": roe_history["stats"],
+            "definition": (
+                "ROE = 年度净利润 / "
+                "((期初股东权益 + 期末股东权益) / 2)"
+            ),
+            "std_definition": (
+                "15年有效年度ROE的样本标准差"
+            )
+        },
 
         "source": {
-            "provider": "Yahoo Finance via yfinance",
+            "provider": (
+                "Yahoo Finance via yfinance"
+            ),
             "note": (
-                "V1原型；后续接入 Alpha Vantage / SEC "
-                "/ A股及港股专用数据源进行交叉校验"
+                "V1：价格、利润表、资产负债表、"
+                "现金流量表、分红分别取数；"
+                "不依赖 ticker.info"
             )
         }
-    }
+            }
