@@ -483,88 +483,13 @@ def resonance_levels(current, pivots, indicators):
     return out
 
 
-def _xma(series, n):
-    """TongdaXin XMA(X,N) compatible future-function implementation.
-
-    XMA is not a centered rolling mean with NaN at the tail. TongdaXin
-    places an N-period arithmetic mean at the middle/offset position and
-    fills the unavailable head/tail with progressively sized means. This
-    reproduces the published/reference Python implementation of XMA and,
-    importantly, makes historical values change when later bars arrive.
-    """
-    s = pd.to_numeric(series, errors="coerce").astype(float)
-    L = len(s)
-    if n <= 0 or L == 0:
-        return pd.Series(np.nan, index=s.index, dtype=float)
-    half = (n // 2) + (1 if n % 2 else 0)
-    if L < half:
-        return pd.Series(np.nan, index=s.index, dtype=float)
-
-    vals = s.to_numpy(dtype=float)
-    out = []
-
-    # Head: progressively sized averages.
-    for ilen in range(half, n):
-        out.append(np.nanmean(vals[:ilen]) if np.isfinite(vals[:ilen]).any() else np.nan)
-
-    # Body: the normal N-period MA, but assigned to the middle/offset bar.
-    if L >= n:
-        body = s.rolling(n, min_periods=n).mean().to_numpy()[n-1:]
-        out.extend(body.tolist())
-
-        # Tail: after the last full N-bar window, use shrinking windows.
-        for ilen in range(n-1, half-1, -1):
-            tail = vals[-ilen:]
-            out.append(np.nanmean(tail) if np.isfinite(tail).any() else np.nan)
-
-    arr = np.asarray(out, dtype=float)
-    if len(arr) != L:
-        # Defensive alignment; should not be reached for valid N/L.
-        arr = np.resize(arr, L)
-    return pd.Series(arr, index=s.index, dtype=float)
-
-
-def _cross_up(a, b):
-    """TongdaXin-style CROSS(a,b): a crosses from <= b to > b."""
-    return (a > b) & (a.shift(1) <= b.shift(1))
-
-
-def _xa_channel(history):
-    h=pd.to_numeric(history["High"], errors="coerce")
-    l=pd.to_numeric(history["Low"], errors="coerce")
-    c=pd.to_numeric(history["Close"], errors="coerce")
-    # Exact weighted formulas supplied by the user: REF(19) is intentionally
-    # absent and REF(20) carries weight 1, while the denominator remains 210.
-    w_hi=(20*h + 19*h.shift(1)+18*h.shift(2)+17*h.shift(3)+16*h.shift(4)+15*h.shift(5)+14*h.shift(6)+13*h.shift(7)+12*h.shift(8)+11*h.shift(9)+10*h.shift(10)+9*h.shift(11)+8*h.shift(12)+7*h.shift(13)+6*h.shift(14)+5*h.shift(15)+4*h.shift(16)+3*h.shift(17)+2*h.shift(18)+h.shift(20))/210.0
-    w_lo=(20*l + 19*l.shift(1)+18*l.shift(2)+17*l.shift(3)+16*l.shift(4)+15*l.shift(5)+14*l.shift(6)+13*l.shift(7)+12*l.shift(8)+11*l.shift(9)+10*l.shift(10)+9*l.shift(11)+8*l.shift(12)+7*l.shift(13)+6*l.shift(14)+5*l.shift(15)+4*l.shift(16)+3*l.shift(17)+2*l.shift(18)+l.shift(20))/210.0
-    xa3=w_hi.ewm(span=90, adjust=False).mean()
-    xa4=w_lo.ewm(span=90, adjust=False).mean()
-    xa7=xa3-xa4; xa8=xa3+xa7*2; xa9=xa4-xa7*2
-    xh=_xma(h,25); xl=_xma(l,25)
-    xh2=_xma(xh,25); xl2=_xma(xl,25)
-    rng=xh2-xl2
-    zk1=xh2+rng
-    zd1=xl2-rng
-    xa12=(zd1>=xa9) & (zk1>=xa8)
-    xa13=(zk1<=xa8) & (zd1<=xa9)
-    xa14=(zd1>=xa9) & (zk1<=xa8)
-    cross_low=_cross_up(zd1,l)
-    cross_high=_cross_up(h,zk1)
-    xa33=cross_low & xa12
-    xa34=cross_high & xa12 & (~xa14)
-    xa35=cross_high & xa13
-    xa36=cross_low & xa13 & (~xa14)
-    xa37=cross_low & xa14
-    xa38=cross_high & xa14
-    return {"zk1":zk1,"zd1":zd1,"xa12":xa12,"xa13":xa13,"xa14":xa14,
-            "signals": {"finger":xa36,"run":xa34,"smile":xa35,"cup":xa33 | xa37,
-                        "finger_raw":xa36,"run_raw":xa34,"smile_raw":xa35,"cup_raw":xa33|xa37,
-                        "all":xa33|xa34|xa35|xa36|xa37|xa38}}
-
-
 def technical_price_chart(history, fib):
-    """Build OHLC candles + Bollinger + user-supplied XA channel/signals."""
-    out={"available":False,"points":[],"bollinger_points":[],"xa_points":[],"signals":[],
+    """Build OHLC candles + Bollinger + pivot support/resistance lines.
+
+    MA values are deliberately NOT plotted on the K-line. They remain available
+    to the technical score and the MA cards below.
+    """
+    out={"available":False,"points":[],"bollinger_points":[],"signals":[],
          "current":None,"support":None,"resistance":None,"ma_points":[],"volume_max":None,"timeframe":"1D"}
     if history is None or getattr(history,"empty",True) or "Close" not in history:
         return out
@@ -576,33 +501,83 @@ def technical_price_chart(history, fib):
         if len(h)<40: return out
         for c in ("Open","High","Low"):
             if c not in h.columns: h[c]=h["Close"]
-        h["Open"]=h["Open"].fillna(h["Close"]); h["High"]=h["High"].fillna(h[["Open","Close"]].max(axis=1)); h["Low"]=h["Low"].fillna(h[["Open","Close"]].min(axis=1))
+        h["Open"]=h["Open"].fillna(h["Close"])
+        h["High"]=h["High"].fillna(h[["Open","Close"]].max(axis=1))
+        h["Low"]=h["Low"].fillna(h[["Open","Close"]].min(axis=1))
         if "Volume" not in h.columns: h["Volume"]=np.nan
-        close=h["Close"]; mid=close.rolling(20).mean(); sd=close.rolling(20).std(); upper,lower=mid+2*sd,mid-2*sd
-        xa=_xa_channel(h)
-        # Calculate on the full 2y history first, then show the latest 120 bars.
-        view=h.tail(180); idxset=set(view.index)
-        support=fib.get("nearest_support") if fib else None; resistance=fib.get("nearest_resistance") if fib else None
+        close=h["Close"]
+        mid=close.rolling(20).mean(); sd=close.rolling(20).std(); upper,lower=mid+2*sd,mid-2*sd
+        view=h.tail(180)
+        support=fib.get("nearest_support") if fib else None
+        resistance=fib.get("nearest_resistance") if fib else None
         out["points"]=[{"date":str(idx.date()),"open":finite(row["Open"]),"high":finite(row["High"]),"low":finite(row["Low"]),"close":finite(row["Close"]),"volume":finite(row["Volume"])} for idx,row in view.iterrows()]
         out["bollinger_points"]=[{"date":str(idx.date()),"upper":finite(upper.loc[idx]),"mid":finite(mid.loc[idx]),"lower":finite(lower.loc[idx])} for idx in view.index]
-        out["xa_points"]=[{"date":str(idx.date()),"zk1":finite(xa["zk1"].loc[idx]),"zd1":finite(xa["zd1"].loc[idx]),"state":"bull" if bool(xa["xa12"].loc[idx]) else ("bear" if bool(xa["xa13"].loc[idx]) else ("transition" if bool(xa["xa14"].loc[idx]) else "neutral"))} for idx in view.index]
-        icon_map=[("finger", "☝️", "支撑"),("run","🏃","压力"),("smile","🙂","牛市"),("cup","🥤","杯子")]
-        sigs=[]
-        for key,emoji,label in icon_map:
-            ser=xa["signals"][key]
-            for idx,val in ser.items():
-                if bool(val) and idx in idxset:
-                    price=float(h.loc[idx,"Low"] if key in ("finger","cup") else h.loc[idx,"High"])
-                    sigs.append({"date":str(idx.date()),"type":key,"emoji":emoji,"label":label,"price":price})
-        out["signals"]=sorted(sigs,key=lambda x:x["date"])
         vols=view["Volume"].dropna(); out["volume_max"]=float(vols.max()) if not vols.empty else None
         out["current"]=float(close.iloc[-1]); out["support"]=support; out["resistance"]=resistance; out["available"]=True
     except Exception:
         pass
     return out
 
-def technical_analysis(history):
-    out = {"score": None, "state": "暂无数据", "signals": [], "indicators": {}, "history": []}
+def _score_0_100(value, low, high):
+    v=finite(value)
+    if v is None or high == low:
+        return None
+    return max(0.0, min(100.0, (v-low)/(high-low)*100.0))
+
+
+def _distance_bonus(price, level, full_pct=5.0):
+    """100 near a support level; fades to 0 at full_pct away."""
+    p, lv = finite(price), finite(level)
+    if p is None or lv in (None, 0): return None
+    d=abs(p/lv-1.0)*100.0
+    return max(0.0, min(100.0, (1.0-d/full_pct)*100.0))
+
+
+def _technical_value_score(rsi, kdj_j, macd_hist, macd_hist_delta, fib_s3, bb_lower, price):
+    # Value score is deliberately different from strength score: it rewards
+    # controlled weakness/oversold + nearby structural support, not momentum.
+    parts=[]
+    weights=[]
+    if rsi is not None:
+        # 30-40 is the core value zone; extreme <20 is still oversold but gets
+        # a small haircut to avoid treating a crash as automatically cheap.
+        if 30 <= rsi <= 40: rsi_s=100
+        elif 20 <= rsi < 30: rsi_s=92 + (rsi-20)*0.8
+        elif rsi < 20: rsi_s=75 + max(0,rsi)*0.85
+        elif 40 < rsi <= 50: rsi_s=100-(rsi-40)*3.0
+        elif 50 < rsi <= 60: rsi_s=70-(rsi-50)*3.0
+        elif 60 < rsi <= 70: rsi_s=40-(rsi-60)*3.0
+        else: rsi_s=max(0,20-(rsi-70)*1.0)
+        parts.append(rsi_s); weights.append(20)
+    if kdj_j is not None:
+        if kdj_j < 0: j_s=100
+        elif kdj_j <= 20: j_s=95
+        elif kdj_j <= 40: j_s=75
+        elif kdj_j <= 60: j_s=50
+        elif kdj_j <= 80: j_s=30
+        else: j_s=15
+        parts.append(j_s); weights.append(20)
+    if macd_hist is not None:
+        # Negative histogram gives value; improving histogram gets an extra
+        # reversal bonus. Scale by price to keep stocks comparable.
+        scale=max(abs(finite(price) or 1)*0.01, 1e-9)
+        neg=max(0.0,min(1.0,(-macd_hist)/scale))
+        improve=1.0 if macd_hist_delta is not None and macd_hist_delta>0 else 0.0
+        macd_s=45 + 35*neg + 20*improve if macd_hist<0 else 25 + 20*improve
+        parts.append(min(100,macd_s)); weights.append(20)
+    if fib_s3 is not None:
+        b=_distance_bonus(price,fib_s3,full_pct=5.0)
+        if b is not None: parts.append(b); weights.append(20)
+    if bb_lower is not None:
+        b=_distance_bonus(price,bb_lower,full_pct=5.0)
+        if b is not None: parts.append(b); weights.append(20)
+    if not parts: return None, {}
+    total=sum(p*w for p,w in zip(parts,weights))/sum(weights)
+    return round(max(0,min(100,total))), {"weights":{"RSI":20,"KDJ_J":20,"MACD":20,"Fib_S3":20,"BOLL_lower":20}}
+
+
+def technical_analysis(history, fib=None, pivots=None):
+    out = {"score": None, "state": "暂无数据", "value_score": None, "value_state":"暂无数据", "score_breakdown":{}, "value_breakdown":{}, "signals": [], "indicators": {}, "history": []}
     if history is None or getattr(history, "empty", True) or "Close" not in history:
         return out
     try:
@@ -610,12 +585,38 @@ def technical_analysis(history):
         if len(close) < 30: return out
         volume = history["Volume"].dropna().astype(float) if "Volume" in history else None
         latest = float(close.iloc[-1])
-        delta = close.diff(); gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean(); loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss.replace(0, np.nan); rsi = float((100 - 100/(1+rs)).iloc[-1]) if finite(rs.iloc[-1]) is not None else None
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi_series = 100 - 100/(1+rs)
+        rsi = finite(rsi_series.iloc[-1])
         ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
         macd, signal = ema12-ema26, (ema12-ema26).ewm(span=9, adjust=False).mean()
-        macd_val, signal_val = float(macd.iloc[-1]), float(signal.iloc[-1])
-        mid, sd = close.rolling(20).mean(), close.rolling(20).std(); upper, lower = mid+2*sd, mid-2*sd
+        hist = macd-signal
+        macd_val, signal_val, hist_val = float(macd.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
+        hist_prev=finite(hist.iloc[-2]) if len(hist)>1 else None
+        hist_delta=hist_val-hist_prev if hist_prev is not None else None
+
+        # KDJ(9,3,3): RSV -> K/D -> J. J<0 is an explicit short-term
+        # oversold bonus for the technical value score.
+        hh=history["High"].astype(float).rolling(9).max() if "High" in history else close.rolling(9).max()
+        ll=history["Low"].astype(float).rolling(9).min() if "Low" in history else close.rolling(9).min()
+        denom=(hh-ll).replace(0,np.nan)
+        rsv=(close-ll)/denom*100
+        k=rsv.ewm(alpha=1/3, adjust=False).mean()
+        d=k.ewm(alpha=1/3, adjust=False).mean()
+        j=3*k-2*d
+        k_val,d_val,j_val=finite(k.iloc[-1]),finite(d.iloc[-1]),finite(j.iloc[-1])
+
+        # MA cards: calculated for display/strength scoring, but deliberately
+        # never plotted on the K-line.
+        ma_periods=(20,60,120,250)
+        mas={n:finite(close.rolling(n).mean().iloc[-1]) for n in ma_periods}
+        ma_slopes={n:(finite(close.rolling(n).mean().iloc[-1])-finite(close.rolling(n).mean().iloc[-6])) if len(close)>=n+5 else None for n in ma_periods}
+
+        mid, sd = close.rolling(20).mean(), close.rolling(20).std()
+        upper, lower = mid+2*sd, mid-2*sd
         bb_mid = finite(mid.iloc[-1]); bb_upper = finite(upper.iloc[-1]); bb_lower = finite(lower.iloc[-1])
         bb_pos = safe_ratio(latest-bb_lower, bb_upper-bb_lower) if bb_upper is not None and bb_lower is not None else None
         bb_width = safe_ratio(bb_upper-bb_lower, bb_mid) * 100 if bb_mid not in (None, 0) and bb_upper is not None and bb_lower is not None else None
@@ -624,17 +625,58 @@ def technical_analysis(history):
         if volume is not None and len(volume)>=20:
             av=float(volume.rolling(20).mean().iloc[-1]); vol_ratio=float(volume.iloc[-1]/av) if av else None
         high52, low52 = float(close.tail(252).max()), float(close.tail(252).min()); pos52 = (latest-low52)/(high52-low52)*100 if high52 != low52 else None
-        score=50.0; signals=[]
-        if rsi is not None: score += 8 if 50<=rsi<=70 else (-5 if rsi>75 else (2 if rsi<30 else -2))
-        score += 8 if macd_val>signal_val else -8; signals.append("MACD强于信号线" if macd_val>signal_val else "MACD弱于信号线")
-        if bb_pos is not None: score += 4 if 0.2<=bb_pos<=0.8 else (-3 if bb_pos>0.95 else 0)
-        if ret20 is not None: score += max(-5,min(5,ret20/4))
-        score=max(0,min(100,round(score))); state="偏强" if score>=65 else ("中性" if score>=45 else "偏弱")
-        out.update({"score":score,"state":state,"signals":signals,"indicators":{"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52},"history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(180).items()]})
+
+        # ---------------- Strong-strength score (100) ----------------
+        # Fixed weights, each component normalized to 0-100.
+        components=[]
+        trend_parts=[]
+        for n,w in ((20,8),(60,7),(120,5),(250,5)):
+            m=mas[n]
+            if m is not None: trend_parts.append((100 if latest>m else 0,w))
+        if trend_parts: components.append((sum(v*w for v,w in trend_parts)/sum(w for _,w in trend_parts),25,"均线结构"))
+        if hist_val is not None:
+            scale=max(abs(latest)*0.01,1e-9); macd_s=50+50*math.tanh(hist_val/scale)
+            components.append((macd_s,20,"MACD动能"))
+        if rsi is not None:
+            # Strength is strongest in 55-70; over 80 is penalized as overheated.
+            if 55<=rsi<=70: rsi_s=100
+            elif 50<=rsi<55: rsi_s=80+(rsi-50)*4
+            elif 70<rsi<=80: rsi_s=100-(rsi-70)*5
+            elif rsi>80: rsi_s=max(0,50-(rsi-80)*2.5)
+            else: rsi_s=max(0,50-(50-rsi)*1.5)
+            components.append((rsi_s,15,"RSI动能"))
+        if ret20 is not None: components.append((_score_0_100(ret20,-15,30),15,"20日动量"))
+        if pos52 is not None: components.append((pos52,15,"52周位置"))
+        if vol_ratio is not None: components.append((max(0,min(100,50+(vol_ratio-1)*25)),10,"量能"))
+        if components:
+            score=round(sum(v*w for v,w,_ in components)/sum(w for _,w,_ in components))
+            score=max(0,min(100,score))
+        else: score=None
+        state="强势" if score is not None and score>=75 else ("偏强" if score is not None and score>=60 else ("中性" if score is not None and score>=45 else ("偏弱" if score is not None and score>=30 else "弱势")))
+
+        # ---------------- Technical value score (100) ----------------
+        fib_s3=(pivots or {}).get("fibonacci",{}).get("S3") if pivots else None
+        value_score,value_meta=_technical_value_score(rsi,j_val,hist_val,hist_delta,fib_s3,bb_lower,latest)
+        value_state=("高性价比" if value_score is not None and value_score>=75 else ("较有性价比" if value_score is not None and value_score>=60 else ("中性" if value_score is not None and value_score>=45 else ("性价比较低" if value_score is not None else "暂无数据"))))
+
+        signals=[]
+        if macd_val>signal_val: signals.append("MACD强于信号线")
+        else: signals.append("MACD弱于信号线")
+        if j_val is not None and j_val<0: signals.append("KDJ J<0：短线超卖")
+        if rsi is not None and rsi<30: signals.append("RSI<30：超卖")
+        if fib_s3 is not None and _distance_bonus(latest,fib_s3,5) is not None and _distance_bonus(latest,fib_s3,5)>=80: signals.append("接近斐波纳契S3")
+        if bb_lower is not None and _distance_bonus(latest,bb_lower,5) is not None and _distance_bonus(latest,bb_lower,5)>=80: signals.append("接近布林下轨")
+
+        out.update({
+            "score":score,"state":state,"value_score":value_score,"value_state":value_state,
+            "score_breakdown":{"weights":{"均线结构":25,"MACD动能":20,"RSI动能":15,"20日动量":15,"52周位置":15,"量能":10},"components":[{"name":name,"score":round(v,1),"weight":w} for v,w,name in components]},
+            "value_breakdown":value_meta,
+            "signals":signals,
+            "indicators":{"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"macd_hist":hist_val,"macd_hist_delta":hist_delta,"kdj_k":k_val,"kdj_d":d_val,"kdj_j":j_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52,"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250]},
+            "history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(180).items()]})
     except Exception:
         pass
     return out
-
 
 def analyst_view(ticker):
     out={"available":False,"rating":{},"targets":{},"earnings":{},"revenue":{},"changes":[]}
@@ -1040,7 +1082,7 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     try: divs=t.get_dividends(period="max")
     except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
     dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
-    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, pivots, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
+    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history, fib, pivots); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, pivots, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
 
     # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
