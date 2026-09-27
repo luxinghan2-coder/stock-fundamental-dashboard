@@ -4,9 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    <title>股票基本面驾驶舱 V1</title>
-
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <title>股票基本面驾驶舱</title>
 
     <style>
         * {
@@ -15,121 +13,88 @@
 
         body {
             margin: 0;
-            background: #f5f6f8;
+            padding: 20px;
+            background: #f5f5f5;
             color: #111;
-            font-family:
-                -apple-system,
-                BlinkMacSystemFont,
-                "Segoe UI",
-                "Microsoft YaHei",
-                Arial,
-                sans-serif;
+            font-family: Arial, "Microsoft YaHei", sans-serif;
         }
 
         .container {
-            width: min(1200px, 94%);
-            margin: 30px auto 60px;
+            max-width: 1100px;
+            margin: auto;
         }
 
         h1 {
-            margin: 0;
-            font-size: 30px;
-            font-weight: 700;
+            margin-bottom: 5px;
         }
 
         .subtitle {
-            margin-top: 8px;
             color: #666;
-            font-size: 14px;
+            margin-bottom: 20px;
         }
 
-        .search-box {
-            margin-top: 24px;
+        .search {
             background: white;
-            padding: 18px;
-            border-radius: 14px;
-            box-shadow: 0 3px 15px rgba(0,0,0,0.06);
-            display: flex;
-            gap: 10px;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
         }
 
-        .search-box input {
-            flex: 1;
-            min-width: 0;
-            padding: 13px 15px;
+        input {
+            width: 70%;
+            padding: 13px;
             font-size: 16px;
-            border: 1px solid #d8dce2;
-            border-radius: 9px;
-            outline: none;
+            border: 1px solid #ccc;
+            border-radius: 8px;
         }
 
-        .search-box input:focus {
-            border-color: #111;
-        }
-
-        .search-box button {
-            padding: 0 25px;
-            border: 0;
-            border-radius: 9px;
+        button {
+            padding: 13px 22px;
+            margin-left: 8px;
             background: #111;
             color: white;
+            border: none;
+            border-radius: 8px;
             font-size: 16px;
-            cursor: pointer;
         }
 
-        .search-box button:disabled {
-            opacity: 0.55;
-            cursor: wait;
+        button:disabled {
+            opacity: 0.5;
         }
 
-        .status {
+        #status {
             margin-top: 12px;
-            min-height: 22px;
             color: #666;
-            font-size: 14px;
         }
 
         .error {
-            color: #b00020;
+            color: red !important;
         }
 
-        .hidden {
-            display: none;
-        }
-
-        .company-card {
-            margin-top: 20px;
+        .company {
             background: white;
-            padding: 22px;
-            border-radius: 14px;
-            box-shadow: 0 3px 15px rgba(0,0,0,0.06);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
         }
 
         .company-name {
             font-size: 25px;
-            font-weight: 700;
-        }
-
-        .company-symbol {
-            margin-top: 7px;
-            color: #666;
-            font-size: 14px;
+            font-weight: bold;
         }
 
         .price {
-            margin-top: 18px;
-            font-size: 32px;
-            font-weight: 700;
+            font-size: 30px;
+            font-weight: bold;
+            margin-top: 10px;
         }
 
         .section {
-            margin-top: 22px;
+            margin-bottom: 20px;
         }
 
-        .section-title {
-            margin-bottom: 12px;
+        .section h2 {
             font-size: 20px;
-            font-weight: 700;
         }
 
         .grid {
@@ -140,6 +105,725 @@
 
         .card {
             background: white;
-            padding: 17px;
-            border-radius: 12px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05
+            padding: 16px;
+            border-radius: 10px;
+        }
+
+        .label {
+            color: #666;
+            font-size: 13px;
+        }
+
+        .value {
+            margin-top: 8px;
+            font-size: 21px;
+            font-weight: bold;
+        }
+
+        table {
+            width: 100%;
+            background: white;
+            border-collapse: collapse;
+        }
+
+        th,
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #ddd;
+            text-align: right;
+        }
+
+        th:first-child,
+        td:first-child {
+            text-align: left;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        @media (max-width: 700px) {
+
+            body {
+                padding: 12px;
+            }
+
+            input {
+                width: 100%;
+                margin-bottom: 10px;
+            }
+
+            button {
+                width: 100%;
+                margin-left: 0;
+            }
+
+            .grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>股票基本面驾驶舱</h1>
+
+    <div class="subtitle">
+        A股 · 港股 · 美股
+    </div>
+
+
+    <div class="search">
+
+        <input
+            id="symbol"
+            type="text"
+            value="AAPL"
+            placeholder="输入股票代码，例如 AAPL、600519、0700"
+        >
+
+        <button
+            id="query"
+            type="button"
+        >
+            查询
+        </button>
+
+        <div id="status"></div>
+
+    </div>
+
+
+    <div id="result" class="hidden">
+
+
+        <div class="company">
+
+            <div
+                id="company"
+                class="company-name"
+            >
+                -
+            </div>
+
+            <div id="market">
+                -
+            </div>
+
+            <div
+                id="price"
+                class="price"
+            >
+                -
+            </div>
+
+        </div>
+
+
+        <div class="section">
+
+            <h2>估值</h2>
+
+            <div class="grid">
+
+                <div class="card">
+                    <div class="label">PE</div>
+                    <div id="pe" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">PB</div>
+                    <div id="pb" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">ROE</div>
+                    <div id="roe" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">ROE ÷ PB</div>
+                    <div id="roe_pb" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">PE ÷ ROE</div>
+                    <div id="pe_roe" class="value">暂无数据</div>
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="section">
+
+            <h2>基本面</h2>
+
+            <div class="grid">
+
+                <div class="card">
+                    <div class="label">营收</div>
+                    <div id="revenue" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">净利润</div>
+                    <div id="net_income" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">毛利率</div>
+                    <div id="gross_margin" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">自由现金流</div>
+                    <div id="free_cash_flow" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">股息率</div>
+                    <div id="dividend_yield" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">负债率</div>
+                    <div id="debt_ratio" class="value">暂无数据</div>
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="section">
+
+            <h2>15年 ROE</h2>
+
+            <div class="grid">
+
+                <div class="card">
+                    <div class="label">平均 ROE</div>
+                    <div id="average" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">中位数</div>
+                    <div id="median" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">标准差</div>
+                    <div id="std" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">极差</div>
+                    <div id="range" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">最高 ROE</div>
+                    <div id="max" class="value">暂无数据</div>
+                </div>
+
+                <div class="card">
+                    <div class="label">最低 ROE</div>
+                    <div id="min" class="value">暂无数据</div>
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="section">
+
+            <h2>年度 ROE</h2>
+
+            <table>
+
+                <thead>
+
+                    <tr>
+                        <th>年度</th>
+                        <th>净利润</th>
+                        <th>期初权益</th>
+                        <th>期末权益</th>
+                        <th>ROE</th>
+                    </tr>
+
+                </thead>
+
+                <tbody id="roeTable">
+
+                </tbody>
+
+            </table>
+
+        </div>
+
+
+        <div class="section">
+
+            <p>
+                数据源：
+                <span id="source">-</span>
+            </p>
+
+        </div>
+
+
+    </div>
+
+</div>
+
+
+<script>
+
+const queryButton =
+    document.getElementById("query");
+
+const symbolInput =
+    document.getElementById("symbol");
+
+const status =
+    document.getElementById("status");
+
+const result =
+    document.getElementById("result");
+
+
+function number(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return "暂无数据";
+    }
+
+    const n = Number(value);
+
+    if (!Number.isFinite(n)) {
+        return "暂无数据";
+    }
+
+    return n.toLocaleString(
+        "zh-CN",
+        {
+            maximumFractionDigits: 2
+        }
+    );
+}
+
+
+function percent(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return "暂无数据";
+    }
+
+    const n = Number(value);
+
+    if (!Number.isFinite(n)) {
+        return "暂无数据";
+    }
+
+    return n.toFixed(2) + "%";
+}
+
+
+function money(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return "暂无数据";
+    }
+
+    const n = Number(value);
+
+    if (!Number.isFinite(n)) {
+        return "暂无数据";
+    }
+
+    if (Math.abs(n) >= 1000000000000) {
+        return (n / 1000000000000).toFixed(2) + " 万亿";
+    }
+
+    if (Math.abs(n) >= 100000000) {
+        return (n / 100000000).toFixed(2) + " 亿";
+    }
+
+    return n.toLocaleString(
+        "zh-CN",
+        {
+            maximumFractionDigits: 2
+        }
+    );
+}
+
+
+function set(id, value) {
+
+    document.getElementById(id).textContent =
+        value;
+
+}
+
+
+async function searchStock() {
+
+    const symbol =
+        symbolInput.value.trim();
+
+
+    if (!symbol) {
+
+        status.textContent =
+            "请输入股票代码";
+
+        status.className =
+            "error";
+
+        return;
+
+    }
+
+
+    queryButton.disabled = true;
+
+    queryButton.textContent =
+        "查询中...";
+
+    status.className = "";
+
+    status.textContent =
+        "正在获取数据...";
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/stock/" +
+                encodeURIComponent(symbol)
+            );
+
+
+        const text =
+            await response.text();
+
+
+        console.log(
+            "服务器返回：",
+            text
+        );
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                "服务器错误：" +
+                response.status +
+                " " +
+                text
+            );
+
+        }
+
+
+        const data =
+            JSON.parse(text);
+
+
+        console.log(
+            "解析后的数据：",
+            data
+        );
+
+
+        showData(data);
+
+
+        status.textContent =
+            "查询完成";
+
+
+    } catch (error) {
+
+        console.error(error);
+
+        result.classList.add("hidden");
+
+        status.textContent =
+            "查询失败：" +
+            error.message;
+
+        status.className =
+            "error";
+
+    }
+
+
+    queryButton.disabled = false;
+
+    queryButton.textContent =
+        "查询";
+
+}
+
+
+function showData(data) {
+
+    result.classList.remove("hidden");
+
+
+    set(
+        "company",
+        data.company || "暂无数据"
+    );
+
+
+    set(
+        "market",
+        (
+            data.exchange ||
+            data.market ||
+            "未知市场"
+        ) +
+        " · " +
+        (
+            data.symbol ||
+            "暂无代码"
+        )
+    );
+
+
+    set(
+        "price",
+        number(
+            data.market_data?.price
+        )
+    );
+
+
+    const v =
+        data.valuation || {};
+
+
+    set(
+        "pe",
+        number(v.pe)
+    );
+
+
+    set(
+        "pb",
+        number(v.pb)
+    );
+
+
+    set(
+        "roe",
+        percent(v.roe)
+    );
+
+
+    set(
+        "roe_pb",
+        number(v.roe_pb)
+    );
+
+
+    set(
+        "pe_roe",
+        number(v.pe_roe)
+    );
+
+
+    const f =
+        data.fundamentals || {};
+
+
+    set(
+        "revenue",
+        money(f.revenue)
+    );
+
+
+    set(
+        "net_income",
+        money(f.net_income)
+    );
+
+
+    set(
+        "gross_margin",
+        percent(f.gross_margin)
+    );
+
+
+    set(
+        "free_cash_flow",
+        money(f.free_cash_flow)
+    );
+
+
+    set(
+        "dividend_yield",
+        percent(f.dividend_yield)
+    );
+
+
+    set(
+        "debt_ratio",
+        percent(f.debt_ratio)
+    );
+
+
+    const roe =
+        data.roe_15y || {};
+
+
+    const stats =
+        roe.stats || {};
+
+
+    set(
+        "average",
+        percent(stats.average)
+    );
+
+
+    set(
+        "median",
+        percent(stats.median)
+    );
+
+
+    set(
+        "std",
+        percent(stats.std_dev)
+    );
+
+
+    set(
+        "range",
+        percent(stats.range)
+    );
+
+
+    set(
+        "max",
+        percent(stats.max)
+    );
+
+
+    set(
+        "min",
+        percent(stats.min)
+    );
+
+
+    const rows =
+        roe.years || [];
+
+
+    const table =
+        document.getElementById(
+            "roeTable"
+        );
+
+
+    table.innerHTML = "";
+
+
+    if (!rows.length) {
+
+        table.innerHTML =
+            `
+            <tr>
+                <td colspan="5">
+                    暂无数据
+                </td>
+            </tr>
+            `;
+
+    } else {
+
+        rows
+            .slice()
+            .reverse()
+            .forEach(
+                function(row) {
+
+                    const tr =
+                        document.createElement(
+                            "tr"
+                        );
+
+
+                    tr.innerHTML =
+                        `
+                        <td>${row.year}</td>
+                        <td>${money(row.net_income)}</td>
+                        <td>${money(row.equity_begin)}</td>
+                        <td>${money(row.equity_end)}</td>
+                        <td>${percent(row.roe)}</td>
+                        `;
+
+
+                    table.appendChild(tr);
+
+                }
+            );
+
+    }
+
+
+    set(
+        "source",
+        data.source?.provider ||
+        "Yahoo Finance / yfinance"
+    );
+
+}
+
+
+queryButton.addEventListener(
+    "click",
+    searchStock
+);
+
+
+symbolInput.addEventListener(
+    "keydown",
+    function(event) {
+
+        if (event.key === "Enter") {
+
+            searchStock();
+
+        }
+
+    }
+);
+
+</script>
+
+</body>
+</html>
