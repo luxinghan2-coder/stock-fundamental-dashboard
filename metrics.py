@@ -1053,6 +1053,108 @@ def company_news(symbol, errors, limit=8):
         seen.add(k); out.append(x)
     return out[:limit]
 
+
+# 轻量候选索引：用于输入框联想，不参与行情计算。
+# 先命中本地索引，避免每个字符都请求行情接口；未命中时再尝试 Yahoo 搜索作为候选补充。
+SYMBOL_INDEX = [
+    # US
+    ("AAPL","苹果公司","Apple Inc.","NASDAQ","USD"),("MSFT","微软","Microsoft Corporation","NASDAQ","USD"),
+    ("NVDA","英伟达","NVIDIA Corporation","NASDAQ","USD"),("AMZN","亚马逊","Amazon.com, Inc.","NASDAQ","USD"),
+    ("GOOGL","谷歌","Alphabet Inc.","NASDAQ","USD"),("META","Meta","Meta Platforms, Inc.","NASDAQ","USD"),
+    ("TSLA","特斯拉","Tesla, Inc.","NASDAQ","USD"),("AMD","AMD","Advanced Micro Devices, Inc.","NASDAQ","USD"),
+    ("AVGO","博通","Broadcom Inc.","NASDAQ","USD"),("NFLX","奈飞","Netflix, Inc.","NASDAQ","USD"),
+    ("ORCL","甲骨文","Oracle Corporation","NYSE","USD"),("CRM","赛富时","Salesforce, Inc.","NYSE","USD"),
+    ("INTC","英特尔","Intel Corporation","NASDAQ","USD"),("QCOM","高通","QUALCOMM Incorporated","NASDAQ","USD"),
+    ("MU","美光科技","Micron Technology, Inc.","NASDAQ","USD"),("TSM","台积电","Taiwan Semiconductor Manufacturing Company Limited","NYSE","USD"),
+    ("BRK-B","伯克希尔哈撒韦","Berkshire Hathaway Inc.","NYSE","USD"),("JPM","摩根大通","JPMorgan Chase & Co.","NYSE","USD"),
+    ("V","Visa","Visa Inc.","NYSE","USD"),("MA","万事达","Mastercard Incorporated","NYSE","USD"),
+    ("COST","好市多","Costco Wholesale Corporation","NASDAQ","USD"),("WMT","沃尔玛","Walmart Inc.","NYSE","USD"),
+    ("KO","可口可乐","The Coca-Cola Company","NYSE","USD"),("PEP","百事","PepsiCo, Inc.","NASDAQ","USD"),
+    ("MCD","麦当劳","McDonald's Corporation","NYSE","USD"),("DIS","迪士尼","The Walt Disney Company","NYSE","USD"),
+    ("XOM","埃克森美孚","Exxon Mobil Corporation","NYSE","USD"),("CVX","雪佛龙","Chevron Corporation","NYSE","USD"),
+    ("LLY","礼来","Eli Lilly and Company","NYSE","USD"),("JNJ","强生","Johnson & Johnson","NYSE","USD"),
+    # HK
+    ("0700.HK","腾讯控股","Tencent Holdings Limited","HKEX","HKD"),("9988.HK","阿里巴巴","Alibaba Group Holding Limited","HKEX","HKD"),
+    ("3690.HK","美团","Meituan","HKEX","HKD"),("1810.HK","小米集团","Xiaomi Corporation","HKEX","HKD"),
+    ("9618.HK","京东集团","JD.com, Inc.","HKEX","HKD"),("1024.HK","快手","Kuaishou Technology","HKEX","HKD"),
+    ("9999.HK","网易","NetEase, Inc.","HKEX","HKD"),("0941.HK","中国移动","China Mobile Limited","HKEX","HKD"),
+    ("0883.HK","中国海洋石油","CNOOC Limited","HKEX","HKD"),("0005.HK","汇丰控股","HSBC Holdings plc","HKEX","HKD"),
+    ("0016.HK","新鸿基地产","Sun Hung Kai Properties Limited","HKEX","HKD"),("0001.HK","长和","CK Hutchison Holdings Limited","HKEX","HKD"),
+    # A
+    ("600519.SS","贵州茅台","贵州茅台","SSE","CNY"),("601318.SS","中国平安","中国平安","SSE","CNY"),
+    ("600036.SS","招商银行","招商银行","SSE","CNY"),("601398.SS","工商银行","工商银行","SSE","CNY"),
+    ("601288.SS","农业银行","农业银行","SSE","CNY"),("601939.SS","建设银行","建设银行","SSE","CNY"),
+    ("600900.SS","长江电力","长江电力","SSE","CNY"),("601857.SS","中国石油","中国石油","SSE","CNY"),
+    ("601088.SS","中国神华","中国神华","SSE","CNY"),("600276.SS","恒瑞医药","恒瑞医药","SSE","CNY"),
+    ("000858.SZ","五粮液","五粮液","SZSE","CNY"),("000333.SZ","美的集团","美的集团","SZSE","CNY"),
+    ("000651.SZ","格力电器","格力电器","SZSE","CNY"),("002594.SZ","比亚迪","比亚迪","SZSE","CNY"),
+    ("300750.SZ","宁德时代","宁德时代","SZSE","CNY"),("000001.SZ","平安银行","平安银行","SZSE","CNY"),
+    ("000002.SZ","万科A","万科企业","SZSE","CNY"),("002415.SZ","海康威视","海康威视","SZSE","CNY"),
+    ("300059.SZ","东方财富","东方财富","SZSE","CNY"),("601012.SS","隆基绿能","隆基绿能","SSE","CNY"),
+    ("600887.SS","伊利股份","伊利股份","SSE","CNY"),("600030.SS","中信证券","中信证券","SSE","CNY"),
+]
+
+def _search_text(x: str) -> str:
+    return re.sub(r"[\s\W_]+", "", str(x or "").lower())
+
+def _candidate_from_tuple(row):
+    code, zh, en, ex, cur = row
+    return {"symbol": code, "name_zh": zh, "name_en": en, "exchange": ex, "currency": cur}
+
+def search_symbols(q: str, limit: int = 5):
+    q = str(q or "").strip()
+    if not q:
+        return []
+    nq = _search_text(q)
+    if not nq:
+        return []
+    scored=[]
+    for row in SYMBOL_INDEX:
+        code, zh, en, ex, cur = row
+        fields=[_search_text(code),_search_text(zh),_search_text(en)]
+        score=None
+        if nq == fields[0]: score=0
+        elif nq == fields[1]: score=1
+        elif nq == fields[2]: score=2
+        elif fields[0].startswith(nq): score=3
+        elif fields[1].startswith(nq): score=4
+        elif fields[2].startswith(nq): score=5
+        elif nq in fields[1]: score=6
+        elif nq in fields[2]: score=7
+        if score is not None:
+            scored.append((score,row))
+    scored.sort(key=lambda x:(x[0], x[1][0]))
+    out=[_candidate_from_tuple(r) for _,r in scored[:limit]]
+    if out:
+        return out
+
+    # 仅作为候选补充，绝不影响 /api/stock/core 的路径。
+    try:
+        r=requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q":q,"quotesCount":limit,"newsCount":0},
+            headers={"User-Agent":"Mozilla/5.0 AEL/2.4.14"},
+            timeout=2.5,
+        )
+        r.raise_for_status()
+        quotes=(r.json() or {}).get("quotes",[])[:limit]
+        for x in quotes:
+            sym=str(x.get("symbol") or "").strip()
+            if not sym: continue
+            ex=str(x.get("exchange") or "")
+            # Yahoo 对美股/港股/A股返回的 symbol 可直接用于现有查询。
+            out.append({
+                "symbol":sym,
+                "name_zh":x.get("longname") or x.get("shortname") or sym,
+                "name_en":x.get("longname") or x.get("shortname") or sym,
+                "exchange":ex,
+                "currency":x.get("currency") or "",
+            })
+        return out[:limit]
+    except Exception:
+        return []
+
+
 def build_dashboard(raw_symbol: str, include_slow: bool = True) -> dict[str, Any]:
     symbol=clean_symbol(raw_symbol); t=yf.Ticker(symbol); errors={}
     history=get_history(t,symbol,errors)

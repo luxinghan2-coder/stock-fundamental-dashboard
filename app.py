@@ -5,7 +5,7 @@ from pathlib import Path
 from metrics import build_dashboard
 
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.4.7', version='2.4.7')
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.4.14', version='2.4.14')
 app.mount('/static', StaticFiles(directory=BASE / 'static'), name='static')
 
 @app.get('/')
@@ -14,7 +14,14 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.4.7'}
+    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.4.14'}
+
+
+@app.get('/api/search')
+def stock_search(q: str = ""):
+    """轻量候选搜索：优先本地索引；远程补充仅用于候选，不触发行情/财报查询。"""
+    from metrics import search_symbols
+    return {"query": q, "items": search_symbols(q, limit=5)}
 
 @app.get('/api/stock/core/{symbol}')
 def stock_core(symbol: str):
