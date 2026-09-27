@@ -287,6 +287,59 @@ def dividend_metrics(divs, cf, price, fcf, net_income, dividend_error=None):
     return out
 
 
+def pivot_levels(history):
+    """Calculate daily pivot points using the latest completed daily OHLC bar.
+
+    This matches the common quote-app "轴点" table shown in the reference UI:
+    Classic pivots and Fibonacci pivots are both derived from the same prior-day
+    High/Low/Close.  It is intentionally separate from Fibonacci retracement,
+    which uses a multi-month swing high/low.
+    """
+    out = {
+        "available": False, "date": None, "high": None, "low": None, "close": None,
+        "classic": {}, "fibonacci": {},
+        "fibonacci_ratios": {"R1": 0.382, "R2": 0.618, "R3": 1.0},
+    }
+    if history is None or getattr(history, "empty", True):
+        return out
+    try:
+        cols = {str(c).lower(): c for c in history.columns}
+        if not all(k in cols for k in ("high", "low", "close")):
+            return out
+        hcol, lcol, ccol = cols["high"], cols["low"], cols["close"]
+        row = history.dropna(subset=[hcol, lcol, ccol]).iloc[-1]
+        high, low, close = float(row[hcol]), float(row[lcol]), float(row[ccol])
+        if not all(math.isfinite(x) for x in (high, low, close)) or high <= low:
+            return out
+        rng = high - low
+        pp = (high + low + close) / 3.0
+        classic = {
+            "R3": high + 2 * (pp - low),
+            "R2": pp + rng,
+            "R1": 2 * pp - low,
+            "轴心点": pp,
+            "S1": 2 * pp - high,
+            "S2": pp - rng,
+            "S3": low - 2 * (high - pp),
+        }
+        fibonacci = {
+            "R3": pp + 1.000 * rng,
+            "R2": pp + 0.618 * rng,
+            "R1": pp + 0.382 * rng,
+            "轴心点": pp,
+            "S1": pp - 0.382 * rng,
+            "S2": pp - 0.618 * rng,
+            "S3": pp - 1.000 * rng,
+        }
+        idx = history.index[-1]
+        date = str(getattr(idx, "date", lambda: idx)()) if hasattr(idx, "date") else str(idx)
+        out.update({"available": True, "date": date, "high": high, "low": low, "close": close,
+                    "classic": classic, "fibonacci": fibonacci})
+    except Exception:
+        pass
+    return out
+
+
 def fibonacci_levels(history):
     out = {"available": False, "swing_high": None, "swing_low": None, "levels": {}, "nearest_support": None, "nearest_resistance": None}
     if history is None or getattr(history, "empty", True) or "Close" not in history:
@@ -679,7 +732,7 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     try: divs=t.get_dividends(period="max")
     except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
     dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
-    fib=fibonacci_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["resonance"]=resonance_levels(price, fib, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
+    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, fib, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
 
     # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
