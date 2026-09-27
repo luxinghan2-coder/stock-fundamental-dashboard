@@ -2,13 +2,14 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-
     <meta
         name="viewport"
         content="width=device-width, initial-scale=1.0"
     >
 
     <title>股票基本面驾驶舱</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
     <style>
 
@@ -24,208 +25,142 @@
                 -apple-system,
                 BlinkMacSystemFont,
                 "Segoe UI",
-                "PingFang SC",
                 "Microsoft YaHei",
                 Arial,
                 sans-serif;
         }
 
         .container {
-            width: 100%;
             max-width: 1100px;
             margin: 0 auto;
-            padding: 24px 16px 50px;
+            padding: 20px;
         }
 
-        .header {
-            background: #fff;
-            border-radius: 16px;
-            padding: 24px;
-            margin-bottom: 16px;
-            border: 1px solid #e5e7eb;
-        }
-
-        .title {
+        h1 {
+            margin: 0 0 6px;
             font-size: 28px;
-            font-weight: 700;
-            margin-bottom: 8px;
         }
 
         .subtitle {
             color: #666;
-            font-size: 14px;
+            margin-bottom: 20px;
         }
 
         .search-box {
-            margin-top: 20px;
             display: flex;
             gap: 10px;
+            margin-bottom: 20px;
         }
 
-        #symbol {
+        input {
             flex: 1;
             min-width: 0;
-            height: 48px;
-            padding: 0 16px;
-            border: 1px solid #d1d5db;
+            padding: 14px;
+            border: 1px solid #ccc;
             border-radius: 10px;
-            font-size: 17px;
-            outline: none;
-            background: #fff;
+            font-size: 16px;
+            background: white;
         }
 
-        #symbol:focus {
-            border-color: #111;
-        }
-
-        #query {
-            height: 48px;
-            padding: 0 24px;
+        button {
+            padding: 14px 22px;
             border: none;
             border-radius: 10px;
             background: #111;
-            color: #fff;
+            color: white;
             font-size: 16px;
-            font-weight: 600;
             cursor: pointer;
         }
 
-        #query:hover {
-            opacity: 0.88;
-        }
-
-        #query:disabled {
-            opacity: 0.5;
-            cursor: wait;
+        button:active {
+            opacity: .75;
         }
 
         .status {
-            display: none;
-            margin-top: 14px;
-            padding: 12px 14px;
-            border-radius: 8px;
-            background: #f0f0f0;
-            font-size: 14px;
+            margin-bottom: 16px;
+            color: #666;
+            min-height: 20px;
         }
 
-        .company-card {
-            background: #fff;
-            border-radius: 16px;
-            padding: 22px;
-            margin-bottom: 16px;
-            border: 1px solid #e5e7eb;
+        .card {
+            background: white;
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 18px;
+            box-shadow:
+                0 2px 10px rgba(0,0,0,.05);
         }
 
         .company-name {
-            font-size: 25px;
+            font-size: 24px;
             font-weight: 700;
             margin-bottom: 8px;
         }
 
         .company-meta {
             color: #666;
-            font-size: 14px;
-            line-height: 1.8;
-        }
-
-        .section {
-            background: #fff;
-            border-radius: 16px;
-            padding: 22px;
-            margin-bottom: 16px;
-            border: 1px solid #e5e7eb;
         }
 
         .section-title {
-            font-size: 19px;
+            font-size: 20px;
             font-weight: 700;
-            margin-bottom: 18px;
+            margin-bottom: 16px;
         }
 
         .grid {
-            display: grid;
-            grid-template-columns:
-                repeat(4, minmax(0, 1fr));
-            gap: 12px;
-        }
-
-        .metric {
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 16px;
-            background: #fafafa;
-            min-height: 90px;
-        }
-
-        .metric-label {
-            color: #666;
-            font-size: 13px;
-            margin-bottom: 9px;
-        }
-
-        .metric-value {
-            font-size: 22px;
-            font-weight: 700;
-            word-break: break-word;
-        }
-
-        .metric-unit {
-            font-size: 13px;
-            color: #666;
-            margin-left: 3px;
-        }
-
-        .stats-grid {
             display: grid;
             grid-template-columns:
                 repeat(3, minmax(0, 1fr));
             gap: 12px;
         }
 
-        .stat {
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 16px;
+        .metric {
+            border: 1px solid #eee;
+            border-radius: 10px;
+            padding: 14px;
+            background: #fafafa;
         }
 
-        .stat-label {
+        .metric-name {
             color: #666;
-            font-size: 13px;
-            margin-bottom: 8px;
+            font-size: 14px;
+            margin-bottom: 6px;
         }
 
-        .stat-value {
+        .metric-value {
             font-size: 21px;
             font-weight: 700;
+            word-break: break-word;
         }
 
-        .table-wrap {
-            width: 100%;
+        .chart-wrapper {
+            position: relative;
+            height: 380px;
+        }
+
+        .table-wrapper {
             overflow-x: auto;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            min-width: 600px;
         }
 
         th,
         td {
-            text-align: right;
-            padding: 12px 10px;
+            padding: 11px 10px;
             border-bottom: 1px solid #eee;
-            font-size: 14px;
-        }
-
-        th {
-            background: #f7f7f7;
-            font-weight: 700;
+            text-align: right;
         }
 
         th:first-child,
         td:first-child {
             text-align: left;
+        }
+
+        th {
+            background: #fafafa;
         }
 
         .empty {
@@ -234,88 +169,49 @@
             text-align: center;
         }
 
-        .definition {
-            margin-top: 16px;
-            padding: 14px;
-            background: #f7f7f7;
-            border-radius: 10px;
-            color: #555;
-            font-size: 13px;
-            line-height: 1.7;
-        }
-
         .source {
-            color: #777;
-            font-size: 13px;
-            line-height: 1.7;
+            color: #666;
+            font-size: 14px;
+            line-height: 1.8;
         }
 
-        .hidden {
-            display: none;
-        }
-
-        @media (max-width: 800px) {
-
-            .grid {
-                grid-template-columns:
-                    repeat(2, minmax(0, 1fr));
-            }
-
-            .stats-grid {
-                grid-template-columns:
-                    repeat(2, minmax(0, 1fr));
-            }
-
-            .title {
-                font-size: 24px;
-            }
-
-        }
-
-        @media (max-width: 520px) {
+        @media (max-width: 700px) {
 
             .container {
-                padding: 12px 10px 30px;
+                padding: 14px;
             }
 
-            .header,
-            .company-card,
-            .section {
-                padding: 16px;
-                border-radius: 12px;
+            h1 {
+                font-size: 24px;
             }
 
             .search-box {
                 flex-direction: column;
             }
 
-            #query {
+            button {
                 width: 100%;
             }
 
             .grid {
-                grid-template-columns: 1fr 1fr;
-                gap: 8px;
+                grid-template-columns:
+                    repeat(2, minmax(0, 1fr));
             }
 
-            .stats-grid {
-                grid-template-columns: 1fr 1fr;
-                gap: 8px;
-            }
-
-            .metric {
-                padding: 12px;
-                min-height: 82px;
+            .chart-wrapper {
+                height: 300px;
             }
 
             .metric-value {
                 font-size: 18px;
             }
+        }
 
-            .company-name {
-                font-size: 21px;
+        @media (max-width: 420px) {
+
+            .grid {
+                grid-template-columns: 1fr;
             }
-
         }
 
     </style>
@@ -325,178 +221,135 @@
 
 <div class="container">
 
-    <!-- ==============================
-         页面标题
-    =============================== -->
+    <h1>股票基本面驾驶舱</h1>
 
-    <div class="header">
+    <div class="subtitle">
+        A股 · 港股 · 美股｜估值 · 盈利 · 现金流 · ROE
+    </div>
 
-        <div class="title">
-            股票基本面驾驶舱
-        </div>
+    <div class="search-box">
 
-        <div class="subtitle">
-            A股 · 港股 · 美股｜估值 · 盈利 · 现金流 · ROE
-        </div>
+        <input
+            id="symbol"
+            value="AAPL"
+            placeholder="输入股票代码，例如 AAPL / 600519 / 0700.HK"
+        >
 
-        <div class="search-box">
-
-            <input
-                id="symbol"
-                type="text"
-                value="AAPL"
-                placeholder="输入股票代码，例如 AAPL、600519、0700"
-                autocomplete="off"
-            >
-
-            <button id="query">
-                查询
-            </button>
-
-        </div>
-
-        <div
-            id="status"
-            class="status"
-        ></div>
+        <button id="query">
+            查询
+        </button>
 
     </div>
 
-
-    <!-- ==============================
-         公司信息
-    =============================== -->
-
     <div
-        id="company-card"
-        class="company-card hidden"
+        id="status"
+        class="status"
     >
+        准备查询
+    </div>
+
+
+    <!-- 公司 -->
+
+    <div class="card">
 
         <div
-            id="company-name"
+            id="company"
             class="company-name"
         >
-            -
+            —
         </div>
 
         <div
-            id="company-meta"
+            id="companyMeta"
             class="company-meta"
         >
-            -
+            —
         </div>
 
     </div>
 
 
-    <!-- ==============================
-         估值
-    =============================== -->
+    <!-- 估值 -->
 
-    <div
-        id="valuation-section"
-        class="section hidden"
-    >
+    <div class="card">
 
         <div class="section-title">
-            估值与盈利能力
+            估值与核心指标
         </div>
 
         <div class="grid">
 
             <div class="metric">
-
-                <div class="metric-label">
-                    当前股价
+                <div class="metric-name">
+                    当前价格
                 </div>
-
                 <div
                     id="price"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     PE
                 </div>
-
                 <div
                     id="pe"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     PB
                 </div>
-
                 <div
                     id="pb"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
-                    当前 ROE
+                <div class="metric-name">
+                    ROE
                 </div>
-
                 <div
                     id="roe"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     ROE ÷ PB
                 </div>
-
                 <div
-                    id="roe-pb"
+                    id="roePb"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     PE ÷ ROE
                 </div>
-
                 <div
-                    id="pe-roe"
+                    id="peRoe"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
         </div>
@@ -504,114 +357,86 @@
     </div>
 
 
-    <!-- ==============================
-         基本面
-    =============================== -->
+    <!-- 基本面 -->
 
-    <div
-        id="fundamental-section"
-        class="section hidden"
-    >
+    <div class="card">
 
         <div class="section-title">
-            核心基本面
+            公司基本面
         </div>
 
         <div class="grid">
 
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     营收
                 </div>
-
                 <div
                     id="revenue"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     净利润
                 </div>
-
                 <div
-                    id="net-income"
+                    id="netIncome"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     毛利率
                 </div>
-
                 <div
-                    id="gross-margin"
+                    id="grossMargin"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     自由现金流
                 </div>
-
                 <div
                     id="fcf"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
             <div class="metric">
-
-                <div class="metric-label">
+                <div class="metric-name">
                     股息率
                 </div>
-
                 <div
-                    id="dividend-yield"
+                    id="dividendYield"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
-
 
             <div class="metric">
-
-                <div class="metric-label">
-                    负债率
+                <div class="metric-name">
+                    资产负债率
                 </div>
-
                 <div
-                    id="debt-ratio"
+                    id="debtRatio"
                     class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
         </div>
@@ -619,212 +444,155 @@
     </div>
 
 
-    <!-- ==============================
-         15年 ROE 统计
-    =============================== -->
+    <!-- ROE 折线图 -->
 
-    <div
-        id="roe-section"
-        class="section hidden"
-    >
+    <div class="card">
 
         <div class="section-title">
-            15年 ROE 历史统计
+            15年 ROE 趋势
         </div>
 
-        <div class="stats-grid">
+        <div
+            id="chartEmpty"
+            class="empty"
+            style="display:none;"
+        >
+            暂无足够的历史 ROE 数据
+        </div>
 
-            <div class="stat">
+        <div
+            id="chartContainer"
+            class="chart-wrapper"
+        >
+            <canvas id="roeChart"></canvas>
+        </div>
 
-                <div class="stat-label">
+    </div>
+
+
+    <!-- ROE统计 -->
+
+    <div class="card">
+
+        <div class="section-title">
+            15年 ROE 统计
+        </div>
+
+        <div class="grid">
+
+            <div class="metric">
+                <div class="metric-name">
                     有效年度
                 </div>
-
                 <div
-                    id="roe-count"
-                    class="stat-value"
+                    id="roeCount"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
-            <div class="stat">
-
-                <div class="stat-label">
+            <div class="metric">
+                <div class="metric-name">
                     平均 ROE
                 </div>
-
                 <div
-                    id="roe-average"
-                    class="stat-value"
+                    id="roeAverage"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
-            <div class="stat">
-
-                <div class="stat-label">
+            <div class="metric">
+                <div class="metric-name">
                     ROE 中位数
                 </div>
-
                 <div
-                    id="roe-median"
-                    class="stat-value"
+                    id="roeMedian"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
-            <div class="stat">
-
-                <div class="stat-label">
-                    ROE 标准差
+            <div class="metric">
+                <div class="metric-name">
+                    标准差
                 </div>
-
                 <div
-                    id="roe-std"
-                    class="stat-value"
+                    id="roeStd"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
-            <div class="stat">
-
-                <div class="stat-label">
+            <div class="metric">
+                <div class="metric-name">
                     ROE 极差
                 </div>
-
                 <div
-                    id="roe-range"
-                    class="stat-value"
+                    id="roeRange"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
-            <div class="stat">
-
-                <div class="stat-label">
+            <div class="metric">
+                <div class="metric-name">
                     最高 ROE
                 </div>
-
                 <div
-                    id="roe-max"
-                    class="stat-value"
+                    id="roeMax"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
 
-
-            <div class="stat">
-
-                <div class="stat-label">
+            <div class="metric">
+                <div class="metric-name">
                     最低 ROE
                 </div>
-
                 <div
-                    id="roe-min"
-                    class="stat-value"
+                    id="roeMin"
+                    class="metric-value"
                 >
-                    暂无数据
+                    —
                 </div>
-
             </div>
-
-        </div>
-
-
-        <div class="definition">
-
-            <strong>ROE计算公式：</strong><br>
-
-            年度 ROE =
-            年度净利润 ÷
-            ((期初股东权益 + 期末股东权益) ÷ 2)
-
-            <br><br>
-
-            <strong>标准差：</strong>
-
-            15个有效年度 ROE 的样本标准差。
 
         </div>
 
     </div>
 
 
-    <!-- ==============================
-         ROE年度明细
-    =============================== -->
+    <!-- ROE 年度明细 -->
 
-    <div
-        id="roe-table-section"
-        class="section hidden"
-    >
+    <div class="card">
 
         <div class="section-title">
-            年度 ROE 明细
+            15年 ROE 年度明细
         </div>
 
-        <div
-            id="roe-empty"
-            class="empty hidden"
-        >
-            暂无有效年度数据
-        </div>
-
-        <div
-            id="roe-table-wrap"
-            class="table-wrap"
-        >
+        <div class="table-wrapper">
 
             <table>
 
                 <thead>
 
                     <tr>
-
-                        <th>
-                            年份
-                        </th>
-
-                        <th>
-                            净利润
-                        </th>
-
-                        <th>
-                            期初股东权益
-                        </th>
-
-                        <th>
-                            期末股东权益
-                        </th>
-
-                        <th>
-                            ROE
-                        </th>
-
+                        <th>年度</th>
+                        <th>ROE</th>
                     </tr>
 
                 </thead>
 
-                <tbody
-                    id="roe-table-body"
-                ></tbody>
+                <tbody id="roeTable">
+
+                </tbody>
 
             </table>
 
@@ -833,14 +601,9 @@
     </div>
 
 
-    <!-- ==============================
-         数据来源
-    =============================== -->
+    <!-- 数据来源 -->
 
-    <div
-        id="source-section"
-        class="section hidden"
-    >
+    <div class="card">
 
         <div class="section-title">
             数据来源
@@ -850,7 +613,7 @@
             id="source"
             class="source"
         >
-            -
+            —
         </div>
 
     </div>
@@ -860,757 +623,651 @@
 
 <script>
 
-    // =====================================
-    // 工具函数
-    // =====================================
+let roeChart = null;
 
-    function formatNumber(value, decimals = 2) {
 
-        if (
-            value === null ||
-            value === undefined ||
-            value === "" ||
-            Number.isNaN(Number(value))
-        ) {
-            return "暂无数据";
-        }
+function formatNumber(value) {
 
-        return Number(value).toLocaleString(
-            "zh-CN",
-            {
-                minimumFractionDigits: decimals,
-                maximumFractionDigits: decimals
-            }
-        );
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(Number(value))
+    ) {
+        return "暂无数据";
     }
 
-
-    function formatPercent(value) {
-
-        if (
-            value === null ||
-            value === undefined ||
-            value === "" ||
-            Number.isNaN(Number(value))
-        ) {
-            return "暂无数据";
+    return Number(value).toLocaleString(
+        "zh-CN",
+        {
+            maximumFractionDigits: 2
         }
+    );
+}
 
-        return Number(value).toFixed(2) + "%";
+
+function formatPercent(value) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(Number(value))
+    ) {
+        return "暂无数据";
     }
 
+    return Number(value).toFixed(2) + "%";
+}
 
-    function formatMoney(value) {
 
-        if (
-            value === null ||
-            value === undefined ||
-            value === "" ||
-            Number.isNaN(Number(value))
-        ) {
-            return "暂无数据";
-        }
+function formatMoney(value) {
 
-        const num = Number(value);
-
-        const abs = Math.abs(num);
-
-        if (abs >= 1e12) {
-
-            return (
-                (num / 1e12).toFixed(2)
-                +
-                " 万亿"
-            );
-
-        }
-
-        if (abs >= 1e8) {
-
-            return (
-                (num / 1e8).toFixed(2)
-                +
-                " 亿"
-            );
-
-        }
-
-        if (abs >= 1e4) {
-
-            return (
-                (num / 1e4).toFixed(2)
-                +
-                " 万"
-            );
-
-        }
-
-        return formatNumber(
-            num,
-            2
-        );
+    if (
+        value === null ||
+        value === undefined ||
+        Number.isNaN(Number(value))
+    ) {
+        return "暂无数据";
     }
 
+    const n = Number(value);
 
-    function showStatus(message) {
+    const abs = Math.abs(n);
 
-        const status =
-            document.getElementById(
-                "status"
-            );
-
-        status.style.display = "block";
-
-        status.textContent =
-            message;
+    if (abs >= 1e12) {
+        return (n / 1e12).toFixed(2) + "T";
     }
 
-
-    function hideStatus() {
-
-        const status =
-            document.getElementById(
-                "status"
-            );
-
-        status.style.display = "none";
-
+    if (abs >= 1e9) {
+        return (n / 1e9).toFixed(2) + "B";
     }
 
+    if (abs >= 1e6) {
+        return (n / 1e6).toFixed(2) + "M";
+    }
 
-    function showSections() {
+    return n.toLocaleString(
+        "zh-CN",
+        {
+            maximumFractionDigits: 2
+        }
+    );
+}
 
-        const ids = [
 
-            "company-card",
+function setText(id, value) {
 
-            "valuation-section",
+    const element =
+        document.getElementById(id);
 
-            "fundamental-section",
+    if (element) {
+        element.textContent = value;
+    }
+}
 
-            "roe-section",
 
-            "roe-table-section",
+function renderRoeChart(rows) {
 
-            "source-section"
-
-        ];
-
-        ids.forEach(
-            function(id) {
-
-                document
-                    .getElementById(id)
-                    .classList
-                    .remove("hidden");
-
-            }
+    const chartContainer =
+        document.getElementById(
+            "chartContainer"
         );
 
+    const chartEmpty =
+        document.getElementById(
+            "chartEmpty"
+        );
+
+    if (
+        !rows ||
+        !Array.isArray(rows) ||
+        rows.length === 0
+    ) {
+
+        chartContainer.style.display =
+            "none";
+
+        chartEmpty.style.display =
+            "block";
+
+        if (roeChart) {
+            roeChart.destroy();
+            roeChart = null;
+        }
+
+        return;
+    }
+
+    chartContainer.style.display =
+        "block";
+
+    chartEmpty.style.display =
+        "none";
+
+
+    const labels = rows.map(
+        row => String(row.year)
+    );
+
+    const values = rows.map(
+        row => Number(row.roe)
+    );
+
+
+    const canvas =
+        document.getElementById(
+            "roeChart"
+        );
+
+    if (roeChart) {
+        roeChart.destroy();
     }
 
 
-    // =====================================
-    // 查询股票
-    // =====================================
+    roeChart = new Chart(
+        canvas,
+        {
+            type: "line",
 
-    async function queryStock() {
+            data: {
 
-        const input =
-            document.getElementById(
-                "symbol"
-            );
+                labels: labels,
 
-        const button =
-            document.getElementById(
-                "query"
-            );
-
-        const symbol =
-            input.value.trim();
-
-        if (!symbol) {
-
-            showStatus(
-                "请输入股票代码"
-            );
-
-            return;
-        }
-
-        button.disabled = true;
-
-        button.textContent =
-            "查询中...";
-
-        showStatus(
-            "正在获取数据，请稍候..."
-        );
-
-        try {
-
-            const url =
-                "/api/stock/"
-                +
-                encodeURIComponent(
-                    symbol
-                );
-
-            console.log(
-                "请求地址:",
-                url
-            );
-
-            const response =
-                await fetch(
-                    url,
+                datasets: [
                     {
-                        method: "GET",
-                        cache: "no-store"
+                        label: "ROE",
+
+                        data: values,
+
+                        tension: 0.25,
+
+                        borderWidth: 2,
+
+                        pointRadius: 4,
+
+                        pointHoverRadius: 6,
+
+                        fill: false
                     }
-                );
+                ]
+            },
 
-            console.log(
-                "HTTP状态:",
-                response.status
-            );
+            options: {
 
-            const text =
-                await response.text();
+                responsive: true,
 
-            console.log(
-                "API返回:",
-                text
-            );
+                maintainAspectRatio: false,
 
-            if (!response.ok) {
+                interaction: {
+                    mode: "index",
+                    intersect: false
+                },
 
-                let message =
-                    "查询失败";
+                plugins: {
 
-                try {
+                    legend: {
+                        display: true
+                    },
 
-                    const errorData =
-                        JSON.parse(text);
+                    tooltip: {
 
-                    if (
-                        errorData.detail
-                    ) {
-                        message =
-                            errorData.detail;
-                    }
+                        callbacks: {
 
-                } catch (e) {}
+                            label: function(context) {
 
-                throw new Error(
-                    message
-                );
-            }
+                                return (
+                                    "ROE: "
+                                    +
+                                    Number(
+                                        context.raw
+                                    ).toFixed(2)
+                                    +
+                                    "%"
+                                );
 
-            const data =
-                JSON.parse(text);
+                            }
 
-            renderDashboard(
-                data
-            );
-
-            showStatus(
-                "查询成功"
-            );
-
-        } catch (error) {
-
-            console.error(
-                "查询错误:",
-                error
-            );
-
-            showStatus(
-                "查询失败：" +
-                error.message
-            );
-
-        } finally {
-
-            button.disabled = false;
-
-            button.textContent =
-                "查询";
-
-        }
-
-    }
-
-
-    // =====================================
-    // 渲染数据
-    // =====================================
-
-    function renderDashboard(data) {
-
-        showSections();
-
-        // -----------------------------
-        // 公司信息
-        // -----------------------------
-
-        document.getElementById(
-            "company-name"
-        ).textContent =
-            data.company
-            ||
-            data.symbol
-            ||
-            "暂无数据";
-
-
-        document.getElementById(
-            "company-meta"
-        ).textContent =
-
-            "代码："
-            +
-            (
-                data.symbol
-                ||
-                "暂无数据"
-            )
-            +
-            "　｜　市场："
-            +
-            (
-                data.exchange
-                ||
-                "暂无数据"
-            )
-            +
-            "　｜　货币："
-            +
-            (
-                data.currency
-                ||
-                "暂无数据"
-            );
-
-
-        // -----------------------------
-        // 市场数据
-        // -----------------------------
-
-        const market =
-            data.market_data
-            ||
-            {};
-
-        document.getElementById(
-            "price"
-        ).textContent =
-            formatNumber(
-                market.price
-            );
-
-
-        // -----------------------------
-        // 估值
-        // -----------------------------
-
-        const valuation =
-            data.valuation
-            ||
-            {};
-
-        document.getElementById(
-            "pe"
-        ).textContent =
-            formatNumber(
-                valuation.pe
-            );
-
-
-        document.getElementById(
-            "pb"
-        ).textContent =
-            formatNumber(
-                valuation.pb
-            );
-
-
-        document.getElementById(
-            "roe"
-        ).textContent =
-            formatPercent(
-                valuation.roe
-            );
-
-
-        document.getElementById(
-            "roe-pb"
-        ).textContent =
-            formatNumber(
-                valuation.roe_pb
-            );
-
-
-        document.getElementById(
-            "pe-roe"
-        ).textContent =
-            formatNumber(
-                valuation.pe_roe
-            );
-
-
-        // -----------------------------
-        // 基本面
-        // -----------------------------
-
-        const fundamentals =
-            data.fundamentals
-            ||
-            {};
-
-        document.getElementById(
-            "revenue"
-        ).textContent =
-            formatMoney(
-                fundamentals.revenue
-            );
-
-
-        document.getElementById(
-            "net-income"
-        ).textContent =
-            formatMoney(
-                fundamentals.net_income
-            );
-
-
-        document.getElementById(
-            "gross-margin"
-        ).textContent =
-            formatPercent(
-                fundamentals.gross_margin
-            );
-
-
-        document.getElementById(
-            "fcf"
-        ).textContent =
-            formatMoney(
-                fundamentals.free_cash_flow
-            );
-
-
-        // 这里直接显示后端计算出来的股息率
-        document.getElementById(
-            "dividend-yield"
-        ).textContent =
-            formatPercent(
-                fundamentals.dividend_yield
-            );
-
-
-        document.getElementById(
-            "debt-ratio"
-        ).textContent =
-            formatPercent(
-                fundamentals.debt_ratio
-            );
-
-
-        // -----------------------------
-        // 15年 ROE
-        // -----------------------------
-
-        const roeHistory =
-            data.roe_15y
-            ||
-            {};
-
-        const stats =
-            roeHistory.stats
-            ||
-            {};
-
-        document.getElementById(
-            "roe-count"
-        ).textContent =
-            stats.count !== undefined
-            &&
-            stats.count !== null
-                ? stats.count + " 年"
-                : "暂无数据";
-
-
-        document.getElementById(
-            "roe-average"
-        ).textContent =
-            formatPercent(
-                stats.average
-            );
-
-
-        document.getElementById(
-            "roe-median"
-        ).textContent =
-            formatPercent(
-                stats.median
-            );
-
-
-        document.getElementById(
-            "roe-std"
-        ).textContent =
-            formatPercent(
-                stats.std_dev
-            );
-
-
-        document.getElementById(
-            "roe-range"
-        ).textContent =
-            formatPercent(
-                stats.range
-            );
-
-
-        document.getElementById(
-            "roe-max"
-        ).textContent =
-            formatPercent(
-                stats.max
-            );
-
-
-        document.getElementById(
-            "roe-min"
-        ).textContent =
-            formatPercent(
-                stats.min
-            );
-
-
-        // -----------------------------
-        // ROE年度表
-        // -----------------------------
-
-        const tbody =
-            document.getElementById(
-                "roe-table-body"
-            );
-
-        tbody.innerHTML = "";
-
-        const years =
-            Array.isArray(
-                roeHistory.years
-            )
-                ? roeHistory.years
-                : [];
-
-
-        const empty =
-            document.getElementById(
-                "roe-empty"
-            );
-
-        const tableWrap =
-            document.getElementById(
-                "roe-table-wrap"
-            );
-
-
-        if (years.length === 0) {
-
-            empty.classList.remove(
-                "hidden"
-            );
-
-            tableWrap.classList.add(
-                "hidden"
-            );
-
-        } else {
-
-            empty.classList.add(
-                "hidden"
-            );
-
-            tableWrap.classList.remove(
-                "hidden"
-            );
-
-
-            years
-                .slice()
-                .reverse()
-                .forEach(
-                    function(row) {
-
-                        const tr =
-                            document.createElement(
-                                "tr"
-                            );
-
-
-                        const year =
-                            row.year
-                            ??
-                            "暂无数据";
-
-
-                        const netIncome =
-                            formatMoney(
-                                row.net_income
-                            );
-
-
-                        const equityBegin =
-                            formatMoney(
-                                row.equity_begin
-                            );
-
-
-                        const equityEnd =
-                            formatMoney(
-                                row.equity_end
-                            );
-
-
-                        const roe =
-                            formatPercent(
-                                row.roe
-                            );
-
-
-                        tr.innerHTML =
-
-                            "<td>"
-                            +
-                            year
-                            +
-                            "</td>"
-
-                            +
-
-                            "<td>"
-                            +
-                            netIncome
-                            +
-                            "</td>"
-
-                            +
-
-                            "<td>"
-                            +
-                            equityBegin
-                            +
-                            "</td>"
-
-                            +
-
-                            "<td>"
-                            +
-                            equityEnd
-                            +
-                            "</td>"
-
-                            +
-
-                            "<td>"
-                            +
-                            roe
-                            +
-                            "</td>";
-
-
-                        tbody.appendChild(
-                            tr
-                        );
+                        }
 
                     }
-                );
 
-        }
+                },
 
+                scales: {
 
-        // -----------------------------
-        // 数据来源
-        // -----------------------------
+                    x: {
 
-        const source =
-            data.source
-            ||
-            {};
+                        title: {
+                            display: true,
+                            text: "年度"
+                        }
 
-        document.getElementById(
-            "source"
-        ).textContent =
+                    },
 
-            "数据提供方："
-            +
-            (
-                source.provider
-                ||
-                "暂无数据"
-            )
-            +
-            "。"
-            +
-            (
-                source.note
-                ||
-                ""
-            );
+                    y: {
 
-    }
+                        title: {
+                            display: true,
+                            text: "ROE"
+                        },
 
+                        ticks: {
 
-    // =====================================
-    // 点击查询
-    // =====================================
+                            callback:
+                                function(value) {
+                                    return value + "%";
+                                }
 
-    document
-        .getElementById("query")
-        .addEventListener(
-            "click",
-            queryStock
-        );
+                        }
 
-
-    // =====================================
-    // 回车查询
-    // =====================================
-
-    document
-        .getElementById("symbol")
-        .addEventListener(
-            "keydown",
-            function(event) {
-
-                if (
-                    event.key === "Enter"
-                ) {
-
-                    queryStock();
+                    }
 
                 }
 
             }
-        );
-
-
-    // =====================================
-    // 页面加载后自动查询 AAPL
-    // =====================================
-
-    window.addEventListener(
-        "load",
-        function() {
-
-            queryStock();
 
         }
     );
+}
+
+
+function renderRoeTable(rows) {
+
+    const table =
+        document.getElementById(
+            "roeTable"
+        );
+
+    table.innerHTML = "";
+
+
+    if (
+        !rows ||
+        rows.length === 0
+    ) {
+
+        table.innerHTML =
+            '<tr><td colspan="2" class="empty">暂无数据</td></tr>';
+
+        return;
+    }
+
+
+    rows.forEach(
+        row => {
+
+            const tr =
+                document.createElement(
+                    "tr"
+                );
+
+            tr.innerHTML = `
+                <td>${row.year}</td>
+                <td>${formatPercent(row.roe)}</td>
+            `;
+
+            table.appendChild(tr);
+
+        }
+    );
+
+}
+
+
+async function queryStock() {
+
+    const input =
+        document.getElementById(
+            "symbol"
+        );
+
+    const button =
+        document.getElementById(
+            "query"
+        );
+
+    const status =
+        document.getElementById(
+            "status"
+        );
+
+
+    const symbol =
+        input.value.trim();
+
+
+    if (!symbol) {
+
+        status.textContent =
+            "请输入股票代码";
+
+        return;
+    }
+
+
+    button.disabled = true;
+
+    button.textContent =
+        "查询中...";
+
+    status.textContent =
+        "正在获取数据，请稍候...";
+
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/stock/"
+                +
+                encodeURIComponent(
+                    symbol
+                ),
+                {
+                    cache: "no-store"
+                }
+            );
+
+
+        if (!response.ok) {
+
+            throw new Error(
+                "HTTP "
+                +
+                response.status
+            );
+
+        }
+
+
+        const data =
+            await response.json();
+
+
+        console.log(
+            "股票数据：",
+            data
+        );
+
+
+        // 公司
+
+        setText(
+            "company",
+            data.company || data.symbol || "—"
+        );
+
+
+        setText(
+            "companyMeta",
+
+            [
+                data.symbol,
+                data.exchange,
+                data.currency
+            ]
+            .filter(Boolean)
+            .join(" · ")
+        );
+
+
+        // 估值
+
+        setText(
+            "price",
+            formatNumber(
+                data.market_data?.price
+            )
+        );
+
+        setText(
+            "pe",
+            formatNumber(
+                data.valuation?.pe
+            )
+        );
+
+        setText(
+            "pb",
+            formatNumber(
+                data.valuation?.pb
+            )
+        );
+
+        setText(
+            "roe",
+            formatPercent(
+                data.valuation?.roe
+            )
+        );
+
+        setText(
+            "roePb",
+            formatNumber(
+                data.valuation?.roe_pb
+            )
+        );
+
+        setText(
+            "peRoe",
+            formatNumber(
+                data.valuation?.pe_roe
+            )
+        );
+
+
+        // 基本面
+
+        setText(
+            "revenue",
+            formatMoney(
+                data.fundamentals?.revenue
+            )
+        );
+
+        setText(
+            "netIncome",
+            formatMoney(
+                data.fundamentals?.net_income
+            )
+        );
+
+        setText(
+            "grossMargin",
+            formatPercent(
+                data.fundamentals?.gross_margin
+            )
+        );
+
+        setText(
+            "fcf",
+            formatMoney(
+                data.fundamentals?.free_cash_flow
+            )
+        );
+
+        setText(
+            "dividendYield",
+            formatPercent(
+                data.fundamentals?.dividend_yield
+            )
+        );
+
+        setText(
+            "debtRatio",
+            formatPercent(
+                data.fundamentals?.debt_ratio
+            )
+        );
+
+
+        // ROE 统计
+
+        const roeStats =
+            data.roe_15y?.stats || {};
+
+
+        setText(
+            "roeCount",
+            formatNumber(
+                roeStats.count
+            )
+        );
+
+        setText(
+            "roeAverage",
+            formatPercent(
+                roeStats.average
+            )
+        );
+
+        setText(
+            "roeMedian",
+            formatPercent(
+                roeStats.median
+            )
+        );
+
+        setText(
+            "roeStd",
+            formatPercent(
+                roeStats.std_dev
+            )
+        );
+
+        setText(
+            "roeRange",
+            formatPercent(
+                roeStats.range
+            )
+        );
+
+        setText(
+            "roeMax",
+            formatPercent(
+                roeStats.max
+            )
+        );
+
+        setText(
+            "roeMin",
+            formatPercent(
+                roeStats.min
+            )
+        );
+
+
+        // ROE 历史
+
+        const roeRows =
+            data.roe_15y?.years || [];
+
+
+        renderRoeChart(
+            roeRows
+        );
+
+
+        renderRoeTable(
+            roeRows
+        );
+
+
+        // 数据来源
+
+        const source =
+            data.source || {};
+
+
+        setText(
+            "source",
+
+            [
+                "Provider: "
+                +
+                (
+                    source.provider
+                    ||
+                    "Yahoo Finance HTTP API"
+                ),
+
+                source.data_as_of
+                    ?
+                    "Data as of: "
+                    +
+                    source.data_as_of
+                    :
+                    "",
+
+                source.note
+                    ||
+                    ""
+            ]
+            .filter(Boolean)
+            .join("\n")
+        );
+
+
+        status.textContent =
+            "查询完成";
+
+
+    } catch (error) {
+
+        console.error(
+            error
+        );
+
+        status.textContent =
+            "查询失败："
+            +
+            error.message;
+
+    } finally {
+
+        button.disabled =
+            false;
+
+        button.textContent =
+            "查询";
+
+    }
+
+}
+
+
+// 查询按钮
+
+document
+    .getElementById("query")
+    .addEventListener(
+        "click",
+        queryStock
+    );
+
+
+// Enter 查询
+
+document
+    .getElementById("symbol")
+    .addEventListener(
+        "keydown",
+        function(event) {
+
+            if (
+                event.key === "Enter"
+            ) {
+
+                queryStock();
+
+            }
+
+        }
+    );
+
+
+// 页面打开自动查询 AAPL
+
+queryStock();
 
 </script>
 
