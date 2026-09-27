@@ -838,12 +838,14 @@ _PUBLISHER_ZH = {
 }
 
 def _split_translate_chunks(text, max_chars=5000):
+    # Both public translation endpoints used here may reject requests over ~500 chars.
+    # Keep every individual request safely below that limit.
     chunks=[]
     remaining=str(text)[:max_chars]
     while remaining:
-        cut=min(1100,len(remaining))
+        cut=min(440,len(remaining))
         if cut < len(remaining):
-            candidates=[remaining.rfind('. ',0,cut),remaining.rfind('; ',0,cut),remaining.rfind(', ',0,cut),remaining.rfind('。',0,cut)]
+            candidates=[remaining.rfind('. ',0,cut),remaining.rfind('; ',0,cut),remaining.rfind(', ',0,cut),remaining.rfind('。',0,cut),remaining.rfind(' ',0,cut)]
             best=max(candidates)
             if best>350: cut=best+1
         chunks.append(remaining[:cut])
@@ -898,6 +900,11 @@ def translate_to_chinese(text, errors, max_chars=5000):
                 if not tr: raise RuntimeError("empty translation")
                 out.append(tr)
             result="".join(out).strip()
+            # Some public endpoints return an error message as a 200 response.
+            # Never treat that message as the translated company description/news.
+            bad_markers=["QUERY LENGTH LIMIT EXCEEDED", "MAX ALLOWED QUERY", "Request too long", "too many characters"]
+            if any(m.lower() in result.lower() for m in bad_markers):
+                raise RuntimeError("translation provider returned a query-length error")
             if result:
                 _TRANSLATE_CACHE[key]=result
                 return result
