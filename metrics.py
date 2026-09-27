@@ -317,8 +317,51 @@ def fibonacci_levels(history):
     return out
 
 
+def resonance_levels(current, fib, indicators):
+    """Find zones where Fibonacci and Bollinger levels converge.
+
+    A resonance zone requires at least two independent levels within 1% of
+    their cluster center. This is descriptive market structure, not a trade signal.
+    """
+    out = {"available": False, "tolerance_pct": 1.0, "support": [], "resistance": []}
+    current = finite(current)
+    if current is None:
+        return out
+    levels = []
+    for label, value in (fib or {}).get("levels", {}).items():
+        value = finite(value)
+        if value is not None:
+            levels.append({"price": value, "source": f"Fib {label}"})
+    for label, key in (("布林下轨", "bb_lower"), ("布林上轨", "bb_upper")):
+        value = finite((indicators or {}).get(key))
+        if value is not None:
+            levels.append({"price": value, "source": label})
+    if len(levels) < 2:
+        return out
+    levels.sort(key=lambda x: x["price"])
+    clusters = []
+    for item in levels:
+        if not clusters:
+            clusters.append([item]); continue
+        anchor = sum(x["price"] for x in clusters[-1]) / len(clusters[-1])
+        if abs(item["price"] - anchor) / anchor <= 0.01:
+            clusters[-1].append(item)
+        else:
+            clusters.append([item])
+    def pack(cluster):
+        price = sum(x["price"] for x in cluster) / len(cluster)
+        return {"price": price, "count": len(cluster),
+                "sources": [x["source"] for x in cluster],
+                "distance_pct": (price / current - 1) * 100}
+    support = [pack(c) for c in clusters if len(c) >= 2 and sum(x["price"] for x in c)/len(c) < current]
+    resistance = [pack(c) for c in clusters if len(c) >= 2 and sum(x["price"] for x in c)/len(c) > current]
+    support.sort(key=lambda x: (x["count"], x["price"]), reverse=True)
+    resistance.sort(key=lambda x: (x["count"], -x["price"]), reverse=True)
+    out.update({"available": bool(support or resistance), "support": support[:3], "resistance": resistance[:3]})
+    return out
+
 def technical_price_chart(history, fib):
-    out = {"available": False, "points": [], "current": None, "support": None, "resistance": None}
+    out = {"available": False, "points": [], "bollinger_points": [], "current": None, "support": None, "resistance": None}
     if history is None or getattr(history, "empty", True) or "Close" not in history:
         return out
     try:
@@ -327,7 +370,12 @@ def technical_price_chart(history, fib):
             return out
         support = fib.get("nearest_support") if fib else None
         resistance = fib.get("nearest_resistance") if fib else None
+        mid = close.rolling(20).mean()
+        sd = close.rolling(20).std()
+        upper = mid + 2 * sd
+        lower = mid - 2 * sd
         out["points"] = [{"date": str(idx.date()), "price": float(v)} for idx, v in close.items()]
+        out["bollinger_points"] = [{"date": str(idx.date()), "upper": finite(upper.loc[idx]), "mid": finite(mid.loc[idx]), "lower": finite(lower.loc[idx])} for idx in close.index]
         out["current"] = float(close.iloc[-1])
         out["support"] = support
         out["resistance"] = resistance
@@ -353,7 +401,9 @@ def technical_analysis(history):
         macd, signal = ema12-ema26, (ema12-ema26).ewm(span=9, adjust=False).mean()
         macd_val, signal_val = float(macd.iloc[-1]), float(signal.iloc[-1])
         mid, sd = close.rolling(20).mean(), close.rolling(20).std(); upper, lower = mid+2*sd, mid-2*sd
-        bb_pos = safe_ratio(latest-float(lower.iloc[-1]), float(upper.iloc[-1])-float(lower.iloc[-1])) if finite(upper.iloc[-1]) is not None and finite(lower.iloc[-1]) is not None else None
+        bb_mid = finite(mid.iloc[-1]); bb_upper = finite(upper.iloc[-1]); bb_lower = finite(lower.iloc[-1])
+        bb_pos = safe_ratio(latest-bb_lower, bb_upper-bb_lower) if bb_upper is not None and bb_lower is not None else None
+        bb_width = safe_ratio(bb_upper-bb_lower, bb_mid) * 100 if bb_mid not in (None, 0) and bb_upper is not None and bb_lower is not None else None
         ret20 = (latest/float(close.iloc[-21])-1)*100 if len(close)>21 else None
         vol_ratio = None
         if volume is not None and len(volume)>=20:
@@ -369,7 +419,7 @@ def technical_analysis(history):
         if bb_pos is not None: score += 4 if 0.2<=bb_pos<=0.8 else (-3 if bb_pos>0.95 else 0)
         if ret20 is not None: score += max(-5,min(5,ret20/4))
         score=max(0,min(100,round(score))); state="偏强" if score>=65 else ("中性" if score>=45 else "偏弱")
-        out.update({"score":score,"state":state,"signals":signals,"indicators":{"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250],"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"bollinger_position":bb_pos,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52},"history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(120).items()]})
+        out.update({"score":score,"state":state,"signals":signals,"indicators":{"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250],"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52},"history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(120).items()]})
     except Exception:
         pass
     return out
@@ -629,22 +679,63 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     try: divs=t.get_dividends(period="max")
     except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
     dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
-    fib=fibonacci_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
+    fib=fibonacci_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["resonance"]=resonance_levels(price, fib, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
 
     # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
     if sec_roe is not None and len(sec_roe) >= 2:
         roe15=sec_roe; roe_source="SEC EDGAR / XBRL Company Facts"
-        # Keep the headline ROE definition consistent with the 15-year table
-        # for U.S. issuers instead of mixing Yahoo's proprietary calculation.
-        current_roe=finite(roe15[-1].get("roe")) if roe15 else current_roe
     else:
         roe15=annual_roe(inc,bs); roe_source="Yahoo Finance via yfinance"
+
+    # Headline ROE must correspond to the same latest complete fiscal year as
+    # revenue/net income shown above. Do not blindly use the last SEC row: a
+    # newly listed/spun-off company can have SEC historical contexts that do
+    # not line up with Yahoo's latest financial statement columns.
+    def latest_fiscal_roe_from_statements(inc_df, bs_df):
+        if inc_df is None or getattr(inc_df, "empty", True) or bs_df is None or getattr(bs_df, "empty", True):
+            return None
+        try:
+            inc_cols = list(inc_df.columns)
+            bs_cols = list(bs_df.columns)
+            for col in inc_cols:
+                year = getattr(col, "year", None)
+                if year is None:
+                    continue
+                ni = series_value(inc_df, ["Net Income", "Net Income Common Stockholders"], col)
+                if ni is None:
+                    continue
+                same = [c for c in bs_cols if getattr(c, "year", None) == year]
+                prev = [c for c in bs_cols if getattr(c, "year", None) == year - 1]
+                if not same or not prev:
+                    continue
+                ee = series_value(bs_df, ["Stockholders Equity", "Common Stock Equity", "Stockholders Equity Including Minority Interest"], same[0])
+                eb = series_value(bs_df, ["Stockholders Equity", "Common Stock Equity", "Stockholders Equity Including Minority Interest"], prev[0])
+                if eb is None or ee is None or (eb + ee) == 0:
+                    continue
+                return {"year": int(year), "net_income": ni, "equity_begin": eb, "equity_end": ee, "roe": ni / ((eb + ee) / 2) * 100}
+        except Exception:
+            return None
+        return None
+
+    latest_statement_roe = latest_fiscal_roe_from_statements(inc, bs)
+    if latest_statement_roe is not None:
+        current_roe = finite(latest_statement_roe.get("roe"))
+        # Keep the long-history table synchronized with the headline figure.
+        # If the latest financial-statement fiscal year is newer than (or
+        # conflicts with) the last SEC/Yahoo row, replace that year's row.
+        if roe15:
+            target_year = latest_statement_roe["year"]
+            roe15 = [r for r in roe15 if int(r.get("year", -1)) != target_year]
+            roe15.append(latest_statement_roe)
+            roe15 = sorted(roe15, key=lambda r: int(r.get("year", 0)))[-15:]
+        else:
+            roe15 = [latest_statement_roe]
 
     company=info.get("longName") or info.get("shortName") or symbol
     exchange=info.get("exchange") or ""; currency=info.get("currency") or ""
     source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10}
-    return {"query":raw_symbol,"symbol":symbol,"company":company,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
+    return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":info.get("longBusinessSummary") or None,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
             "valuation":{"pe":pe,"pb":pb,"roe":current_roe,"roe_pb":safe_ratio(current_roe,pb),"pe_roe":safe_ratio(pe,current_roe)},
             "fundamentals":{"revenue":revenue,"net_income":net_income,"gross_margin":gross_margin,"free_cash_flow":fcf,"debt_ratio":debt_ratio,"debt_to_equity":finite(info.get("debtToEquity"))},
             "dividends":dividends,"roe_15y":{"years":roe15,"stats":stats([r["roe"] for r in roe15]),"definition":"ROE = 年度净利润 / ((期初股东权益 + 期末股东权益) / 2)","source":roe_source},
