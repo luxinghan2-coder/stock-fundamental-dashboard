@@ -483,17 +483,45 @@ def resonance_levels(current, pivots, indicators):
     return out
 
 
-def _xma_centered(series, n):
-    """Approximate TongdaXin XMA for chart replication.
+def _xma(series, n):
+    """TongdaXin XMA(X,N) compatible future-function implementation.
 
-    TongdaXin documents XMA as an offset/centered moving average that uses
-    data from the following N/2 bars (a future function). For this dashboard
-    we reproduce the historical plotted line with a centered rolling mean.
-    The last N//2 bars are therefore intentionally unavailable rather than
-    being fabricated.
+    XMA is not a centered rolling mean with NaN at the tail. TongdaXin
+    places an N-period arithmetic mean at the middle/offset position and
+    fills the unavailable head/tail with progressively sized means. This
+    reproduces the published/reference Python implementation of XMA and,
+    importantly, makes historical values change when later bars arrive.
     """
-    s=pd.to_numeric(series, errors="coerce")
-    return s.rolling(n, center=True, min_periods=n).mean()
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    L = len(s)
+    if n <= 0 or L == 0:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+    half = (n // 2) + (1 if n % 2 else 0)
+    if L < half:
+        return pd.Series(np.nan, index=s.index, dtype=float)
+
+    vals = s.to_numpy(dtype=float)
+    out = []
+
+    # Head: progressively sized averages.
+    for ilen in range(half, n):
+        out.append(np.nanmean(vals[:ilen]) if np.isfinite(vals[:ilen]).any() else np.nan)
+
+    # Body: the normal N-period MA, but assigned to the middle/offset bar.
+    if L >= n:
+        body = s.rolling(n, min_periods=n).mean().to_numpy()[n-1:]
+        out.extend(body.tolist())
+
+        # Tail: after the last full N-bar window, use shrinking windows.
+        for ilen in range(n-1, half-1, -1):
+            tail = vals[-ilen:]
+            out.append(np.nanmean(tail) if np.isfinite(tail).any() else np.nan)
+
+    arr = np.asarray(out, dtype=float)
+    if len(arr) != L:
+        # Defensive alignment; should not be reached for valid N/L.
+        arr = np.resize(arr, L)
+    return pd.Series(arr, index=s.index, dtype=float)
 
 
 def _cross_up(a, b):
@@ -512,8 +540,8 @@ def _xa_channel(history):
     xa3=w_hi.ewm(span=90, adjust=False).mean()
     xa4=w_lo.ewm(span=90, adjust=False).mean()
     xa7=xa3-xa4; xa8=xa3+xa7*2; xa9=xa4-xa7*2
-    xh=_xma_centered(h,25); xl=_xma_centered(l,25)
-    xh2=_xma_centered(xh,25); xl2=_xma_centered(xl,25)
+    xh=_xma(h,25); xl=_xma(l,25)
+    xh2=_xma(xh,25); xl2=_xma(xl,25)
     rng=xh2-xl2
     zk1=xh2+rng
     zd1=xl2-rng
@@ -553,7 +581,7 @@ def technical_price_chart(history, fib):
         close=h["Close"]; mid=close.rolling(20).mean(); sd=close.rolling(20).std(); upper,lower=mid+2*sd,mid-2*sd
         xa=_xa_channel(h)
         # Calculate on the full 2y history first, then show the latest 120 bars.
-        view=h.tail(120); idxset=set(view.index)
+        view=h.tail(180); idxset=set(view.index)
         support=fib.get("nearest_support") if fib else None; resistance=fib.get("nearest_resistance") if fib else None
         out["points"]=[{"date":str(idx.date()),"open":finite(row["Open"]),"high":finite(row["High"]),"low":finite(row["Low"]),"close":finite(row["Close"]),"volume":finite(row["Volume"])} for idx,row in view.iterrows()]
         out["bollinger_points"]=[{"date":str(idx.date()),"upper":finite(upper.loc[idx]),"mid":finite(mid.loc[idx]),"lower":finite(lower.loc[idx])} for idx in view.index]
@@ -582,7 +610,6 @@ def technical_analysis(history):
         if len(close) < 30: return out
         volume = history["Volume"].dropna().astype(float) if "Volume" in history else None
         latest = float(close.iloc[-1])
-        mas = {n: (float(close.rolling(n).mean().iloc[-1]) if len(close) >= n else None) for n in (20, 60, 120, 250)}
         delta = close.diff(); gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean(); loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan); rsi = float((100 - 100/(1+rs)).iloc[-1]) if finite(rs.iloc[-1]) is not None else None
         ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
@@ -603,7 +630,7 @@ def technical_analysis(history):
         if bb_pos is not None: score += 4 if 0.2<=bb_pos<=0.8 else (-3 if bb_pos>0.95 else 0)
         if ret20 is not None: score += max(-5,min(5,ret20/4))
         score=max(0,min(100,round(score))); state="偏强" if score>=65 else ("中性" if score>=45 else "偏弱")
-        out.update({"score":score,"state":state,"signals":signals,"indicators":{"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250],"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52},"history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(120).items()]})
+        out.update({"score":score,"state":state,"signals":signals,"indicators":{"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52},"history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(180).items()]})
     except Exception:
         pass
     return out
