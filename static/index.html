@@ -20,49 +20,42 @@ function dividendCard(d){const label=d.status==='no_dividend'?'无现金股息':
 function techPriceChart(t){
  const c=t.price_chart||{},r=t.resonance||{};
  if(!c.available||!c.points?.length)return '<div class="empty">暂无足够历史 OHLC 数据</div>';
- const pts=c.points,bb=c.bollinger_points||[],xa=c.xa_points||[],signals=c.xa_signals||[];
- const W=760,H=410,L=48,R=56,T=18,B=52,VH=62,plotH=H-T-B-VH;
+ const pts=c.points,bb=c.bollinger_points||[],xa=c.xa_points||[],signals=c.signals||[];
+ const W=760,H=390,L=48,R=56,T=18,B=52,VH=62,plotH=H-T-B-VH;
  const all=pts.flatMap(p=>[p.high,p.low]).filter(Number.isFinite).concat(bb.flatMap(p=>[p.upper,p.lower]).filter(Number.isFinite),xa.flatMap(p=>[p.zk1,p.zd1]).filter(Number.isFinite));
  if(!all.length)return '<div class="empty">暂无足够历史 OHLC 数据</div>';
- const lo=Math.min(...all),hi=Math.max(...all),pad=Math.max((hi-lo)*.065,.01),yLo=lo-pad,yHi=hi+pad;
+ const lo=Math.min(...all),hi=Math.max(...all),pad=Math.max((hi-lo)*.055,.01),yLo=lo-pad,yHi=hi+pad;
  const x=i=>L+(i+.5)*(W-L-R)/pts.length;
  const y=v=>T+(yHi-v)*(plotH)/(yHi-yLo);
- const volMax=Number(c.volume_max)||0;
- const candleW=Math.max(2.5,Math.min(7,(W-L-R)/pts.length*.58));
+ const volMax=Number(c.volume_max)||0,candleW=Math.max(2.5,Math.min(7,(W-L-R)/pts.length*.58));
  const gridN=5,grid=[];
  for(let j=0;j<=gridN;j++){const yy=T+j*plotH/gridN,p=yHi-(yHi-yLo)*j/gridN;grid.push(`<line x1="${L}" x2="${W-R}" y1="${yy}" y2="${yy}" stroke="#e8ebef" stroke-width="1"/><text x="${W-R+7}" y="${yy+4}" font-size="10" fill="#7b8490">${n(p)}</text>`)}
  const xlabels=[0,Math.floor(pts.length*.25),Math.floor(pts.length*.5),Math.floor(pts.length*.75),pts.length-1].filter((v,i,a)=>a.indexOf(v)===i).map(i=>`<text x="${x(i)}" y="${H-8}" text-anchor="middle" font-size="10" fill="#7b8490">${pts[i].date.slice(5)}</text>`).join('');
- const line=(v,label,cls)=>v==null?'':`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="${cls}" stroke-width="1.2" stroke-dasharray="6 5"/><text x="${W-R+6}" y="${y(v)-4}" font-size="9" fill="${cls}">${label} ${n(v)}</text>`;
- const bbLine=(key)=>{const arr=bb.map((p,i)=>Number.isFinite(p[key])?`${x(i)},${y(p[key])}`:null).filter(Boolean);return arr.length?`<polyline points="${arr.join(' ')}" fill="none" stroke="#a6adb6" stroke-width="1.1" stroke-dasharray="4 4"/>`:''};
- const xaLine=(key,stroke,dash='')=>{const arr=xa.map((p,i)=>Number.isFinite(p[key])?`${x(i)},${y(p[key])}`:null).filter(Boolean);return arr.length?`<polyline points="${arr.join(' ')}" fill="none" stroke="${stroke}" stroke-width="1.8" ${dash?`stroke-dasharray="${dash}"`:''}/>`:''};
- let candles='',vols='',titles='';
+ const lineSeries=(arr,key,stroke,dash='')=>{const map=new Map(arr.map((p,i)=>[p.date,{i,v:Number(p[key])}]));const out=[];pts.forEach((p)=>{const q=map.get(p.date);if(q&&Number.isFinite(q.v))out.push(`${x(q.i)},${y(q.v)}`)});return out.length?`<polyline points="${out.join(' ')}" fill="none" stroke="${stroke}" stroke-width="1.6" ${dash?`stroke-dasharray="${dash}"`:''}/>`:''};
+ const bbLine=key=>lineSeries(bb,key,'#a6adb6','4 4');
+ const xaLine=key=>lineSeries(xa,key,key==='zk1'?'#2563eb':'#2563eb','2 5');
+ let candles='',vols='',titles='',icons='';
  pts.forEach((p,i)=>{
-   const up=p.close>=p.open, stroke=up?'#e84d5b':'#159a68', bodyTop=y(Math.max(p.open,p.close)), bodyBot=y(Math.min(p.open,p.close)), bodyH=Math.max(1.4,bodyBot-bodyTop);
+   const up=p.close>=p.open,stroke=up?'#e84d5b':'#159a68',bodyTop=y(Math.max(p.open,p.close)),bodyBot=y(Math.min(p.open,p.close)),bodyH=Math.max(1.4,bodyBot-bodyTop);
    candles+=`<line x1="${x(i)}" x2="${x(i)}" y1="${y(p.high)}" y2="${y(p.low)}" stroke="${stroke}" stroke-width="1.2"/><rect x="${x(i)-candleW/2}" y="${bodyTop}" width="${candleW}" height="${bodyH}" fill="${up?'#e84d5b':'#159a68'}" rx="0.7"/>`;
    if(Number.isFinite(p.volume)&&volMax>0){const vh=Math.max(1,(Number(p.volume)/volMax)*VH);vols+=`<rect x="${x(i)-candleW/2}" y="${H-B-vh}" width="${candleW}" height="${vh}" fill="${up?'#e84d5b':'#159a68'}" opacity=".35"/>`}
    if(i===pts.length-1) titles+=`<circle cx="${x(i)}" cy="${y(p.close)}" r="3.5" fill="#111827"><title>${p.date} 开 ${n(p.open)} 高 ${n(p.high)} 低 ${n(p.low)} 收 ${n(p.close)}</title></circle>`;
  });
- const sigByDate=new Map(signals.map((s)=>[s.date,s]));
- let icons='';
- pts.forEach((p,i)=>{
-   const sig=sigByDate.get(p.date); if(!sig||!sig.icon)return;
-   const yy=(sig.type==='support')?y(p.low)+20:(sig.type==='pressure'||sig.type==='bull')?y(p.high)-18:y(p.high)-18;
-   icons+=`<text x="${x(i)}" y="${yy}" text-anchor="middle" font-size="18" style="font-family:'Apple Color Emoji','Segoe UI Emoji',sans-serif">${sig.icon}<title>${sig.date} · ${sig.type} · ${sig.rule}</title></text>`;
- });
- const sup=r.support?.[0],res=r.resistance?.[0];
- const last=pts[pts.length-1];
+ const dateIndex=new Map(pts.map((p,i)=>[p.date,i]));
+ signals.forEach(q=>{const i=dateIndex.get(q.date);if(i==null)return; const yy=y(q.price)+(q.type==='finger'||q.type==='cup'?18:-18); icons+=`<text x="${x(i)}" y="${yy}" text-anchor="middle" font-size="15" style="font-family: 'Noto Color Emoji','Segoe UI Emoji',sans-serif" class="xa-icon" aria-label="${q.label}">${q.emoji}<title>${q.date} ${q.label}</title></text>`});
+ const line=(v,label,cls)=>v==null?'':`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="${cls}" stroke-width="1.2" stroke-dasharray="6 5"/><text x="${W-R+6}" y="${y(v)-4}" font-size="9" fill="${cls}">${label} ${n(v)}</text>`;
+ const sup=r.support?.[0],res=r.resistance?.[0],last=pts[pts.length-1];
  return `<div class="kchart">
-   <div class="khead"><div><b>日K</b><span> · 最近180个交易日</span></div><div>O ${n(last.open)}　H ${n(last.high)}　L ${n(last.low)}　C ${n(last.close)}</div></div>
-   <div class="klegend"><span><i style="background:#e84d5b"></i>上涨</span><span><i style="background:#159a68"></i>下跌</span><span><i style="background:#7c8794"></i>布林</span><span><i style="background:#2563eb"></i>ZK1 压力</span><span><i style="background:#f59e0b"></i>ZD1 支撑</span><span>🏃 震荡压力</span><span>☝️ 支撑</span><span>🙂 牛市</span><span>🥤 牛市强化</span></div>
+   <div class="khead"><div><b>日K</b><span> · 最近120个交易日</span></div><div>O ${n(last.open)}　H ${n(last.high)}　L ${n(last.low)}　C ${n(last.close)}</div></div>
+   <div class="klegend"><span><i style="background:#e84d5b"></i>上涨</span><span><i style="background:#159a68"></i>下跌</span><span><i style="background:#7c8794"></i>布林</span><span><i style="background:#2563eb"></i>ZK1压力</span><span><i style="background:#2563eb"></i>ZD1支撑</span><span>🏃 压力</span><span>☝️ 支撑</span><span>🙂 牛市</span><span>🥤 强势</span></div>
    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="AEL 日K线图">
-     <rect x="${L}" y="${T}" width="${W-L-R}" height="${plotH}" fill="#fbfcfd"/>
-     ${grid.join('')}
+     <rect x="${L}" y="${T}" width="${W-L-R}" height="${plotH}" fill="#fbfcfd"/>${grid.join('')}
      <line x1="${L}" x2="${W-R}" y1="${H-B-VH}" y2="${H-B-VH}" stroke="#dfe3e8"/>
-     ${bbLine('upper')}${bbLine('lower')}${xaLine('zk1','#2563eb','4 3')}${xaLine('zd1','#f59e0b','4 3')}
-     ${candles}${vols}${icons}${line(c.current,'现价','#111827')}${line(sup?.price,'回撤支撑','#64748b')}${line(res?.price,'回撤压力','#64748b')}${titles}${xlabels}
+     ${bbLine('upper')}${bbLine('lower')}${xaLine('zk1')}${xaLine('zd1')}
+     ${candles}${vols}${line(c.current,'现价','#111827')}${line(sup?.price,'支撑','#64748b')}${line(res?.price,'压力','#64748b')}${icons}${titles}${xlabels}
      <text x="${L}" y="${H-B-VH+14}" font-size="9" fill="#8a929d">成交量</text>
    </svg>
-   <div class="kfoot">已移除 MA5/MA20/MA60 主图均线，改用你提供的 XA 动态支撑/压力系统；四类图标按原公式 DRAWICON 规则映射。布林带、枢轴/回撤线继续独立显示。</div>
+   <div class="kfoot">K线颜色按中国行情软件习惯：红涨绿跌；虚线为布林带；蓝色虚线为 XA 动态压力 ZK1 / 支撑 ZD1。图标按原公式 DRAWICON 逻辑复刻：🏃压力、☝️支撑、🙂牛市、🥤强化。</div>
  </div>`;
 }
 
@@ -78,7 +71,7 @@ function techCard(t){
  const fibItems=Object.entries(fib.levels||{}).map(([k,v])=>`<div class="fib-item"><span>${k}</span><b>${n(v)}</b></div>`).join('');
  return `<div class="card"><div class="section">技术分析</div><div class="two"><div><div class="score">${n(t.score,0)}</div><div class="muted">技术状态：${esc(t.state)}</div></div><div class="chips">${(t.signals||[]).slice(-7).map(x=>`<span class="chip">${esc(x)}</span>`).join('')}</div></div>
  ${techPriceChart(t)}
- <div class="grid">${metric('MA20',n(i.ma20))}${metric('MA60',n(i.ma60))}${metric('MA120',n(i.ma120))}${metric('MA250',n(i.ma250))}${metric('RSI14',n(i.rsi14,1))}${metric('MACD',n(i.macd,3))}${metric('20日动量',pct(i.momentum_20d))}${metric('52周位置',pct(i['52w_position']))}</div>
+ <div class="grid">${metric('RSI14',n(i.rsi14,1))}${metric('MACD',n(i.macd,3))}${metric('20日动量',pct(i.momentum_20d))}${metric('52周位置',pct(i['52w_position']))}</div>
  <div class="section" style="margin-top:12px">布林带（20日，±2σ）</div><div class="grid">${metric('布林上轨',n(i.bb_upper))}${metric('布林中轨',n(i.bb_mid))}${metric('布林下轨',n(i.bb_lower))}${metric('布林位置',i.bollinger_position==null?'暂无数据':pct(i.bollinger_position*100))}</div>
  <div class="section" style="margin-top:12px">轴点</div>${pivotTable(p)}
  <div class="section" style="margin-top:14px">斐波那契回撤支撑 / 压力</div><div class="fib-grid">${fibItems||'<div class="empty">暂无足够历史行情数据</div>'}</div>${resonanceHtml(r)}
