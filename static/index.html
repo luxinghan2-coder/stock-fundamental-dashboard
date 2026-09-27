@@ -45,6 +45,22 @@ def safe_div(a, b):
 def normalize_symbol(symbol: str) -> tuple[str, str]:
     """
     自动识别常见 A 股、港股、美股代码。
+
+    A股:
+        600519
+        000001
+        300750
+
+    港股:
+        0700
+        700
+        9988
+        0700.HK
+
+    美股:
+        AAPL
+        MSFT
+        BRK.B
     """
 
     original = symbol.strip().upper()
@@ -52,6 +68,7 @@ def normalize_symbol(symbol: str) -> tuple[str, str]:
     if not original:
         raise ValueError("股票代码不能为空")
 
+    # 已经带市场后缀
     if original.endswith(".HK"):
         return original, "港股"
 
@@ -61,12 +78,15 @@ def normalize_symbol(symbol: str) -> tuple[str, str]:
     if original.endswith(".SZ"):
         return original, "A股"
 
+    # 纯数字代码
     if original.isdigit():
 
+        # 4~5 位：默认港股
         if len(original) <= 5:
             padded = original.zfill(4)
             return f"{padded}.HK", "港股"
 
+        # 6 位：根据代码判断沪深
         if len(original) == 6:
 
             if original.startswith(
@@ -79,8 +99,10 @@ def normalize_symbol(symbol: str) -> tuple[str, str]:
             ):
                 return f"{original}.SZ", "A股"
 
+            # 无法明确判断时默认沪市
             return f"{original}.SS", "A股"
 
+    # 其他情况默认美股
     return original, "美股"
 
 
@@ -100,80 +122,6 @@ def get_row(df, names):
     return None
 
 
-def calculate_dividend_yield(ticker, price, info):
-    """
-    自己计算股息率。
-
-    优先使用 Yahoo Finance 的 dividendRate：
-        股息率 = 每股年度股息 / 当前股价 × 100
-
-    不直接使用 dividendYield，
-    避免 Yahoo 字段单位变化导致出现 32% 之类的错误。
-    """
-
-    price = clean_number(price)
-
-    if price is None or price == 0:
-        return None
-
-    # 优先读取年度每股股息
-    dividend_rate = clean_number(
-        info.get("dividendRate")
-    )
-
-    if dividend_rate is not None:
-        return (
-            dividend_rate
-            /
-            price
-        ) * 100
-
-    # 如果 dividendRate 没有数据，
-    # 尝试直接从最近一年的分红记录计算 TTM 股息
-    try:
-
-        dividends = ticker.dividends
-
-        if dividends is not None and not dividends.empty:
-
-            dividends = dividends.dropna()
-
-            if len(dividends) > 0:
-
-                latest_date = dividends.index.max()
-
-                one_year_ago = (
-                    latest_date
-                    -
-                    pd.Timedelta(days=365)
-                )
-
-                recent = dividends[
-                    dividends.index >= one_year_ago
-                ]
-
-                if len(recent) > 0:
-
-                    ttm_dividend = clean_number(
-                        recent.sum()
-                    )
-
-                    if (
-                        ttm_dividend is not None
-                        and ttm_dividend >= 0
-                    ):
-                        return (
-                            ttm_dividend
-                            /
-                            price
-                        ) * 100
-
-    except Exception:
-        pass
-
-    return None
-
-
 def build_current_metrics(ticker):
     """
     获取当前估值及基本面。
@@ -186,22 +134,42 @@ def build_current_metrics(ticker):
     except Exception:
         info = {}
 
+    # -------------------------
+    # 当前价格
+    # -------------------------
+
     price = clean_number(
         info.get("currentPrice")
         or info.get("regularMarketPrice")
     )
 
+    # -------------------------
+    # 市值
+    # -------------------------
+
     market_cap = clean_number(
         info.get("marketCap")
     )
+
+    # -------------------------
+    # PE
+    # -------------------------
 
     pe = clean_number(
         info.get("trailingPE")
     )
 
+    # -------------------------
+    # PB
+    # -------------------------
+
     pb = clean_number(
         info.get("priceToBook")
     )
+
+    # -------------------------
+    # ROE
+    # -------------------------
 
     roe = clean_number(
         info.get("returnOnEquity")
@@ -210,13 +178,25 @@ def build_current_metrics(ticker):
     if roe is not None:
         roe *= 100
 
+    # -------------------------
+    # 营收
+    # -------------------------
+
     revenue = clean_number(
         info.get("totalRevenue")
     )
 
+    # -------------------------
+    # 净利润
+    # -------------------------
+
     net_income = clean_number(
         info.get("netIncomeToCommon")
     )
+
+    # -------------------------
+    # 毛利率
+    # -------------------------
 
     gross_margin = clean_number(
         info.get("grossMargins")
@@ -225,30 +205,37 @@ def build_current_metrics(ticker):
     if gross_margin is not None:
         gross_margin *= 100
 
+    # -------------------------
+    # 自由现金流
+    # -------------------------
+
     free_cash_flow = clean_number(
         info.get("freeCashflow")
     )
 
-    # ==============================
+    # -------------------------
     # 股息率
-    # ==============================
+    # -------------------------
     #
-    # 不再直接读取 dividendYield。
+    # 注意：
+    # 当前 Yahoo/yfinance 返回的
+    # dividendYield 在本项目中直接
+    # 按百分比数值处理。
     #
-    # 自己计算：
+    # 例如：
+    # 0.5  -> 0.5%
+    # 2.1  -> 2.1%
     #
-    # 股息率 =
-    # 年度每股股息 / 当前股价 × 100
+    # 不再执行 ×100。
     #
-    dividend_yield = calculate_dividend_yield(
-        ticker,
-        price,
-        info
+
+    dividend_yield = clean_number(
+        info.get("dividendYield")
     )
 
-    # ==============================
+    # -------------------------
     # 负债率
-    # ==============================
+    # -------------------------
 
     debt_ratio = None
 
@@ -273,6 +260,10 @@ def build_current_metrics(ticker):
 
         if debt_ratio is not None:
             debt_ratio *= 100
+
+    # -------------------------
+    # 返回
+    # -------------------------
 
     return {
 
@@ -331,6 +322,8 @@ def build_roe_history(ticker):
     年度净利润 /
     ((期初股东权益 + 期末股东权益) / 2)
 
+    注意：
+
     只有同时存在：
 
     1. 当年净利润
@@ -338,30 +331,52 @@ def build_roe_history(ticker):
     3. 上一年期末股东权益
 
     才计算该年度 ROE。
+
+    数据不足时不估算。
     """
 
     income = None
     balance = None
 
+    # -------------------------
+    # 获取利润表
+    # -------------------------
+
     try:
+
         income = ticker.get_income_stmt(
             freq="yearly"
         )
+
     except Exception:
+
         try:
             income = ticker.income_stmt
+
         except Exception:
             income = None
 
+    # -------------------------
+    # 获取资产负债表
+    # -------------------------
+
     try:
+
         balance = ticker.get_balance_sheet(
             freq="yearly"
         )
+
     except Exception:
+
         try:
             balance = ticker.balance_sheet
+
         except Exception:
             balance = None
+
+    # -------------------------
+    # 数据不存在
+    # -------------------------
 
     if (
         income is None
@@ -369,24 +384,39 @@ def build_roe_history(ticker):
         or balance is None
         or balance.empty
     ):
+
         return empty_roe_result()
+
+    # -------------------------
+    # 找净利润
+    # -------------------------
 
     net_income_row = get_row(
         income,
         [
             "Net Income",
+
             "NetIncome",
+
             "Net Income Common Stockholders",
+
             "Net Income Including Noncontrolling Interests"
         ]
     )
+
+    # -------------------------
+    # 找股东权益
+    # -------------------------
 
     equity_row = get_row(
         balance,
         [
             "Stockholders Equity",
+
             "Stockholders' Equity",
+
             "Total Stockholder Equity",
+
             "Common Stock Equity"
         ]
     )
@@ -395,15 +425,23 @@ def build_roe_history(ticker):
         net_income_row is None
         or equity_row is None
     ):
+
         return empty_roe_result()
+
+    # -------------------------
+    # 建立净利润年度数据
+    # -------------------------
 
     income_map = {}
 
     for col in net_income_row.index:
 
         try:
+
             year = pd.Timestamp(col).year
+
         except Exception:
+
             continue
 
         value = clean_number(
@@ -411,15 +449,23 @@ def build_roe_history(ticker):
         )
 
         if value is not None:
+
             income_map[year] = value
+
+    # -------------------------
+    # 建立股东权益年度数据
+    # -------------------------
 
     equity_map = {}
 
     for col in equity_row.index:
 
         try:
+
             year = pd.Timestamp(col).year
+
         except Exception:
+
             continue
 
         value = clean_number(
@@ -427,13 +473,22 @@ def build_roe_history(ticker):
         )
 
         if value is not None:
+
             equity_map[year] = value
+
+    # -------------------------
+    # 找共同年度
+    # -------------------------
 
     years = sorted(
         set(income_map.keys())
         &
         set(equity_map.keys())
     )
+
+    # -------------------------
+    # 计算年度 ROE
+    # -------------------------
 
     rows = []
 
@@ -451,6 +506,8 @@ def build_roe_history(ticker):
             year
         )
 
+        # 缺少上一年权益
+        # 无法按照平均权益法计算
         if (
             beginning_equity is None
             or ending_equity is None
@@ -490,13 +547,24 @@ def build_roe_history(ticker):
 
         })
 
-    # 最近15个有效年度
+    # -------------------------
+    # 只保留最近 15 个有效年度
+    # -------------------------
+
     rows = rows[-15:]
 
+    # -------------------------
+    # 统计
+    # -------------------------
+
     values = [
+
         float(row["roe"])
+
         for row in rows
+
         if row.get("roe") is not None
+
     ]
 
     if values:
@@ -508,6 +576,13 @@ def build_roe_history(ticker):
         median = float(
             np.median(values)
         )
+
+        # 样本标准差
+        #
+        # ddof=1
+        #
+        # 当只有一个数据点时
+        # 标准差无法计算。
 
         if len(values) >= 2:
 
@@ -539,11 +614,20 @@ def build_roe_history(ticker):
     else:
 
         average = None
+
         median = None
+
         std_dev = None
+
         maximum = None
+
         minimum = None
+
         value_range = None
+
+    # -------------------------
+    # 返回
+    # -------------------------
 
     return {
 
@@ -577,6 +661,9 @@ def build_roe_history(ticker):
 
 
 def empty_roe_result():
+    """
+    ROE 历史数据不足时返回统一结构。
+    """
 
     return {
 
@@ -610,28 +697,54 @@ def empty_roe_result():
 
 
 def build_dashboard(symbol: str):
+    """
+    构建完整股票基本面数据。
+    """
+
+    # -------------------------
+    # 股票代码标准化
+    # -------------------------
 
     yahoo_symbol, exchange = normalize_symbol(
         symbol
     )
 
+    # -------------------------
+    # 创建 ticker
+    # -------------------------
+
     ticker = yf.Ticker(
         yahoo_symbol
     )
+
+    # -------------------------
+    # 当前数据
+    # -------------------------
 
     current = build_current_metrics(
         ticker
     )
 
+    # -------------------------
+    # 15年 ROE
+    # -------------------------
+
     roe_15y = build_roe_history(
         ticker
     )
 
+    # -------------------------
+    # 公司名称
+    # -------------------------
+
     info = {}
 
     try:
+
         info = ticker.info
+
     except Exception:
+
         info = {}
 
     company = (
@@ -640,19 +753,19 @@ def build_dashboard(symbol: str):
         or symbol.upper()
     )
 
+    # -------------------------
+    # 最终返回
+    # -------------------------
+
     return {
 
-        "query":
-            symbol.upper(),
+        "query": symbol.upper(),
 
-        "symbol":
-            yahoo_symbol,
+        "symbol": yahoo_symbol,
 
-        "company":
-            company,
+        "company": company,
 
-        "exchange":
-            exchange,
+        "exchange": exchange,
 
         "currency":
             info.get("currency"),
