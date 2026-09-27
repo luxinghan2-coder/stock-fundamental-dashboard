@@ -8,7 +8,7 @@ from time import time
 from metrics import build_dashboard
 
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.4.18', version='2.4.18')
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.4.20', version='2.4.20')
 
 # AEL MARKET SCAN：主动触发才执行。默认使用轻量、可控的跨市场候选池；
 # 可通过环境变量 AEL_SCAN_UNIVERSE 覆盖，格式：AAPL,MSFT,600519.SS,0700.HK
@@ -28,7 +28,7 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.4.18'}
+    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.4.20'}
 
 @app.get('/api/stock/core/{symbol}')
 def stock_core(symbol: str):
@@ -86,6 +86,9 @@ def _scan_one(symbol: str):
             'roe': roe, 'pe': pe, 'fcf': fcf,
             'strength': strength, 'value_score': value, 'composite_score': composite,
             'state': tech.get('state') or '', 'value_state': tech.get('value_state') or '',
+            'score_breakdown': tech.get('score_breakdown') or {},
+            'value_breakdown': tech.get('value_breakdown') or {},
+            'composite_breakdown': tech.get('composite_breakdown') or {},
         }
     except Exception:
         return None
@@ -114,21 +117,44 @@ def market_scan(
             if row:
                 results.append(row)
 
-    # 固定按综合评分排序：技术强势分50% + 技术价值分50%。
-    def rank_key(x):
-        return x.get('composite_score') if isinstance(x.get('composite_score'), (int, float)) else -1
-    results.sort(key=rank_key, reverse=True)
-    results = results[:limit]
+    # 每个市场独立排名：综合评分降序；同分时技术强势、技术价值、代码依次作为稳定排序键。
+    def market_of(symbol):
+        u = str(symbol).upper()
+        if u.endswith('.HK'): return 'hk'
+        if u.endswith('.SS') or u.endswith('.SZ'): return 'cn'
+        return 'us'
+    groups = {'us': [], 'hk': [], 'cn': []}
+    for row in results:
+        groups[market_of(row.get('symbol', ''))].append(row)
+    ranked = {}
+    for mk in ('us', 'hk', 'cn'):
+        group = groups[mk]
+        group.sort(key=lambda x: (
+            float(x.get('composite_score', -1)),
+            float(x.get('strength', -1)),
+            float(x.get('value_score', -1)),
+            str(x.get('symbol', ''))
+        ), reverse=True)
+        group = group[:limit]
+        for idx, row in enumerate(group, 1):
+            row['rank'] = idx
+            row['market'] = mk
+        ranked[mk] = group
+    selected_markets = [m.strip().lower() for m in markets.split(',') if m.strip() in {'us','hk','cn'}]
+    matched = sum(len(ranked[m]) for m in selected_markets)
     data = {
         'ok': True,
         'scan': {
-            'markets': [('美股' if m=='us' else '港股' if m=='hk' else 'A股') for m in ['us','hk','cn'] if m in {x.strip().lower() for x in markets.split(',')}],
+            'markets': [('美股' if m=='us' else '港股' if m=='hk' else 'A股') for m in ['us','hk','cn'] if m in selected_markets],
             'universe_size': len(universe),
-            'matched': len(results),
-            'rules': '基本面数据完整 + 技术强势分、技术价值分、综合评分均可计算；缺失数据不估算',
+            'matched': matched,
+            'top_n': limit,
+            'rules': '每个市场独立按综合评分降序排名；同分依次比较技术强势分、技术价值分；基本面与技术数据不足不估算、不入榜',
             'ttl_seconds': _SCAN_CACHE_TTL,
         },
-        'results': results,
+        'results_by_market': {m: ranked[m] for m in selected_markets},
+        # 保留扁平 results 兼容旧前端/调用方，但正式 UI 使用 results_by_market。
+        'results': [row for m in selected_markets for row in ranked[m]],
         'cached': False,
     }
     _SCAN_CACHE[cache_key] = {'ts': now, 'data': data}
