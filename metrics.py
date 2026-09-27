@@ -329,52 +329,138 @@ def _sec_fact(facts, tags):
 
 
 def sec_annual_roe(symbol, errors):
-    """15-year ROE from SEC Company Facts for US-listed common stocks."""
+    """Build up to 15 annual ROEs from SEC Company Facts.
+
+    Income is a duration fact (FY/10-K); equity is an instant fact at fiscal
+    year-end.  They therefore must NOT be filtered with the same rules.
+    """
     if not is_us_symbol(symbol):
         return None
     try:
-        cik = sec_cik_for_ticker(symbol.replace("-", "-"))
+        cik = sec_cik_for_ticker(symbol)
         if not cik:
             errors["sec"] = "ticker not found in SEC company_tickers"
             return None
+
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
         r = requests.get(url, headers=SEC_HEADERS, timeout=15)
-        r.raise_for_status(); data = r.json()
+        r.raise_for_status()
+        data = r.json()
         facts = data.get("facts", {})
-        ni = _sec_fact(facts, [("us-gaap", "NetIncomeLoss"), ("us-gaap", "ProfitLoss"), ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic")])
-        eq = _sec_fact(facts, [("us-gaap", "StockholdersEquity"), ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"), ("us-gaap", "PartnersCapital")])
-        if not ni or not eq:
-            errors["sec"] = "SEC facts missing net income or equity tags"
+
+        def pick_units(taxonomy, tag_candidates):
+            for tag in tag_candidates:
+                unit_map = facts.get(taxonomy, {}).get(tag, {}).get("units", {})
+                if not unit_map:
+                    continue
+                if "USD" in unit_map:
+                    return unit_map["USD"]
+                # Equity/net-income for ordinary issuers should normally be USD.
+                first = next(iter(unit_map.values()), None)
+                if first:
+                    return first
             return []
 
-        def annual_values(items):
+        # Net income is a duration/flow fact.
+        ni_items = pick_units("us-gaap", [
+            "NetIncomeLoss",
+            "ProfitLoss",
+            "NetIncomeLossAvailableToCommonStockholdersBasic",
+            "NetIncomeLossAvailableToCommonStockholdersDiluted",
+        ])
+        # Equity is an instant/balance-sheet fact.  Prefer parent/common equity
+        # over a total including non-controlling interests when both exist.
+        eq_items = pick_units("us-gaap", [
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            "CommonStockholdersEquity",
+            "PartnersCapital",
+        ])
+        if not ni_items or not eq_items:
+            errors["sec"] = "SEC facts missing usable net income or equity tags"
+            return []
+
+        def latest_annual_flow(items):
             by_year = {}
             for x in items:
-                fy=x.get("fy"); fp=x.get("fp"); form=x.get("form"); end=x.get("end"); start=x.get("start"); val=finite(x.get("val"))
-                if val is None or not fy or fp != "FY" or form not in ("10-K","20-F","40-F") or not end or not start:
+                val = finite(x.get("val"))
+                fy = x.get("fy")
+                fp = x.get("fp")
+                form = x.get("form")
+                start = x.get("start")
+                end = x.get("end")
+                if val is None or not fy or not end or not start:
                     continue
-                # Avoid quarterly-like facts mislabeled FY: require roughly 9-15 months.
+                if form not in ("10-K", "20-F", "40-F"):
+                    continue
+                # Annual income statement fact: roughly a full fiscal year.
                 try:
-                    days=(pd.Timestamp(end)-pd.Timestamp(start)).days
-                    if days < 250 or days > 400: continue
-                except Exception: continue
-                year=int(fy)
-                # Keep the latest filed fact for each fiscal year.
-                old=by_year.get(year)
-                if old is None or str(x.get("filed","")) > str(old.get("filed","")):
-                    by_year[year]=x
-            return by_year
+                    days = (pd.Timestamp(end) - pd.Timestamp(start)).days
+                except Exception:
+                    continue
+                if days < 250 or days > 400:
+                    continue
+                # Prefer explicit FY facts; some filings use a non-FY fp.
+                year = int(fy)
+                score = (1 if fp == "FY" else 0, str(x.get("filed", "")))
+                old = by_year.get(year)
+                if old is None or score > old[0]:
+                    by_year[year] = (score, x)
+            return {y: item for y, (_, item) in by_year.items()}
 
-        ni_by=annual_values(ni); eq_by=annual_values(eq)
-        years=sorted(set(ni_by) & set(eq_by))
-        rows=[]
+        def latest_annual_instant(items):
+            by_year = {}
+            for x in items:
+                val = finite(x.get("val"))
+                end = x.get("end")
+                form = x.get("form")
+                fy = x.get("fy")
+                if val is None or not end or form not in ("10-K", "20-F", "40-F"):
+                    continue
+                # Instant fact: no start date should be required.
+                try:
+                    year = int(fy) if fy else pd.Timestamp(end).year
+                except Exception:
+                    continue
+                score = (
+                    1 if x.get("fp") == "FY" else 0,
+                    str(x.get("filed", "")),
+                )
+                old = by_year.get(year)
+                if old is None or score > old[0]:
+                    by_year[year] = (score, x)
+            return {y: item for y, (_, item) in by_year.items()}
+
+        ni_by = latest_annual_flow(ni_items)
+        eq_by = latest_annual_instant(eq_items)
+        years = sorted(set(ni_by) & set(eq_by))
+        rows = []
         for year in years:
-            begin_fact=eq_by.get(year-1)
-            end_fact=eq_by.get(year)
-            n=finite(ni_by[year].get("val")); eb=finite(begin_fact.get("val")) if begin_fact else None; ee=finite(end_fact.get("val")) if end_fact else None
-            if n is None or eb is None or ee is None or (eb+ee)==0: continue
-            roe=n/((eb+ee)/2)*100
-            rows.append({"year":year,"net_income":n,"equity_begin":eb,"equity_end":ee,"roe":roe})
+            # Beginning equity is the immediately preceding fiscal year-end.
+            prev = eq_by.get(year - 1)
+            cur = eq_by.get(year)
+            if not prev or not cur:
+                continue
+            n = finite(ni_by[year].get("val"))
+            eb = finite(prev.get("val"))
+            ee = finite(cur.get("val"))
+            if n is None or eb is None or ee is None:
+                continue
+            avg_equity = (eb + ee) / 2
+            if avg_equity == 0:
+                continue
+            rows.append({
+                "year": int(year),
+                "net_income": n,
+                "equity_begin": eb,
+                "equity_end": ee,
+                "roe": n / avg_equity * 100,
+            })
+
+        rows.sort(key=lambda x: x["year"])
+        if not rows:
+            errors["sec"] = "SEC facts found, but no matching annual income/equity pairs"
+            return []
         return rows[-15:]
     except Exception as exc:
         errors["sec"] = str(exc)[:240]
