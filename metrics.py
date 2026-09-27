@@ -483,137 +483,92 @@ def resonance_levels(current, pivots, indicators):
     return out
 
 
-def _xma(series, n):
-    """TongdaXin-style XMA approximation: alpha=1/N exponential smoothing."""
-    s = pd.to_numeric(series, errors="coerce").astype(float)
-    if s.empty:
-        return s
-    alpha = 1.0 / float(n)
-    out = pd.Series(index=s.index, dtype=float)
-    prev = None
-    for idx, value in s.items():
-        if not np.isfinite(value):
-            out.loc[idx] = prev if prev is not None else np.nan
-            continue
-        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
-        out.loc[idx] = prev
-    return out
+def _xma_centered(series, n):
+    """Approximate TongdaXin XMA for chart replication.
+
+    TongdaXin documents XMA as an offset/centered moving average that uses
+    data from the following N/2 bars (a future function). For this dashboard
+    we reproduce the historical plotted line with a centered rolling mean.
+    The last N//2 bars are therefore intentionally unavailable rather than
+    being fabricated.
+    """
+    s=pd.to_numeric(series, errors="coerce")
+    return s.rolling(n, center=True, min_periods=n).mean()
 
 
 def _cross_up(a, b):
-    """CROSS(A,B): A was <= B on the previous bar and is > B now."""
-    return bool(a.iloc[-1] > b.iloc[-1] and a.iloc[-2] <= b.iloc[-2]) if len(a) >= 2 else False
+    """TongdaXin-style CROSS(a,b): a crosses from <= b to > b."""
+    return (a > b) & (a.shift(1) <= b.shift(1))
+
+
+def _xa_channel(history):
+    h=pd.to_numeric(history["High"], errors="coerce")
+    l=pd.to_numeric(history["Low"], errors="coerce")
+    c=pd.to_numeric(history["Close"], errors="coerce")
+    # Exact weighted formulas supplied by the user: REF(19) is intentionally
+    # absent and REF(20) carries weight 1, while the denominator remains 210.
+    w_hi=(20*h + 19*h.shift(1)+18*h.shift(2)+17*h.shift(3)+16*h.shift(4)+15*h.shift(5)+14*h.shift(6)+13*h.shift(7)+12*h.shift(8)+11*h.shift(9)+10*h.shift(10)+9*h.shift(11)+8*h.shift(12)+7*h.shift(13)+6*h.shift(14)+5*h.shift(15)+4*h.shift(16)+3*h.shift(17)+2*h.shift(18)+h.shift(20))/210.0
+    w_lo=(20*l + 19*l.shift(1)+18*l.shift(2)+17*l.shift(3)+16*l.shift(4)+15*l.shift(5)+14*l.shift(6)+13*l.shift(7)+12*l.shift(8)+11*l.shift(9)+10*l.shift(10)+9*l.shift(11)+8*l.shift(12)+7*l.shift(13)+6*l.shift(14)+5*l.shift(15)+4*l.shift(16)+3*l.shift(17)+2*l.shift(18)+l.shift(20))/210.0
+    xa3=w_hi.ewm(span=90, adjust=False).mean()
+    xa4=w_lo.ewm(span=90, adjust=False).mean()
+    xa7=xa3-xa4; xa8=xa3+xa7*2; xa9=xa4-xa7*2
+    xh=_xma_centered(h,25); xl=_xma_centered(l,25)
+    xh2=_xma_centered(xh,25); xl2=_xma_centered(xl,25)
+    rng=xh2-xl2
+    zk1=xh2+rng
+    zd1=xl2-rng
+    xa12=(zd1>=xa9) & (zk1>=xa8)
+    xa13=(zk1<=xa8) & (zd1<=xa9)
+    xa14=(zd1>=xa9) & (zk1<=xa8)
+    cross_low=_cross_up(zd1,l)
+    cross_high=_cross_up(h,zk1)
+    xa33=cross_low & xa12
+    xa34=cross_high & xa12 & (~xa14)
+    xa35=cross_high & xa13
+    xa36=cross_low & xa13 & (~xa14)
+    xa37=cross_low & xa14
+    xa38=cross_high & xa14
+    return {"zk1":zk1,"zd1":zd1,"xa12":xa12,"xa13":xa13,"xa14":xa14,
+            "signals": {"finger":xa36,"run":xa34,"smile":xa35,"cup":xa33 | xa37,
+                        "finger_raw":xa36,"run_raw":xa34,"smile_raw":xa35,"cup_raw":xa33|xa37,
+                        "all":xa33|xa34|xa35|xa36|xa37|xa38}}
 
 
 def technical_price_chart(history, fib):
-    """Build the AEL XA technical-analysis overlay.
-
-    MA5/10/20/60 are intentionally NOT rendered on the main K-line chart.
-    The overlay follows the supplied formula: ZK1/ZD1 plus four icon events.
-    """
-    out = {
-        "available": False, "points": [], "bollinger_points": [],
-        "current": None, "support": None, "resistance": None,
-        "ma_points": [], "xa_points": [], "xa_signals": [],
-        "volume_max": None, "timeframe": "1D"
-    }
-    if history is None or getattr(history, "empty", True) or "Close" not in history:
+    """Build OHLC candles + Bollinger + user-supplied XA channel/signals."""
+    out={"available":False,"points":[],"bollinger_points":[],"xa_points":[],"signals":[],
+         "current":None,"support":None,"resistance":None,"ma_points":[],"volume_max":None,"timeframe":"1D"}
+    if history is None or getattr(history,"empty",True) or "Close" not in history:
         return out
     try:
-        cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in history.columns]
-        h = history[cols].copy()
-        for c in cols:
-            h[c] = pd.to_numeric(h[c], errors="coerce")
-        h = h.dropna(subset=["Close"]).tail(180)
-        if len(h) < 30:
-            return out
-        for c in ("Open", "High", "Low"):
-            if c not in h.columns:
-                h[c] = h["Close"]
-        h["Open"] = h["Open"].fillna(h["Close"])
-        h["High"] = h["High"].fillna(h[["Open", "Close"]].max(axis=1))
-        h["Low"] = h["Low"].fillna(h[["Open", "Close"]].min(axis=1))
-        if "Volume" not in h.columns:
-            h["Volume"] = np.nan
-
-        close, high, low = h["Close"], h["High"], h["Low"]
-        mid = close.rolling(20).mean()
-        sd = close.rolling(20).std()
-        upper, lower = mid + 2 * sd, mid - 2 * sd
-
-        # Supplied XA formula.
-        # The original weights sum to 210; REF(...,20) is intentionally kept
-        # as the unweighted twentieth prior bar, matching the source formula.
-        xa1 = sum((20-i) * high.shift(i) for i in range(19)) / 210.0 + high.shift(20) / 210.0
-        xa2 = sum((20-i) * low.shift(i) for i in range(19)) / 210.0 + low.shift(20) / 210.0
-        xa3, xa4 = _xma(xa1, 90), _xma(xa2, 90)
-        xa7 = xa3 - xa4
-        xa8, xa9 = xa3 + xa7 * 2, xa4 - xa7 * 2
-        xma_h25 = _xma(_xma(high, 25), 25)
-        xma_l25 = _xma(_xma(low, 25), 25)
-        xa10 = xma_h25 + (xma_h25 - xma_l25)
-        xa11 = xma_l25 - (xma_h25 - xma_l25)
-        xa12 = (xa3 >= xa9) & (xa10 >= xa8)
-        xa13 = (xa10 <= xa8) & (xa11 <= xa9)
-        xa14 = (xa11 >= xa9) & (xa10 <= xa8)
-        xa17 = xa11 - (xma_h25 - xma_l25) * 0.5
-        xa18 = (xa10 + xa11) / 2.0
-
-        out["points"] = [{
-            "date": str(idx.date()), "open": finite(row["Open"]),
-            "high": finite(row["High"]), "low": finite(row["Low"]),
-            "close": finite(row["Close"]), "volume": finite(row["Volume"])
-        } for idx, row in h.iterrows()]
-        out["bollinger_points"] = [{
-            "date": str(idx.date()), "upper": finite(upper.loc[idx]),
-            "mid": finite(mid.loc[idx]), "lower": finite(lower.loc[idx])
-        } for idx in h.index]
-        out["xa_points"] = [{
-            "date": str(idx.date()), "zk1": finite(xa10.loc[idx]),
-            "zd1": finite(xa11.loc[idx]), "mid": finite(xa18.loc[idx]),
-            "outer_support": finite(xa17.loc[idx])
-        } for idx in h.index]
-
-        # Exact signal mapping from the supplied DRAWICON rules:
-        # 11 = XA36, 5 = XA34, 19 = XA33/XA37, 15 = XA35/XA38.
-        sigs = []
-        for i, idx in enumerate(h.index):
-            if i == 0:
-                continue
-            cross_zd_low = bool(xa11.iloc[i] > low.iloc[i] and xa11.iloc[i-1] <= low.iloc[i-1])
-            cross_high_zk = bool(high.iloc[i] > xa10.iloc[i] and high.iloc[i-1] <= xa10.iloc[i-1])
-            a12, a13, a14 = bool(xa12.iloc[i]), bool(xa13.iloc[i]), bool(xa14.iloc[i])
-            xa33 = cross_zd_low and a12
-            xa34 = cross_high_zk and a12 and not a14
-            xa35 = cross_high_zk and a13
-            xa36 = cross_zd_low and a13 and not a14
-            xa37 = cross_zd_low and a14
-            xa38 = cross_high_zk and a14
-            if xa36:
-                sigs.append({"date": str(idx.date()), "icon": "☝️", "code": 11, "type": "support", "price": finite(low.iloc[i]), "rule": "XA36"})
-            if xa34:
-                sigs.append({"date": str(idx.date()), "icon": "🏃", "code": 5, "type": "pressure", "price": finite(high.iloc[i]), "rule": "XA34"})
-            if xa33 or xa37:
-                sigs.append({"date": str(idx.date()), "icon": "☝️", "code": 19, "type": "support", "price": finite(low.iloc[i]), "rule": "XA33/XA37"})
-            if xa35 or xa38:
-                sigs.append({"date": str(idx.date()), "icon": "🙂", "code": 15, "type": "bull", "price": finite(high.iloc[i]), "rule": "XA35/XA38"})
-        # The source formula has four icon IDs. Keep the visual mapping compact;
-        # the cup is used as the stronger bull-state marker when XA14 is active.
-        for sig in sigs:
-            if sig["code"] == 15 and any(
-                x["date"] == sig["date"] and x["rule"] in ("XA35", "XA38") for x in sigs
-            ):
-                # Preserve the original code while exposing the user's preferred
-                # four visual categories to the frontend.
-                sig["icon"] = "🥤" if sig["rule"] == "XA38" else "🙂"
-        out["xa_signals"] = sigs
-
-        vols = h["Volume"].dropna()
-        out["volume_max"] = float(vols.max()) if not vols.empty else None
-        out["current"] = float(close.iloc[-1])
-        out["support"] = fib.get("nearest_support") if fib else None
-        out["resistance"] = fib.get("nearest_resistance") if fib else None
-        out["available"] = True
+        cols=[c for c in ("Open","High","Low","Close","Volume") if c in history.columns]
+        h=history[cols].copy()
+        for c in cols: h[c]=pd.to_numeric(h[c],errors="coerce")
+        h=h.dropna(subset=["Close"]).copy()
+        if len(h)<40: return out
+        for c in ("Open","High","Low"):
+            if c not in h.columns: h[c]=h["Close"]
+        h["Open"]=h["Open"].fillna(h["Close"]); h["High"]=h["High"].fillna(h[["Open","Close"]].max(axis=1)); h["Low"]=h["Low"].fillna(h[["Open","Close"]].min(axis=1))
+        if "Volume" not in h.columns: h["Volume"]=np.nan
+        close=h["Close"]; mid=close.rolling(20).mean(); sd=close.rolling(20).std(); upper,lower=mid+2*sd,mid-2*sd
+        xa=_xa_channel(h)
+        # Calculate on the full 2y history first, then show the latest 120 bars.
+        view=h.tail(120); idxset=set(view.index)
+        support=fib.get("nearest_support") if fib else None; resistance=fib.get("nearest_resistance") if fib else None
+        out["points"]=[{"date":str(idx.date()),"open":finite(row["Open"]),"high":finite(row["High"]),"low":finite(row["Low"]),"close":finite(row["Close"]),"volume":finite(row["Volume"])} for idx,row in view.iterrows()]
+        out["bollinger_points"]=[{"date":str(idx.date()),"upper":finite(upper.loc[idx]),"mid":finite(mid.loc[idx]),"lower":finite(lower.loc[idx])} for idx in view.index]
+        out["xa_points"]=[{"date":str(idx.date()),"zk1":finite(xa["zk1"].loc[idx]),"zd1":finite(xa["zd1"].loc[idx]),"state":"bull" if bool(xa["xa12"].loc[idx]) else ("bear" if bool(xa["xa13"].loc[idx]) else ("transition" if bool(xa["xa14"].loc[idx]) else "neutral"))} for idx in view.index]
+        icon_map=[("finger", "☝️", "支撑"),("run","🏃","压力"),("smile","🙂","牛市"),("cup","🥤","杯子")]
+        sigs=[]
+        for key,emoji,label in icon_map:
+            ser=xa["signals"][key]
+            for idx,val in ser.items():
+                if bool(val) and idx in idxset:
+                    price=float(h.loc[idx,"Low"] if key in ("finger","cup") else h.loc[idx,"High"])
+                    sigs.append({"date":str(idx.date()),"type":key,"emoji":emoji,"label":label,"price":price})
+        out["signals"]=sorted(sigs,key=lambda x:x["date"])
+        vols=view["Volume"].dropna(); out["volume_max"]=float(vols.max()) if not vols.empty else None
+        out["current"]=float(close.iloc[-1]); out["support"]=support; out["resistance"]=resistance; out["available"]=True
     except Exception:
         pass
     return out
@@ -643,10 +598,6 @@ def technical_analysis(history):
             av=float(volume.rolling(20).mean().iloc[-1]); vol_ratio=float(volume.iloc[-1]/av) if av else None
         high52, low52 = float(close.tail(252).max()), float(close.tail(252).min()); pos52 = (latest-low52)/(high52-low52)*100 if high52 != low52 else None
         score=50.0; signals=[]
-        for n,w in [(20,10),(60,10),(120,10),(250,15)]:
-            ma=mas[n]
-            if ma is not None:
-                score += w if latest>ma else -w; signals.append(f"MA{n}之上" if latest>ma else f"MA{n}之下")
         if rsi is not None: score += 8 if 50<=rsi<=70 else (-5 if rsi>75 else (2 if rsi<30 else -2))
         score += 8 if macd_val>signal_val else -8; signals.append("MACD强于信号线" if macd_val>signal_val else "MACD弱于信号线")
         if bb_pos is not None: score += 4 if 0.2<=bb_pos<=0.8 else (-3 if bb_pos>0.95 else 0)
@@ -902,17 +853,15 @@ _PUBLISHER_ZH = {
     "AP News": "美联社",
 }
 
-def _split_translate_chunks(text, max_chars=5000):
-    chunks=[]
-    remaining=str(text)[:max_chars]
+def _split_translate_chunks(text, max_chars=450):
+    chunks=[]; remaining=str(text)[:max_chars*20]
     while remaining:
-        cut=min(1100,len(remaining))
+        cut=min(max_chars,len(remaining))
         if cut < len(remaining):
             candidates=[remaining.rfind('. ',0,cut),remaining.rfind('; ',0,cut),remaining.rfind(', ',0,cut),remaining.rfind('。',0,cut)]
             best=max(candidates)
-            if best>350: cut=best+1
-        chunks.append(remaining[:cut])
-        remaining=remaining[cut:]
+            if best>120: cut=best+1
+        chunks.append(remaining[:cut]); remaining=remaining[cut:]
     return chunks
 
 def _translate_google(chunk):
@@ -952,7 +901,7 @@ def translate_to_chinese(text, errors, max_chars=5000):
         return text
     key=text[:max_chars]
     if key in _TRANSLATE_CACHE: return _TRANSLATE_CACHE[key]
-    chunks=_split_translate_chunks(text,max_chars)
+    chunks=_split_translate_chunks(text,min(max_chars,450))
     providers=[("google",_translate_google),("mymemory",_translate_mymemory)]
     last_error=None
     for name,fn in providers:
@@ -963,9 +912,10 @@ def translate_to_chinese(text, errors, max_chars=5000):
                 if not tr: raise RuntimeError("empty translation")
                 out.append(tr)
             result="".join(out).strip()
-            if result:
+            if result and "QUERY LENGTH LIMIT EXCEEDED" not in result.upper() and "MAX ALLOWED QUERY" not in result.upper():
                 _TRANSLATE_CACHE[key]=result
                 return result
+            raise RuntimeError("translation provider returned a query-length error")
         except Exception as exc:
             last_error=f"{name}: {exc}"
             continue
@@ -1119,7 +1069,7 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     company=info.get("longName") or info.get("shortName") or symbol
     exchange=info.get("exchange") or ""; currency=info.get("currency") or ""
     company_description_en=info.get("longBusinessSummary") or None
-    company_description_zh=translate_to_chinese(company_description_en, errors, max_chars=6000) if company_description_en else None
+    company_description_zh=translate_to_chinese(company_description_en, errors, max_chars=9000) if company_description_en else None
     news=company_news(symbol, errors, limit=8)
     source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10,"news":bool(news)}
     return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":company_description_zh,"company_description_en":company_description_en,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
