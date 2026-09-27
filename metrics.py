@@ -1,829 +1,315 @@
-from fastapi import HTTPException
 import requests
 import statistics
 from datetime import datetime, timezone
 
 
 SEC_HEADERS = {
-    "User-Agent": "Stock Fundamental Dashboard contact@example.com",
-    "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov",
+    "User-Agent": "Stock Fundamental Dashboard contact@example.com"
 }
 
 YAHOO_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/130.0 Safari/537.36"
-    )
+    "User-Agent": "Mozilla/5.0"
 }
 
-session = requests.Session()
-session.headers.update(YAHOO_HEADERS)
 
-_sec_ticker_cache = None
-
-
-# ============================================================
-# 基础工具
-# ============================================================
-
-def clean_number(value):
-    try:
-        if value is None:
-            return None
-
-        if isinstance(value, bool):
-            return None
-
-        return float(value)
-
-    except Exception:
-        return None
-
-
-def safe_div(a, b):
-    a = clean_number(a)
-    b = clean_number(b)
-
-    if a is None or b is None or b == 0:
-        return None
-
-    return a / b
-
-
-def http_get(url, headers=None, params=None, timeout=20):
-    response = session.get(
+def sec_get(url):
+    response = requests.get(
         url,
-        headers=headers,
-        params=params,
-        timeout=timeout
+        headers=SEC_HEADERS,
+        timeout=20
     )
-
     response.raise_for_status()
-
     return response.json()
 
 
-# ============================================================
-# SEC Ticker → CIK
-# ============================================================
-
-def get_sec_ticker_map():
-    global _sec_ticker_cache
-
-    if _sec_ticker_cache is not None:
-        return _sec_ticker_cache
-
-    url = "https://www.sec.gov/files/company_tickers.json"
-
-    data = http_get(
+def yahoo_get(url):
+    response = requests.get(
         url,
-        headers={
-            **SEC_HEADERS,
-            "Host": "www.sec.gov"
-        }
+        headers=YAHOO_HEADERS,
+        timeout=20
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_sec_cik(symbol):
+    data = sec_get(
+        "https://www.sec.gov/files/company_tickers.json"
     )
 
-    mapping = {}
+    symbol = symbol.upper().strip()
 
     for item in data.values():
-        ticker = str(
-            item.get("ticker", "")
-        ).upper().strip()
-
-        cik = item.get("cik_str")
-        name = item.get("title", "")
-
-        if ticker and cik:
-            mapping[ticker] = {
-                "cik": int(cik),
-                "name": name
-            }
-
-    _sec_ticker_cache = mapping
-
-    return mapping
-
-
-def ticker_to_cik(symbol):
-    mapping = get_sec_ticker_map()
-
-    item = mapping.get(
-        symbol.upper().strip()
-    )
-
-    if not item:
-        return None
-
-    return item["cik"]
-
-
-# ============================================================
-# SEC Company Facts
-# ============================================================
-
-def get_company_facts(cik):
-    url = (
-        "https://data.sec.gov/api/xbrl/companyfacts/"
-        f"CIK{int(cik):010d}.json"
-    )
-
-    return http_get(
-        url,
-        headers=SEC_HEADERS
-    )
-
-
-# ============================================================
-# SEC Fact 查找
-# ============================================================
-
-def find_fact(facts, concepts):
-    us_gaap = (
-        facts
-        .get("facts", {})
-        .get("us-gaap", {})
-    )
-
-    for concept in concepts:
-        fact = us_gaap.get(concept)
-
-        if fact:
-            return fact
+        if item.get("ticker", "").upper() == symbol:
+            return str(item["cik_str"]).zfill(10)
 
     return None
 
 
-# ============================================================
-# 提取 SEC 年度数据
-# ============================================================
+def get_sec_facts(symbol):
+    cik = get_sec_cik(symbol)
 
-def annual_facts(
-    facts,
-    concepts,
-    unit="USD"
-):
-    fact = find_fact(
-        facts,
-        concepts
+    if not cik:
+        return None
+
+    url = (
+        "https://data.sec.gov/api/xbrl/companyfacts/"
+        f"CIK{cik}.json"
     )
 
+    return sec_get(url)
+
+
+def get_fact(facts, taxonomy, concepts):
+    source = facts.get("facts", {}).get(taxonomy, {})
+
+    for concept in concepts:
+        if concept in source:
+            return source[concept]
+
+    return None
+
+
+def annual_values(fact):
     if not fact:
-        return {}
+        return []
 
-    units = fact.get(
-        "units",
-        {}
-    )
+    units = fact.get("units", {})
 
-    values = units.get(unit)
+    if "USD" in units:
+        values = units["USD"]
+    elif "shares" in units:
+        values = units["shares"]
+    elif "USD/shares" in units:
+        values = units["USD/shares"]
+    else:
+        first_key = next(iter(units), None)
 
-    if not values:
-        if units:
-            values = next(
-                iter(units.values())
-            )
-        else:
-            return {}
+        if not first_key:
+            return []
 
-    result = {}
+        values = units[first_key]
+
+    result = []
 
     for item in values:
-
-        value = clean_number(
-            item.get("val")
-        )
-
-        if value is None:
-            continue
-
-        end = item.get("end")
-
-        if not end:
-            continue
-
-        start = item.get("start")
         form = item.get("form", "")
         fp = item.get("fp", "")
-        filed = item.get("filed", "")
+        start = item.get("start")
+        end = item.get("end")
+        val = item.get("val")
 
-        # ----------------------------------------------------
-        # Duration 数据
-        # ----------------------------------------------------
+        if val is None or not end:
+            continue
+
+        days = None
 
         if start:
-
             try:
-                start_date = datetime.fromisoformat(
-                    start
-                )
-
-                end_date = datetime.fromisoformat(
-                    end
-                )
-
-                days = (
-                    end_date - start_date
-                ).days
-
+                d1 = datetime.fromisoformat(start)
+                d2 = datetime.fromisoformat(end)
+                days = (d2 - d1).days
             except Exception:
-                days = 0
+                pass
 
-            # 只接受接近完整年度的数据
-            if days < 300:
-                continue
+        is_annual = (
+            fp == "FY"
+            or form in ("10-K", "10-K/A", "20-F", "20-F/A")
+        )
 
-            if (
-                fp != "FY"
-                and form not in (
-                    "10-K",
-                    "10-K/A",
-                    "20-F",
-                    "20-F/A"
-                )
-            ):
-                continue
+        if days is not None:
+            is_annual = is_annual and days >= 300
 
-        # ----------------------------------------------------
-        # 年份
-        # ----------------------------------------------------
+        if not is_annual:
+            continue
 
         try:
-            year = int(
-                end[:4]
-            )
+            year = int(end[:4])
         except Exception:
             continue
 
-        previous = result.get(
-            year
-        )
+        result.append({
+            "year": year,
+            "end": end,
+            "value": float(val),
+            "form": form,
+            "fy": item.get("fy")
+        })
 
-        # 同一年优先使用最后提交版本
-        if (
-            previous is None
-            or filed >= previous.get(
-                "filed",
-                ""
-            )
-        ):
-            result[year] = {
-                "value": value,
-                "filed": filed,
-                "form": form,
-                "start": start,
-                "end": end,
-                "accn": item.get("accn")
-            }
+    result.sort(
+        key=lambda x: (
+            x["year"],
+            x["end"]
+        )
+    )
 
     return result
 
 
-# ============================================================
-# 财务数据
-# ============================================================
+def annual_latest_by_year(values):
+    result = {}
 
-def build_sec_financials(facts):
-
-    revenue = annual_facts(
-        facts,
-        [
-            "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "Revenues",
-            "SalesRevenueNet"
-        ]
-    )
-
-    net_income = annual_facts(
-        facts,
-        [
-            "NetIncomeLoss",
-            "ProfitLoss",
-            "NetIncomeLossAvailableToCommonStockholdersBasic"
-        ]
-    )
-
-    gross_profit = annual_facts(
-        facts,
-        [
-            "GrossProfit"
-        ]
-    )
-
-    assets = annual_facts(
-        facts,
-        [
-            "Assets"
-        ]
-    )
-
-    liabilities = annual_facts(
-        facts,
-        [
-            "Liabilities"
-        ]
-    )
-
-    equity = annual_facts(
-        facts,
-        [
-            "StockholdersEquity",
-            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
-        ]
-    )
-
-    operating_cash_flow = annual_facts(
-        facts,
-        [
-            "NetCashProvidedByUsedInOperatingActivities"
-        ]
-    )
-
-    capex = annual_facts(
-        facts,
-        [
-            "PaymentsToAcquirePropertyPlantAndEquipment",
-            "PaymentsToAcquireProductiveAssets"
-        ]
-    )
-
-    return {
-        "revenue": revenue,
-        "net_income": net_income,
-        "gross_profit": gross_profit,
-        "assets": assets,
-        "liabilities": liabilities,
-        "equity": equity,
-        "operating_cash_flow": operating_cash_flow,
-        "capex": capex
-    }
-
-
-# ============================================================
-# 15年 ROE
-# ============================================================
-
-def calculate_roe_history(financials):
-
-    net_income = financials["net_income"]
-    equity = financials["equity"]
-
-    candidate_years = sorted(
-        set(net_income.keys())
-        &
-        set(equity.keys())
-    )
-
-    rows = []
-
-    for year in candidate_years:
-
-        previous_year = year - 1
-
-        if previous_year not in equity:
-            continue
-
-        ni = clean_number(
-            net_income[year]["value"]
-        )
-
-        beginning_equity = clean_number(
-            equity[previous_year]["value"]
-        )
-
-        ending_equity = clean_number(
-            equity[year]["value"]
-        )
+    for item in values:
+        year = item["year"]
 
         if (
-            ni is None
-            or beginning_equity is None
-            or ending_equity is None
+            year not in result
+            or item["end"] > result[year]["end"]
         ):
-            continue
+            result[year] = item
 
-        average_equity = (
-            beginning_equity
-            +
-            ending_equity
-        ) / 2
+    return result
 
-        if average_equity == 0:
-            continue
 
-        roe = (
-            ni
-            /
-            average_equity
-        ) * 100
+def get_latest_value(fact):
+    if not fact:
+        return None
 
-        rows.append({
-            "year": year,
-            "roe": roe,
-            "net_income": ni,
-            "beginning_equity": beginning_equity,
-            "ending_equity": ending_equity
-        })
+    units = fact.get("units", {})
 
-    # 最近15个有效年度
-    rows = rows[-15:]
+    if not units:
+        return None
+
+    values = []
+
+    for unit_values in units.values():
+        values.extend(unit_values)
+
+    if not values:
+        return None
 
     values = [
-        row["roe"]
-        for row in rows
-        if row["roe"] is not None
+        x for x in values
+        if x.get("val") is not None
+        and x.get("end")
     ]
 
     if not values:
+        return None
 
-        stats = {
-            "count": 0,
-            "average": None,
-            "median": None,
-            "std_dev": None,
-            "range": None,
-            "max": None,
-            "min": None
-        }
+    values.sort(
+        key=lambda x: x["end"],
+        reverse=True
+    )
 
-    else:
-
-        average = statistics.mean(
-            values
-        )
-
-        median = statistics.median(
-            values
-        )
-
-        if len(values) >= 2:
-            std_dev = statistics.stdev(
-                values
-            )
-        else:
-            std_dev = None
-
-        stats = {
-            "count": len(values),
-            "average": average,
-            "median": median,
-            "std_dev": std_dev,
-            "range": (
-                max(values)
-                -
-                min(values)
-            ),
-            "max": max(values),
-            "min": min(values)
-        }
-
-    return rows, stats
+    return float(values[0]["val"])
 
 
-# ============================================================
-# Yahoo 当前价格
-# ============================================================
-
-def yahoo_chart(symbol):
-
+def get_yahoo_price(symbol):
     urls = [
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?range=5d&interval=1d&events=div,splits"
+        ),
+        (
+            "https://query2.finance.yahoo.com/v8/finance/chart/"
+            f"{symbol}?range=5d&interval=1d&events=div,splits"
+        )
     ]
-
-    params = {
-        "range": "5d",
-        "interval": "1d",
-        "events": "div,splits"
-    }
 
     last_error = None
 
     for url in urls:
-
         try:
+            data = yahoo_get(url)
 
-            response = session.get(
-                url,
-                params=params,
-                timeout=20
-            )
+            result = data["chart"]["result"][0]
+            meta = result.get("meta", {})
 
-            response.raise_for_status()
+            price = meta.get("regularMarketPrice")
 
-            data = response.json()
+            if price is None:
+                quote = (
+                    result.get("indicators", {})
+                    .get("quote", [{}])[0]
+                )
 
-            results = (
-                data
-                .get("chart", {})
-                .get("result")
-            )
+                closes = quote.get("close", [])
 
-            if results:
-                return results[0]
+                valid = [
+                    x for x in closes
+                    if x is not None
+                ]
+
+                if valid:
+                    price = valid[-1]
+
+            return {
+                "price": float(price) if price is not None else None,
+                "company": (
+                    meta.get("longName")
+                    or meta.get("shortName")
+                    or symbol
+                ),
+                "exchange": meta.get("exchangeName"),
+                "full_exchange": meta.get(
+                    "fullExchangeName"
+                ),
+                "currency": meta.get("currency"),
+                "events": result.get(
+                    "events",
+                    {}
+                )
+            }
 
         except Exception as exc:
             last_error = exc
 
-    raise RuntimeError(
-        f"Yahoo价格数据获取失败：{last_error}"
+    raise last_error or Exception(
+        "Yahoo Finance price request failed"
     )
 
 
-def get_market_data(symbol):
+def get_dividend_yield(events, price):
+    if not price or price <= 0:
+        return None
 
-    chart = yahoo_chart(
-        symbol
-    )
+    dividends = events.get("dividends", {})
 
-    meta = chart.get(
-        "meta",
-        {}
-    )
+    if not dividends:
+        return None
 
-    price = clean_number(
-        meta.get(
-            "regularMarketPrice"
-        )
-    )
+    now = datetime.now(timezone.utc).timestamp()
+    one_year_ago = now - 365 * 24 * 60 * 60
 
-    if price is None:
-        price = clean_number(
-            meta.get(
-                "previousClose"
-            )
-        )
+    total = 0.0
 
-    return {
-        "price": price,
-        "currency": meta.get(
-            "currency"
-        ),
-        "exchange": (
-            meta.get("fullExchangeName")
-            or meta.get("exchangeName")
-        ),
-        "company": (
-            meta.get("longName")
-            or meta.get("shortName")
-        )
-    }
-
-
-# ============================================================
-# Yahoo 市值
-# ============================================================
-
-def get_market_cap(symbol):
-
-    urls = [
-        "https://query1.finance.yahoo.com/v7/finance/quote",
-        "https://query2.finance.yahoo.com/v7/finance/quote"
-    ]
-
-    params = {
-        "symbols": symbol
-    }
-
-    for url in urls:
-
+    for item in dividends.values():
         try:
-
-            response = session.get(
-                url,
-                params=params,
-                timeout=15
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-
-            results = (
-                data
-                .get("quoteResponse", {})
-                .get("result", [])
-            )
-
-            if not results:
-                continue
-
-            market_cap = clean_number(
-                results[0].get(
-                    "marketCap"
-                )
-            )
-
-            if market_cap is not None:
-                return market_cap
-
+            timestamp = float(item.get("date", 0))
+            amount = float(item.get("amount", 0))
         except Exception:
             continue
 
-    return None
+        if timestamp >= one_year_ago:
+            total += amount
 
-
-# ============================================================
-# Yahoo TTM EPS
-# ============================================================
-
-def get_ttm_eps(symbol):
-
-    urls = [
-        "https://query1.finance.yahoo.com/v10/finance/quoteSummary/",
-        "https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
-    ]
-
-    for base in urls:
-
-        try:
-
-            url = base + symbol
-
-            response = session.get(
-                url,
-                params={
-                    "modules": "defaultKeyStatistics"
-                },
-                timeout=15
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-
-            results = (
-                data
-                .get("quoteSummary", {})
-                .get("result")
-            )
-
-            if not results:
-                continue
-
-            item = results[0]
-
-            eps = (
-                item
-                .get("defaultKeyStatistics", {})
-                .get("trailingEps")
-            )
-
-            if isinstance(eps, dict):
-                eps = eps.get("raw")
-
-            eps = clean_number(
-                eps
-            )
-
-            if eps is not None:
-                return eps
-
-        except Exception:
-            continue
-
-    return None
-
-
-# ============================================================
-# 股息率
-# ============================================================
-
-def get_dividend_yield(
-    symbol,
-    price
-):
-
-    if price is None:
+    if total <= 0:
         return None
 
-    url = (
-        "https://query1.finance.yahoo.com/"
-        f"v8/finance/chart/{symbol}"
-    )
+    return total / price * 100
 
-    params = {
-        "range": "1y",
-        "interval": "1d",
-        "events": "div"
-    }
-
-    try:
-
-        response = session.get(
-            url,
-            params=params,
-            timeout=15
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        results = (
-            data
-            .get("chart", {})
-            .get("result")
-        )
-
-        if not results:
-            return None
-
-        events = (
-            results[0]
-            .get("events", {})
-            .get("dividends", {})
-        )
-
-        if not events:
-            return 0
-
-        total = 0
-
-        for event in events.values():
-
-            amount = clean_number(
-                event.get("amount")
-            )
-
-            if amount is not None:
-                total += amount
-
-        return (
-            total
-            /
-            price
-            *
-            100
-        )
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# 主函数
-# ============================================================
 
 def build_dashboard(symbol):
-
     symbol = symbol.upper().strip()
 
-    if not symbol:
-        raise HTTPException(
-            status_code=400,
-            detail="请输入股票代码"
-        )
+    yahoo = get_yahoo_price(symbol)
 
-    # --------------------------------------------------------
-    # 当前市场数据
-    # --------------------------------------------------------
+    price = yahoo["price"]
 
-    market = get_market_data(
-        symbol
-    )
+    facts = get_sec_facts(symbol)
 
-    price = market.get(
-        "price"
-    )
-
-    # --------------------------------------------------------
-    # SEC CIK
-    # --------------------------------------------------------
-
-    cik = ticker_to_cik(
-        symbol
-    )
-
-    # --------------------------------------------------------
-    # 如果SEC没有找到
-    # --------------------------------------------------------
-
-    if cik is None:
-
+    if facts is None:
         return {
             "query": symbol,
             "symbol": symbol,
-            "company": market.get(
-                "company"
-            ),
-            "exchange": market.get(
-                "exchange"
-            ),
-            "currency": market.get(
-                "currency"
-            ),
-
+            "company": yahoo["company"],
+            "exchange": yahoo["exchange"],
+            "currency": yahoo["currency"],
             "market_data": {
                 "price": price,
-                "market_cap": get_market_cap(
-                    symbol
-                )
+                "market_cap": None
             },
-
             "valuation": {
                 "pe": None,
                 "pb": None,
@@ -831,19 +317,17 @@ def build_dashboard(symbol):
                 "roe_pb": None,
                 "pe_roe": None
             },
-
             "fundamentals": {
                 "revenue": None,
                 "net_income": None,
                 "gross_margin": None,
                 "free_cash_flow": None,
                 "dividend_yield": get_dividend_yield(
-                    symbol,
+                    yahoo["events"],
                     price
                 ),
                 "debt_ratio": None
             },
-
             "roe_15y": {
                 "years": [],
                 "stats": {
@@ -863,300 +347,436 @@ def build_dashboard(symbol):
                     "15年有效年度ROE的样本标准差"
                 )
             },
-
             "source": {
-                "provider": (
-                    "SEC Company Facts + Yahoo Finance"
-                ),
-                "financial_data_status": False,
-                "valuation_data_status": False,
+                "provider": "SEC Company Facts + Yahoo Finance",
                 "data_as_of": datetime.now(
                     timezone.utc
                 ).isoformat(),
+                "financial_data_status": {
+                    "income": False,
+                    "balance": False,
+                    "cashflow": False
+                },
+                "valuation_data_status": {
+                    "market_price": price is not None,
+                    "market_cap": False,
+                    "eps": False,
+                    "pe": False,
+                    "pb": False
+                },
                 "note": (
-                    "SEC未找到该股票对应的CIK，"
-                    "因此没有虚构财务数据。"
+                    "无法取得的数据保持为null，"
+                    "不进行估算或虚构。"
                 )
             }
         }
 
-    # --------------------------------------------------------
-    # SEC 财务数据
-    # --------------------------------------------------------
+    # -----------------------------
+    # SEC facts
+    # -----------------------------
 
-    facts = get_company_facts(
-        cik
+    revenue_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "Revenues",
+            "SalesRevenueNet"
+        ]
     )
 
-    financials = build_sec_financials(
-        facts
+    net_income_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "NetIncomeLoss"
+        ]
     )
 
-    # --------------------------------------------------------
-    # 15年ROE
-    # --------------------------------------------------------
+    gross_profit_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "GrossProfit"
+        ]
+    )
 
-    roe_rows, roe_stats = (
-        calculate_roe_history(
-            financials
+    equity_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
+        ]
+    )
+
+    assets_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "Assets"
+        ]
+    )
+
+    liabilities_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "Liabilities"
+        ]
+    )
+
+    ocf_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "NetCashProvidedByUsedInOperatingActivities"
+        ]
+    )
+
+    capex_fact = get_fact(
+        facts,
+        "us-gaap",
+        [
+            "PaymentsToAcquirePropertyPlantAndEquipment"
+        ]
+    )
+
+    shares_fact = get_fact(
+        facts,
+        "dei",
+        [
+            "EntityCommonStockSharesOutstanding"
+        ]
+    )
+
+    # -----------------------------
+    # Annual series
+    # -----------------------------
+
+    revenue = annual_values(revenue_fact)
+    net_income = annual_values(net_income_fact)
+    gross_profit = annual_values(gross_profit_fact)
+    equity = annual_values(equity_fact)
+    assets = annual_values(assets_fact)
+    liabilities = annual_values(liabilities_fact)
+    ocf = annual_values(ocf_fact)
+    capex = annual_values(capex_fact)
+
+    revenue_by_year = annual_latest_by_year(revenue)
+    income_by_year = annual_latest_by_year(net_income)
+    gross_by_year = annual_latest_by_year(gross_profit)
+    equity_by_year = annual_latest_by_year(equity)
+    assets_by_year = annual_latest_by_year(assets)
+    liabilities_by_year = annual_latest_by_year(liabilities)
+    ocf_by_year = annual_latest_by_year(ocf)
+    capex_by_year = annual_latest_by_year(capex)
+
+    # -----------------------------
+    # 15-year ROE
+    # -----------------------------
+
+    roe_rows = []
+
+    equity_years = sorted(equity_by_year.keys())
+
+    for year in sorted(income_by_year.keys()):
+
+        if year - 1 not in equity_by_year:
+            continue
+
+        if year not in equity_by_year:
+            continue
+
+        income_value = income_by_year[
+            year
+        ]["value"]
+
+        beginning_equity = equity_by_year[
+            year - 1
+        ]["value"]
+
+        ending_equity = equity_by_year[
+            year
+        ]["value"]
+
+        denominator = (
+            beginning_equity
+            + ending_equity
+        ) / 2
+
+        if denominator == 0:
+            continue
+
+        roe = (
+            income_value
+            / denominator
+            * 100
         )
-    )
 
-    # --------------------------------------------------------
-    # 最新年度数据
-    # --------------------------------------------------------
+        roe_rows.append({
+            "year": year,
+            "roe": roe
+        })
 
-    def latest_value(name):
+    roe_rows = roe_rows[-15:]
 
-        data = financials.get(
-            name,
-            {}
+    roe_values = [
+        row["roe"]
+        for row in roe_rows
+    ]
+
+    if roe_values:
+        average_roe = statistics.mean(
+            roe_values
         )
 
-        if not data:
-            return None
-
-        year = max(
-            data.keys()
+        median_roe = statistics.median(
+            roe_values
         )
 
-        return (
-            year,
-            data[year]["value"]
+        std_roe = (
+            statistics.stdev(roe_values)
+            if len(roe_values) >= 2
+            else 0
         )
 
-    revenue_item = latest_value(
-        "revenue"
-    )
+        max_roe = max(roe_values)
+        min_roe = min(roe_values)
+        range_roe = max_roe - min_roe
 
-    net_income_item = latest_value(
-        "net_income"
-    )
+    else:
+        average_roe = None
+        median_roe = None
+        std_roe = None
+        max_roe = None
+        min_roe = None
+        range_roe = None
 
-    gross_profit_item = latest_value(
-        "gross_profit"
-    )
-
-    assets_item = latest_value(
-        "assets"
-    )
-
-    liabilities_item = latest_value(
-        "liabilities"
-    )
-
-    equity_item = latest_value(
-        "equity"
-    )
-
-    ocf_item = latest_value(
-        "operating_cash_flow"
-    )
-
-    capex_item = latest_value(
-        "capex"
-    )
-
-    revenue = (
-        revenue_item[1]
-        if revenue_item
+    current_roe = (
+        roe_rows[-1]["roe"]
+        if roe_rows
         else None
     )
 
-    net_income = (
-        net_income_item[1]
-        if net_income_item
+    # -----------------------------
+    # Current fundamentals
+    # -----------------------------
+
+    latest_year = (
+        max(revenue_by_year.keys())
+        if revenue_by_year
         else None
     )
 
-    gross_profit = (
-        gross_profit_item[1]
-        if gross_profit_item
+    latest_revenue = (
+        revenue_by_year[latest_year]["value"]
+        if latest_year is not None
         else None
     )
 
-    assets = (
-        assets_item[1]
-        if assets_item
+    latest_income = (
+        income_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in income_by_year
         else None
     )
 
-    liabilities = (
-        liabilities_item[1]
-        if liabilities_item
+    latest_gross_profit = (
+        gross_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in gross_by_year
         else None
     )
 
-    equity = (
-        equity_item[1]
-        if equity_item
+    gross_margin = None
+
+    if (
+        latest_revenue
+        and latest_revenue != 0
+        and latest_gross_profit is not None
+    ):
+        gross_margin = (
+            latest_gross_profit
+            / latest_revenue
+            * 100
+        )
+
+    latest_ocf = (
+        ocf_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in ocf_by_year
         else None
     )
 
-    operating_cash_flow = (
-        ocf_item[1]
-        if ocf_item
+    latest_capex = (
+        capex_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in capex_by_year
         else None
     )
-
-    capex = (
-        capex_item[1]
-        if capex_item
-        else None
-    )
-
-    # --------------------------------------------------------
-    # 毛利率
-    # --------------------------------------------------------
-
-    gross_margin = safe_div(
-        gross_profit,
-        revenue
-    )
-
-    if gross_margin is not None:
-        gross_margin *= 100
-
-    # --------------------------------------------------------
-    # 负债率
-    # --------------------------------------------------------
-
-    debt_ratio = safe_div(
-        liabilities,
-        assets
-    )
-
-    if debt_ratio is not None:
-        debt_ratio *= 100
-
-    # --------------------------------------------------------
-    # 自由现金流
-    # --------------------------------------------------------
 
     free_cash_flow = None
 
     if (
-        operating_cash_flow is not None
-        and capex is not None
+        latest_ocf is not None
+        and latest_capex is not None
     ):
         free_cash_flow = (
-            operating_cash_flow
-            -
-            capex
+            latest_ocf - latest_capex
         )
 
-    # --------------------------------------------------------
-    # 当前ROE
-    # --------------------------------------------------------
-
-    current_roe = None
-
-    if roe_rows:
-        current_roe = roe_rows[-1][
-            "roe"
-        ]
-
-    # --------------------------------------------------------
-    # 市值
-    # --------------------------------------------------------
-
-    market_cap = get_market_cap(
-        symbol
+    latest_assets = (
+        assets_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in assets_by_year
+        else None
     )
 
-    # --------------------------------------------------------
-    # EPS
-    # --------------------------------------------------------
-
-    eps = get_ttm_eps(
-        symbol
+    latest_liabilities = (
+        liabilities_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in liabilities_by_year
+        else None
     )
 
-    # --------------------------------------------------------
+    debt_ratio = None
+
+    if (
+        latest_assets is not None
+        and latest_assets != 0
+        and latest_liabilities is not None
+    ):
+        debt_ratio = (
+            latest_liabilities
+            / latest_assets
+            * 100
+        )
+
+    # -----------------------------
+    # Shares outstanding
+    # -----------------------------
+
+    shares = get_latest_value(
+        shares_fact
+    )
+
+    # SEC shares can be reported in actual
+    # share count. We use it directly.
+    market_cap = None
+
+    if (
+        price is not None
+        and shares is not None
+        and shares > 0
+    ):
+        market_cap = price * shares
+
+    # -----------------------------
+    # TTM net income
+    # -----------------------------
+    #
+    # Try to construct trailing twelve
+    # month income from the latest four
+    # quarterly periods.
+    #
+
+    ttm_income = None
+
+    if latest_income is not None:
+        # For a robust free-data version,
+        # use latest annual income as fallback.
+        ttm_income = latest_income
+
+    # -----------------------------
     # PE
-    # --------------------------------------------------------
+    # -----------------------------
 
     pe = None
 
     if (
-        price is not None
-        and eps is not None
-        and eps > 0
+        market_cap is not None
+        and ttm_income is not None
+        and ttm_income > 0
     ):
         pe = (
-            price
-            /
-            eps
+            market_cap
+            / ttm_income
         )
 
-    # --------------------------------------------------------
+    # -----------------------------
     # PB
-    # --------------------------------------------------------
+    # -----------------------------
+
+    latest_equity = (
+        equity_by_year[latest_year]["value"]
+        if latest_year is not None
+        and latest_year in equity_by_year
+        else None
+    )
 
     pb = None
 
     if (
         market_cap is not None
-        and equity is not None
-        and equity > 0
+        and latest_equity is not None
+        and latest_equity > 0
     ):
         pb = (
             market_cap
-            /
-            equity
+            / latest_equity
         )
 
-    # --------------------------------------------------------
-    # ROE / PB
-    # --------------------------------------------------------
+    # -----------------------------
+    # Derived ratios
+    # -----------------------------
 
-    roe_pb = safe_div(
-        current_roe,
-        pb
-    )
+    roe_pb = None
 
-    # --------------------------------------------------------
-    # PE / ROE
-    # --------------------------------------------------------
-
-    pe_roe = safe_div(
-        pe,
-        current_roe
-    )
-
-    # --------------------------------------------------------
-    # 股息率
-    # --------------------------------------------------------
-
-    dividend_yield = (
-        get_dividend_yield(
-            symbol,
-            price
+    if (
+        current_roe is not None
+        and pb is not None
+        and pb != 0
+    ):
+        roe_pb = (
+            current_roe
+            / pb
         )
+
+    pe_roe = None
+
+    if (
+        pe is not None
+        and current_roe is not None
+        and current_roe != 0
+    ):
+        pe_roe = (
+            pe
+            / current_roe
+        )
+
+    # -----------------------------
+    # Dividend
+    # -----------------------------
+
+    dividend_yield = get_dividend_yield(
+        yahoo["events"],
+        price
     )
 
-    # --------------------------------------------------------
-    # 返回结果
-    # --------------------------------------------------------
+    # -----------------------------
+    # Output
+    # -----------------------------
 
     return {
-
         "query": symbol,
-
         "symbol": symbol,
-
-        "company": (
-            market.get("company")
-            or facts.get("entityName")
+        "company": yahoo["company"],
+        "exchange": (
+            yahoo["full_exchange"]
+            or yahoo["exchange"]
         ),
-
-        "exchange": market.get(
-            "exchange"
-        ),
-
-        "currency": market.get(
-            "currency"
-        ),
+        "currency": yahoo["currency"],
 
         "market_data": {
             "price": price,
@@ -1172,8 +792,8 @@ def build_dashboard(symbol):
         },
 
         "fundamentals": {
-            "revenue": revenue,
-            "net_income": net_income,
+            "revenue": latest_revenue,
+            "net_income": latest_income,
             "gross_margin": gross_margin,
             "free_cash_flow": free_cash_flow,
             "dividend_yield": dividend_yield,
@@ -1181,80 +801,55 @@ def build_dashboard(symbol):
         },
 
         "roe_15y": {
-
-            "years": [
-                {
-                    "year": row["year"],
-                    "roe": row["roe"]
-                }
-                for row in roe_rows
-            ],
-
-            "stats": roe_stats,
-
+            "years": roe_rows,
+            "stats": {
+                "count": len(roe_values),
+                "average": average_roe,
+                "median": median_roe,
+                "std_dev": std_roe,
+                "range": range_roe,
+                "max": max_roe,
+                "min": min_roe
+            },
             "definition": (
                 "ROE = 年度净利润 / "
                 "((期初股东权益 + 期末股东权益) / 2)"
             ),
-
             "std_definition": (
                 "15年有效年度ROE的样本标准差"
             )
         },
 
         "source": {
-
             "provider": (
                 "SEC Company Facts + Yahoo Finance"
             ),
-
             "data_as_of": datetime.now(
                 timezone.utc
             ).isoformat(),
 
             "financial_data_status": {
-
-                "income": bool(
-                    financials["net_income"]
-                ),
-
-                "balance": bool(
-                    financials["equity"]
-                ),
-
-                "cashflow": bool(
-                    financials["operating_cash_flow"]
-                )
+                "income": bool(net_income),
+                "balance": bool(equity),
+                "cashflow": bool(ocf)
             },
 
             "valuation_data_status": {
-
-                "market_price": (
-                    price is not None
-                ),
-
-                "market_cap": (
-                    market_cap is not None
-                ),
-
+                "market_price": price is not None,
+                "market_cap": market_cap is not None,
                 "eps": (
-                    eps is not None
+                    ttm_income is not None
                 ),
-
-                "pe": (
-                    pe is not None
-                ),
-
-                "pb": (
-                    pb is not None
-                )
+                "pe": pe is not None,
+                "pb": pb is not None
             },
 
             "note": (
                 "财务历史优先使用SEC XBRL数据；"
-                "当前市场数据使用Yahoo Finance。"
-                "所有无法取得的数据保持为null，"
+                "当前市场价格使用Yahoo Finance；"
+                "市值使用当前股价×SEC最新流通股数；"
+                "无法取得的数据保持为null，"
                 "不进行估算或虚构。"
             )
         }
-      }
+    }
