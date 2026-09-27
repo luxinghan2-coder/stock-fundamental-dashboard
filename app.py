@@ -8,7 +8,7 @@ from time import time
 from metrics import build_dashboard
 
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.4.15', version='2.4.15')
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.4.18', version='2.4.18')
 
 # AEL MARKET SCAN：主动触发才执行。默认使用轻量、可控的跨市场候选池；
 # 可通过环境变量 AEL_SCAN_UNIVERSE 覆盖，格式：AAPL,MSFT,600519.SS,0700.HK
@@ -28,7 +28,7 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.4.15'}
+    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.4.18'}
 
 @app.get('/api/stock/core/{symbol}')
 def stock_core(symbol: str):

@@ -660,6 +660,23 @@ def technical_analysis(history, fib=None, pivots=None):
         value_score,value_meta=_technical_value_score(rsi,j_val,hist_val,hist_delta,fib_s3,bb_lower,latest)
         value_state=("高性价比" if value_score is not None and value_score>=75 else ("较有性价比" if value_score is not None and value_score>=60 else ("中性" if value_score is not None and value_score>=45 else ("性价比较低" if value_score is not None else "暂无数据"))))
 
+        # ---------------- Composite score (100) ----------------
+        # Keep the two dimensions independent, then combine them transparently.
+        # Never reference an uninitialised value: the previous build could
+        # throw here, causing the entire technical block to fall back to
+        # "暂无数据" even when RSI/MACD/BOLL/MA had already been calculated.
+        composite_score = None
+        composite_state = "暂无数据"
+        if score is not None and value_score is not None:
+            composite_score = round(score * 0.50 + value_score * 0.50)
+            composite_score = max(0, min(100, composite_score))
+            composite_state = (
+                "强" if composite_score >= 75 else
+                "偏强" if composite_score >= 60 else
+                "中性" if composite_score >= 45 else
+                "偏弱"
+            )
+
         signals=[]
         if macd_val>signal_val: signals.append("MACD强于信号线")
         else: signals.append("MACD弱于信号线")
