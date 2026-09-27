@@ -1,538 +1,184 @@
-import math
-from statistics import median, stdev
+from __future__ import annotations
 
-import pandas as pd
-import yfinance as yf
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import requests
 
 
-def clean_number(value):
+# ============================================================
+# Yahoo Finance HTTP 数据层
+# 不再通过 yfinance 获取数据
+# ============================================================
+
+SESSION = requests.Session()
+
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+
+def _number(value: Any) -> Optional[float]:
+    """安全转换数字。"""
     try:
         if value is None:
             return None
 
-        if pd.isna(value):
+        if isinstance(value, bool):
             return None
 
         value = float(value)
 
-        if not math.isfinite(value):
+        if value != value:  # NaN
             return None
 
         return value
-
     except Exception:
         return None
 
 
-def safe_div(a, b):
-    a = clean_number(a)
-    b = clean_number(b)
-
-    if a is None or b is None or b == 0:
-        return None
-
-    result = a / b
-
-    return result if math.isfinite(result) else None
-
-
-def normalize_symbol(symbol):
-    symbol = str(symbol or "").strip().upper()
-
-    # A股
-    if symbol.isdigit():
-        if len(symbol) == 6:
-            if symbol.startswith(("6", "9")):
-                return symbol + ".SS"
-            return symbol + ".SZ"
-
-        # 港股
-        if len(symbol) <= 5:
-            return symbol.zfill(4) + ".HK"
-
-    return symbol
-
-
-def find_row(df, names):
-    if df is None or df.empty:
-        return None
-
-    for name in names:
-        if name in df.index:
-            return df.loc[name]
-
-    return None
-
-
-def get_latest_value(row):
-    if row is None:
-        return None
-
-    try:
-        values = row.dropna()
-
-        if len(values) == 0:
-            return None
-
-        return clean_number(values.iloc[0])
-
-    except Exception:
-        return None
-
-
-def get_latest_price(ticker):
+def _chart_request(symbol: str, range_: str = "5d", interval: str = "1d") -> Dict[str, Any]:
     """
-    不使用 ticker.info。
-    直接从 history 获取最新价格。
+    直接调用 Yahoo Finance Chart API。
+
+    优先 query1，失败后尝试 query2。
     """
+    symbol = symbol.strip().upper()
 
-    try:
-        history = ticker.history(
-            period="5d",
-            auto_adjust=False
-        )
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
+    ]
 
-        if history is None or history.empty:
-            return None
+    params = {
+        "range": range_,
+        "interval": interval,
+        "events": "div,splits",
+        "includeAdjustedClose": "true",
+    }
 
-        close = history["Close"].dropna()
+    last_error = None
 
-        if close.empty:
-            return None
+    for url in urls:
+        try:
+            response = SESSION.get(
+                url,
+                params=params,
+                timeout=15,
+            )
 
-        return clean_number(close.iloc[-1])
+            response.raise_for_status()
 
-    except Exception:
+            data = response.json()
+
+            chart = data.get("chart") or {}
+
+            if chart.get("error"):
+                last_error = chart["error"]
+                continue
+
+            result = chart.get("result") or []
+
+            if not result:
+                last_error = "Yahoo Finance 返回空结果"
+                continue
+
+            return result[0]
+
+        except Exception as exc:
+            last_error = str(exc)
+
+    raise RuntimeError(
+        f"Yahoo Finance 数据请求失败：{last_error}"
+    )
+
+
+def _latest_close(result: Dict[str, Any]) -> Optional[float]:
+    """从 Chart 数据取得最近一个收盘价。"""
+
+    indicators = result.get("indicators") or {}
+    quote_list = indicators.get("quote") or []
+
+    if not quote_list:
         return None
 
+    closes = quote_list[0].get("close") or []
 
-def get_price_history(ticker):
-    try:
-        history = ticker.history(
-            period="1y",
-            auto_adjust=False
-        )
+    valid = [
+        _number(x)
+        for x in closes
+        if _number(x) is not None
+    ]
 
-        if history is None or history.empty:
-            return None
-
-        return history
-
-    except Exception:
+    if not valid:
         return None
 
+    return valid[-1]
 
-def calculate_dividend_yield(ticker, price):
-    """
-    使用最近12个月实际现金分红计算股息率。
-    不使用 ticker.info。
-    """
 
-    price = clean_number(price)
+def _regular_market_price(result: Dict[str, Any]) -> Optional[float]:
+    """取得 Yahoo 返回的当前市场价格。"""
+
+    meta = result.get("meta") or {}
+
+    price = _number(meta.get("regularMarketPrice"))
+
+    if price is not None:
+        return price
+
+    return _latest_close(result)
+
+
+def _dividend_yield(result: Dict[str, Any], price: Optional[float]) -> Optional[float]:
+    """
+    根据 Yahoo Chart API 最近一年分红计算股息率。
+
+    返回百分比，例如：
+    3.2 表示 3.2%
+    """
 
     if price is None or price <= 0:
         return None
 
-    try:
-        dividends = ticker.dividends
+    events = result.get("events") or {}
+    dividends = events.get("dividends") or {}
 
-        if dividends is None or dividends.empty:
-            return None
+    now = datetime.now(timezone.utc).timestamp()
+    one_year_ago = now - 365 * 24 * 60 * 60
 
-        dividends = dividends.dropna()
+    total = 0.0
 
-        if dividends.empty:
-            return None
-
-        dividends.index = pd.to_datetime(
-            dividends.index
-        )
-
-        latest_date = dividends.index.max()
-
-        start_date = (
-            latest_date -
-            pd.Timedelta(days=365)
-        )
-
-        recent = dividends[
-            dividends.index > start_date
-        ]
-
-        if recent.empty:
-            return None
-
-        annual_dividend = clean_number(
-            recent.sum()
-        )
-
-        if annual_dividend is None:
-            return None
-
-        return (
-            annual_dividend /
-            price *
-            100
-        )
-
-    except Exception:
-        return None
-
-
-def get_income_statement(ticker):
-    """
-    独立获取年度利润表。
-    """
-
-    try:
-        data = ticker.get_income_stmt(
-            freq="yearly"
-        )
-
-        if data is None or data.empty:
-            return None
-
-        return data
-
-    except Exception:
-        return None
-
-
-def get_balance_sheet(ticker):
-    """
-    独立获取年度资产负债表。
-    """
-
-    try:
-        data = ticker.get_balance_sheet(
-            freq="yearly"
-        )
-
-        if data is None or data.empty:
-            return None
-
-        return data
-
-    except Exception:
-        return None
-
-
-def get_cashflow(ticker):
-    """
-    独立获取年度现金流量表。
-    """
-
-    try:
-        data = ticker.get_cash_flow(
-            freq="yearly"
-        )
-
-        if data is None or data.empty:
-            return None
-
-        return data
-
-    except Exception:
-        return None
-
-
-def get_latest_financial_value(df, names):
-    row = find_row(df, names)
-    return get_latest_value(row)
-
-
-def calculate_current_roe(
-    income,
-    balance
-):
-    """
-    当前年度 ROE：
-
-    净利润 /
-    ((期初股东权益 + 期末股东权益) / 2)
-    """
-
-    if income is None or balance is None:
-        return None
-
-    net_income_row = find_row(
-        income,
-        [
-            "Net Income",
-            "Net Income Common Stockholders",
-            "NetIncome"
-        ]
-    )
-
-    equity_row = find_row(
-        balance,
-        [
-            "Stockholders Equity",
-            "Common Stock Equity",
-            "Total Equity Gross Minority Interest"
-        ]
-    )
-
-    if net_income_row is None:
-        return None
-
-    if equity_row is None:
-        return None
-
-    try:
-        income_dates = sorted(
-            list(income.columns),
-            key=lambda x: pd.Timestamp(x)
-        )
-
-        balance_dates = sorted(
-            list(balance.columns),
-            key=lambda x: pd.Timestamp(x)
-        )
-
-        if not income_dates:
-            return None
-
-        latest_income_date = income_dates[-1]
-
-        net_income = clean_number(
-            net_income_row.get(
-                latest_income_date
-            )
-        )
-
-        if net_income is None:
-            return None
-
-        # 找对应的期末权益
-        matching_dates = [
-            d for d in balance_dates
-            if pd.Timestamp(d) <=
-            pd.Timestamp(latest_income_date)
-        ]
-
-        if not matching_dates:
-            return None
-
-        end_date = matching_dates[-1]
-
-        end_index = balance_dates.index(
-            end_date
-        )
-
-        if end_index == 0:
-            return None
-
-        begin_date = balance_dates[
-            end_index - 1
-        ]
-
-        equity_end = clean_number(
-            equity_row.get(end_date)
-        )
-
-        equity_begin = clean_number(
-            equity_row.get(begin_date)
-        )
-
-        if equity_end is None or equity_begin is None:
-            return None
-
-        average_equity = (
-            equity_begin +
-            equity_end
-        ) / 2
-
-        if average_equity == 0:
-            return None
-
-        return (
-            net_income /
-            average_equity *
-            100
-        )
-
-    except Exception:
-        return None
-
-
-def calculate_roe_history(
-    income,
-    balance
-):
-    """
-    计算最近15个有效年度 ROE。
-    """
-
-    if income is None or balance is None:
-        return {
-            "years": [],
-            "stats": empty_stats()
-        }
-
-    net_income_row = find_row(
-        income,
-        [
-            "Net Income",
-            "Net Income Common Stockholders",
-            "NetIncome"
-        ]
-    )
-
-    equity_row = find_row(
-        balance,
-        [
-            "Stockholders Equity",
-            "Common Stock Equity",
-            "Total Equity Gross Minority Interest"
-        ]
-    )
-
-    if net_income_row is None:
-        return {
-            "years": [],
-            "stats": empty_stats()
-        }
-
-    if equity_row is None:
-        return {
-            "years": [],
-            "stats": empty_stats()
-        }
-
-    try:
-        dates = sorted(
-            list(income.columns),
-            key=lambda x: pd.Timestamp(x)
-        )
-    except Exception:
-        return {
-            "years": [],
-            "stats": empty_stats()
-        }
-
-    records = []
-
-    for date in dates:
-
+    for item in dividends.values():
         try:
-            year = pd.Timestamp(date).year
+            timestamp = float(item.get("date"))
+            amount = _number(item.get("amount"))
+
+            if amount is None:
+                continue
+
+            if timestamp >= one_year_ago:
+                total += amount
+
         except Exception:
             continue
 
-        net_income = clean_number(
-            net_income_row.get(date)
-        )
+    if total <= 0:
+        return None
 
-        if net_income is None:
-            continue
-
-        # 找当前年度对应的权益
-        balance_dates = sorted(
-            list(balance.columns),
-            key=lambda x: pd.Timestamp(x)
-        )
-
-        matching = [
-            d for d in balance_dates
-            if pd.Timestamp(d) <=
-            pd.Timestamp(date)
-        ]
-
-        if not matching:
-            continue
-
-        end_date = matching[-1]
-        end_index = balance_dates.index(
-            end_date
-        )
-
-        if end_index == 0:
-            continue
-
-        begin_date = balance_dates[
-            end_index - 1
-        ]
-
-        equity_end = clean_number(
-            equity_row.get(end_date)
-        )
-
-        equity_begin = clean_number(
-            equity_row.get(begin_date)
-        )
-
-        if equity_end is None or equity_begin is None:
-            continue
-
-        average_equity = (
-            equity_begin +
-            equity_end
-        ) / 2
-
-        if average_equity == 0:
-            continue
-
-        roe = (
-            net_income /
-            average_equity *
-            100
-        )
-
-        if not math.isfinite(roe):
-            continue
-
-        records.append(
-            {
-                "year": year,
-                "net_income": net_income,
-                "equity_begin": equity_begin,
-                "equity_end": equity_end,
-                "roe": roe
-            }
-        )
-
-    records = records[-15:]
-
-    values = [
-        x["roe"]
-        for x in records
-    ]
-
-    if not values:
-        return {
-            "years": [],
-            "stats": empty_stats()
-        }
-
-    average = sum(values) / len(values)
-
-    med = median(values)
-
-    std = (
-        stdev(values)
-        if len(values) >= 2
-        else None
-    )
-
-    maximum = max(values)
-    minimum = min(values)
-
-    return {
-        "years": records,
-        "stats": {
-            "count": len(values),
-            "average": average,
-            "median": med,
-            "std_dev": std,
-            "range": maximum - minimum,
-            "max": maximum,
-            "min": minimum
-        }
-    }
+    return total / price * 100.0
 
 
-def empty_stats():
+# ============================================================
+# 空指标
+# ============================================================
+
+def _empty_stats() -> Dict[str, Any]:
     return {
         "count": 0,
         "average": None,
@@ -540,402 +186,116 @@ def empty_stats():
         "std_dev": None,
         "range": None,
         "max": None,
-        "min": None
+        "min": None,
     }
 
 
-def build_dashboard(symbol):
+# ============================================================
+# 主函数
+# ============================================================
 
-    original_symbol = str(
-        symbol or ""
-    ).strip()
+def build_dashboard(symbol: str) -> Dict[str, Any]:
+    symbol = symbol.strip().upper()
 
-    if not original_symbol:
-        raise ValueError(
-            "请输入股票代码"
-        )
+    if not symbol:
+        raise ValueError("请输入股票代码")
 
-    symbol = normalize_symbol(
-        original_symbol
+    # --------------------------------------------------------
+    # 第一阶段：
+    # 直接从 Yahoo Chart API 获取市场基础信息
+    # --------------------------------------------------------
+
+    result = _chart_request(
+        symbol,
+        range_="1y",
+        interval="1d",
     )
 
-    ticker = yf.Ticker(symbol)
+    meta = result.get("meta") or {}
 
-    # =========================
-    # 1. 价格
-    # =========================
+    price = _regular_market_price(result)
 
-    price = get_latest_price(
-        ticker
+    company = (
+        meta.get("longName")
+        or meta.get("shortName")
+        or symbol
     )
 
-    # =========================
-    # 2. 财务报表
-    # =========================
+    currency = meta.get("currency")
 
-    income = get_income_statement(
-        ticker
+    exchange = (
+        meta.get("fullExchangeName")
+        or meta.get("exchangeName")
     )
-
-    balance = get_balance_sheet(
-        ticker
-    )
-
-    cashflow = get_cashflow(
-        ticker
-    )
-
-    # =========================
-    # 3. 营收
-    # =========================
-
-    revenue = get_latest_financial_value(
-        income,
-        [
-            "Total Revenue",
-            "Operating Revenue"
-        ]
-    )
-
-    # =========================
-    # 4. 净利润
-    # =========================
-
-    net_income = get_latest_financial_value(
-        income,
-        [
-            "Net Income",
-            "Net Income Common Stockholders"
-        ]
-    )
-
-    # =========================
-    # 5. 毛利率
-    # =========================
-
-    gross_profit = get_latest_financial_value(
-        income,
-        [
-            "Gross Profit"
-        ]
-    )
-
-    gross_margin = None
-
-    if (
-        gross_profit is not None
-        and revenue is not None
-        and revenue != 0
-    ):
-        gross_margin = (
-            gross_profit /
-            revenue *
-            100
-        )
-
-    # =========================
-    # 6. 自由现金流
-    # =========================
-
-    operating_cashflow = get_latest_financial_value(
-        cashflow,
-        [
-            "Operating Cash Flow",
-            "Total Cash From Operating Activities"
-        ]
-    )
-
-    capex = get_latest_financial_value(
-        cashflow,
-        [
-            "Capital Expenditure",
-            "Capital Expenditure Reported"
-        ]
-    )
-
-    free_cash_flow = None
-
-    if (
-        operating_cashflow is not None
-        and capex is not None
-    ):
-        # Yahoo通常把资本开支记为负数
-        free_cash_flow = (
-            operating_cashflow +
-            capex
-        )
-
-    # =========================
-    # 7. 资产负债率
-    # =========================
-
-    total_assets = get_latest_financial_value(
-        balance,
-        [
-            "Total Assets"
-        ]
-    )
-
-    total_debt = get_latest_financial_value(
-        balance,
-        [
-            "Total Debt",
-            "Total Debt And Equity"
-        ]
-    )
-
-    debt_ratio = None
-
-    if (
-        total_debt is not None
-        and total_assets is not None
-        and total_assets != 0
-    ):
-        debt_ratio = (
-            total_debt /
-            total_assets *
-            100
-        )
-
-    # =========================
-    # 8. ROE
-    # =========================
-
-    roe = calculate_current_roe(
-        income,
-        balance
-    )
-
-    # =========================
-    # 9. PE / PB
-    # =========================
-
-    pe = None
-    pb = None
-
-    # 不依赖 ticker.info
-    # 使用市场价格 + 财务数据自行计算
-
-    if (
-        price is not None
-        and net_income is not None
-        and net_income != 0
-    ):
-        # 先尝试获取流通股本
-        try:
-            shares = ticker.get_shares_full(
-                start=pd.Timestamp.now() -
-                pd.Timedelta(days=30)
-            )
-
-            if shares is not None and not shares.empty:
-                shares = shares.dropna()
-
-                if not shares.empty:
-                    latest_shares = clean_number(
-                        shares.iloc[-1]
-                    )
-
-                    if (
-                        latest_shares is not None
-                        and latest_shares > 0
-                    ):
-                        market_cap = (
-                            price *
-                            latest_shares
-                        )
-
-                        pe = safe_div(
-                            market_cap,
-                            net_income
-                        )
-
-        except Exception:
-            pass
-
-    # =========================
-    # 10. PB
-    # =========================
-
-    equity = get_latest_financial_value(
-        balance,
-        [
-            "Stockholders Equity",
-            "Common Stock Equity"
-        ]
-    )
-
-    if (
-        equity is not None
-        and equity > 0
-        and price is not None
-    ):
-        try:
-            shares = ticker.get_shares_full(
-                start=pd.Timestamp.now() -
-                pd.Timedelta(days=30)
-            )
-
-            if shares is not None and not shares.empty:
-                shares = shares.dropna()
-
-                if not shares.empty:
-                    latest_shares = clean_number(
-                        shares.iloc[-1]
-                    )
-
-                    if (
-                        latest_shares is not None
-                        and latest_shares > 0
-                    ):
-                        market_cap = (
-                            price *
-                            latest_shares
-                        )
-
-                        pb = safe_div(
-                            market_cap,
-                            equity
-                        )
-
-        except Exception:
-            pass
-
-    # =========================
-    # 11. 股息率
-    # =========================
-
-    dividend_yield = calculate_dividend_yield(
-        ticker,
-        price
-    )
-
-    # =========================
-    # 12. 衍生指标
-    # =========================
-
-    roe_pb = safe_div(
-        roe,
-        pb
-    )
-
-    pe_roe = safe_div(
-        pe,
-        roe
-    )
-
-    # =========================
-    # 13. 15年ROE
-    # =========================
-
-    roe_history = calculate_roe_history(
-        income,
-        balance
-    )
-
-    # =========================
-    # 14. 公司名称
-    # =========================
-
-    company = symbol
-
-    try:
-        fast_info = ticker.fast_info
-
-        if fast_info is not None:
-            company = (
-                getattr(
-                    ticker,
-                    "ticker",
-                    None
-                )
-                or symbol
-            )
-
-    except Exception:
-        pass
-
-    # =========================
-    # 返回
-    # =========================
 
     market_cap = None
 
-    try:
-        shares = ticker.get_shares_full(
-            start=pd.Timestamp.now() -
-            pd.Timedelta(days=30)
-        )
+    # Yahoo Chart API 有时会直接提供 marketCap
+    if meta.get("marketCap") is not None:
+        market_cap = _number(meta.get("marketCap"))
 
-        if shares is not None and not shares.empty:
-            shares = shares.dropna()
+    dividend_yield = _dividend_yield(
+        result,
+        price,
+    )
 
-            if not shares.empty:
-                latest_shares = clean_number(
-                    shares.iloc[-1]
-                )
+    # --------------------------------------------------------
+    # 当前阶段：
+    # 基本面指标先保持暂无数据
+    #
+    # 原因：
+    # 我们正在先验证 Railway → Yahoo 的 HTTP 数据通道。
+    # 下一步再接财务报表数据。
+    # --------------------------------------------------------
 
-                if (
-                    latest_shares is not None
-                    and price is not None
-                ):
-                    market_cap = (
-                        price *
-                        latest_shares
-                    )
+    valuation = {
+        "pe": None,
+        "pb": None,
+        "roe": None,
+        "roe_pb": None,
+        "pe_roe": None,
+    }
 
-    except Exception:
-        pass
+    fundamentals = {
+        "revenue": None,
+        "net_income": None,
+        "gross_margin": None,
+        "free_cash_flow": None,
+        "dividend_yield": dividend_yield,
+        "debt_ratio": None,
+    }
 
     return {
-        "query": original_symbol,
+        "query": symbol,
         "symbol": symbol,
         "company": company,
-        "exchange": None,
-        "currency": None,
+        "exchange": exchange,
+        "currency": currency,
 
         "market_data": {
             "price": price,
-            "market_cap": market_cap
+            "market_cap": market_cap,
         },
 
-        "valuation": {
-            "pe": pe,
-            "pb": pb,
-            "roe": roe,
-            "roe_pb": roe_pb,
-            "pe_roe": pe_roe
-        },
+        "valuation": valuation,
 
-        "fundamentals": {
-            "revenue": revenue,
-            "net_income": net_income,
-            "gross_margin": gross_margin,
-            "free_cash_flow": free_cash_flow,
-            "dividend_yield": dividend_yield,
-            "debt_ratio": debt_ratio
-        },
+        "fundamentals": fundamentals,
 
         "roe_15y": {
-            "years": roe_history["years"],
-            "stats": roe_history["stats"],
+            "years": [],
+            "stats": _empty_stats(),
             "definition": (
                 "ROE = 年度净利润 / "
                 "((期初股东权益 + 期末股东权益) / 2)"
             ),
-            "std_definition": (
-                "15年有效年度ROE的样本标准差"
-            )
+            "std_definition": "15年有效年度ROE的样本标准差",
         },
 
         "source": {
-            "provider": (
-                "Yahoo Finance via yfinance"
-            ),
+            "provider": "Yahoo Finance HTTP Chart API",
             "note": (
-                "V1：价格、利润表、资产负债表、"
-                "现金流量表、分红分别取数；"
-                "不依赖 ticker.info"
-            )
-        }
-            }
+                "当前版本直接通过 HTTP 请求 Yahoo Finance，"
+                "不依赖 yfinance 获取市场数据。"
+            ),
+        },
+    }
