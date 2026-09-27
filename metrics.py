@@ -194,53 +194,96 @@ def stats(values):
 
 
 def dividend_metrics(divs, cf, price, fcf, net_income, dividend_error=None):
-    out = {"status": "unavailable" if dividend_error else "no_dividend", "ttm_dividend_per_share": 0.0 if not dividend_error else None,
-           "dividend_yield": 0.0 if not dividend_error else None, "history": [], "cagr_3y": None, "cagr_5y": None, "cagr_10y": None,
-           "consecutive_years": 0, "dividend_payout_ratio": None, "fcf_payout_ratio": None, "buybacks": None,
-           "shareholder_payout": None, "shareholder_payout_ratio": None, "trend": "无现金股息" if not dividend_error else "暂无数据"}
+    out = {
+        "status": "unavailable" if dividend_error else "no_dividend",
+        "ttm_dividend_per_share": 0.0 if not dividend_error else None,
+        "dividend_yield": 0.0 if not dividend_error else None,
+        "history": [], "cagr_3y": None, "cagr_5y": None, "cagr_10y": None,
+        "consecutive_years": 0, "dividend_payout_ratio": None,
+        "fcf_payout_ratio": None, "buybacks": None,
+        "shareholder_payout": None, "shareholder_payout_ratio": None,
+        "trend": "无现金股息" if not dividend_error else "暂无数据",
+        "latest_complete_year": None,
+        "latest_period": None,
+    }
     if divs is not None and not getattr(divs, "empty", True):
         try:
             divs = divs.dropna().astype(float)
-            annual = divs.groupby(divs.index.year).sum()
+            if not isinstance(divs.index, pd.DatetimeIndex):
+                divs.index = pd.to_datetime(divs.index)
+            annual = divs.groupby(divs.index.year).sum().sort_index()
             out["status"] = "has_dividend"
-            out["history"] = [{"year": int(y), "dividend_per_share": float(v)} for y, v in annual.items()]
-            cutoff = divs.index.max() - pd.Timedelta(days=365)
-            ttm = float(divs[divs.index > cutoff].sum())
-            out["ttm_dividend_per_share"] = ttm if ttm > 0 else float(annual.iloc[-1])
-            if price:
-                out["dividend_yield"] = out["ttm_dividend_per_share"] / price * 100
 
+            now = pd.Timestamp.now()
+            current_year = int(now.year)
+            complete_years = [int(y) for y in annual.index if int(y) < current_year]
+            latest_complete = max(complete_years) if complete_years else None
+            out["latest_complete_year"] = latest_complete
+            out["history"] = [
+                {"year": int(y), "dividend_per_share": float(v),
+                 "complete": int(y) < current_year}
+                for y, v in annual.items()
+            ]
+
+            cutoff = now - pd.Timedelta(days=365)
+            ttm = float(divs[divs.index >= cutoff].sum())
+            if ttm <= 0 and latest_complete is not None:
+                ttm = float(annual.loc[latest_complete])
+            out["ttm_dividend_per_share"] = ttm
+            if price:
+                out["dividend_yield"] = ttm / price * 100
+
+            if annual.index.max() == current_year:
+                out["latest_period"] = f"{current_year} YTD"
+            elif annual.index.max() is not None:
+                out["latest_period"] = str(int(annual.index.max()))
+
+            # CAGR must use completed annual observations only. This prevents
+            # a partial current year (e.g. 2026 YTD) from distorting CAGR.
+            completed = annual.loc[annual.index.astype(int) < current_year]
             def cagr(years):
-                end_year = int(annual.index[-1]); target = end_year - years
-                eligible = [int(y) for y in annual.index if int(y) <= target]
-                if not eligible: return None
+                if completed.empty:
+                    return None
+                end_year = int(completed.index[-1]); target = end_year - years
+                eligible = [int(y) for y in completed.index if int(y) <= target]
+                if not eligible:
+                    return None
                 start_year = max(eligible); actual = end_year - start_year
-                if actual <= 0: return None
-                start, end = float(annual.loc[start_year]), float(annual.iloc[-1])
-                if start <= 0 or end <= 0: return None
-                return ((end / start) ** (1 / actual) - 1) * 100
+                if actual <= 0:
+                    return None
+                start, endv = float(completed.loc[start_year]), float(completed.loc[end_year])
+                if start <= 0 or endv <= 0:
+                    return None
+                return ((endv / start) ** (1 / actual) - 1) * 100
             out["cagr_3y"], out["cagr_5y"], out["cagr_10y"] = cagr(3), cagr(5), cagr(10)
-            last = int(annual.index[-1]); count = 0
-            for y in range(last, last - 30, -1):
-                if y in annual.index and annual.loc[y] > 0: count += 1
-                else: break
+
+            count = 0
+            if latest_complete is not None:
+                for y in range(latest_complete, latest_complete - 30, -1):
+                    if y in completed.index and float(completed.loc[y]) > 0:
+                        count += 1
+                    else:
+                        break
             out["consecutive_years"] = count
             if out["cagr_5y"] is not None:
                 out["trend"] = "上升" if out["cagr_5y"] > 1 else ("下降" if out["cagr_5y"] < -1 else "基本稳定")
-        except Exception:
-            pass
+        except Exception as exc:
+            out["history_error"] = str(exc)[:240]
 
     dividends_paid = latest_row(cf, ["Cash Dividends Paid", "Common Stock Dividend Paid", "Common Stock Payments", "Payment Of Dividends"])
     buybacks = latest_row(cf, ["Repurchase Of Capital Stock", "Repurchase Of Capital Stock Issuance", "Common Stock Payments"])
     dividends_paid = abs(dividends_paid) if dividends_paid is not None else (0.0 if out["status"] == "no_dividend" else None)
     buybacks = abs(buybacks) if buybacks is not None else None
     out["buybacks"] = buybacks
-    if dividends_paid is not None and net_income not in (None, 0): out["dividend_payout_ratio"] = dividends_paid / abs(net_income) * 100
-    if dividends_paid is not None and fcf not in (None, 0): out["fcf_payout_ratio"] = dividends_paid / abs(fcf) * 100
+    if dividends_paid is not None and net_income not in (None, 0):
+        out["dividend_payout_ratio"] = dividends_paid / abs(net_income) * 100
+    if dividends_paid is not None and fcf not in (None, 0):
+        out["fcf_payout_ratio"] = dividends_paid / abs(fcf) * 100
     if dividends_paid is not None or buybacks is not None:
         total = (dividends_paid or 0) + (buybacks or 0)
         out["shareholder_payout"] = total
-        if fcf not in (None, 0): out["shareholder_payout_ratio"] = total / abs(fcf) * 100
+        if fcf not in (None, 0):
+            out["shareholder_payout_ratio"] = total / abs(fcf) * 100
     return out
 
 
@@ -381,8 +424,10 @@ def _sec_fact(facts, tags):
 def sec_annual_roe(symbol, errors):
     """Build up to 15 annual ROEs from SEC Company Facts.
 
-    Income is a duration fact (FY/10-K); equity is an instant fact at fiscal
-    year-end.  They therefore must NOT be filtered with the same rules.
+    SEC duration facts (net income) and instant facts (equity) are matched by
+    fiscal-period end dates, not merely by the SEC ``fy`` field. This avoids
+    the common Apple-style fiscal-year/context mismatch where an equity fact
+    from a prior balance sheet is accidentally paired with the current year.
     """
     if not is_us_symbol(symbol):
         return None
@@ -393,7 +438,7 @@ def sec_annual_roe(symbol, errors):
             return None
 
         url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+        r = requests.get(url, headers=SEC_HEADERS, timeout=20)
         r.raise_for_status()
         data = r.json()
         facts = data.get("facts", {})
@@ -405,21 +450,18 @@ def sec_annual_roe(symbol, errors):
                     continue
                 if "USD" in unit_map:
                     return unit_map["USD"]
-                # Equity/net-income for ordinary issuers should normally be USD.
                 first = next(iter(unit_map.values()), None)
                 if first:
                     return first
             return []
 
-        # Net income is a duration/flow fact.
+        # Prefer consolidated net income and total shareholders' equity.
         ni_items = pick_units("us-gaap", [
             "NetIncomeLoss",
             "ProfitLoss",
             "NetIncomeLossAvailableToCommonStockholdersBasic",
             "NetIncomeLossAvailableToCommonStockholdersDiluted",
         ])
-        # Equity is an instant/balance-sheet fact.  Prefer parent/common equity
-        # over a total including non-controlling interests when both exist.
         eq_items = pick_units("us-gaap", [
             "StockholdersEquity",
             "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
@@ -430,80 +472,121 @@ def sec_annual_roe(symbol, errors):
             errors["sec"] = "SEC facts missing usable net income or equity tags"
             return []
 
-        def latest_annual_flow(items):
-            by_year = {}
+        forms = {"10-K", "20-F", "40-F"}
+
+        def annual_flows(items):
+            """Return one duration fact per fiscal year, preserving period dates."""
+            candidates = []
             for x in items:
                 val = finite(x.get("val"))
-                fy = x.get("fy")
-                fp = x.get("fp")
-                form = x.get("form")
-                start = x.get("start")
-                end = x.get("end")
-                if val is None or not fy or not end or not start:
+                start, end = x.get("start"), x.get("end")
+                form, fy = x.get("form"), x.get("fy")
+                if val is None or not start or not end or form not in forms:
                     continue
-                if form not in ("10-K", "20-F", "40-F"):
-                    continue
-                # Annual income statement fact: roughly a full fiscal year.
                 try:
                     days = (pd.Timestamp(end) - pd.Timestamp(start)).days
                 except Exception:
                     continue
-                if days < 250 or days > 400:
+                # Annual 10-K duration; allow 52/53-week fiscal years.
+                if not 250 <= days <= 400:
                     continue
-                # Prefer explicit FY facts; some filings use a non-FY fp.
-                year = int(fy)
-                score = (1 if fp == "FY" else 0, str(x.get("filed", "")))
-                old = by_year.get(year)
-                if old is None or score > old[0]:
-                    by_year[year] = (score, x)
-            return {y: item for y, (_, item) in by_year.items()}
+                try:
+                    year = int(fy) if fy else pd.Timestamp(end).year
+                except Exception:
+                    year = pd.Timestamp(end).year
+                score = (
+                    1 if x.get("fp") == "FY" else 0,
+                    1 if form == "10-K" else 0,
+                    str(x.get("filed", "")),
+                )
+                candidates.append((year, str(end), score, x))
 
-        def latest_annual_instant(items):
             by_year = {}
+            for year, end, score, x in candidates:
+                old = by_year.get(year)
+                # Prefer the filing with the strongest annual designation and
+                # latest filing date, while retaining its exact fiscal end date.
+                if old is None or score > old[0]:
+                    by_year[year] = (score, end, x)
+            return {y: item for y, (_, _, item) in by_year.items()}
+
+        def instant_equity(items):
+            """Return the best equity fact for each exact balance-sheet end date."""
+            by_end = {}
             for x in items:
                 val = finite(x.get("val"))
                 end = x.get("end")
                 form = x.get("form")
-                fy = x.get("fy")
-                if val is None or not end or form not in ("10-K", "20-F", "40-F"):
+                if val is None or not end or form not in forms:
                     continue
-                # Instant fact: no start date should be required.
                 try:
-                    year = int(fy) if fy else pd.Timestamp(end).year
+                    end_date = str(pd.Timestamp(end).date())
                 except Exception:
                     continue
+                # Instant facts must not require a start date.
                 score = (
                     1 if x.get("fp") == "FY" else 0,
+                    1 if form == "10-K" else 0,
                     str(x.get("filed", "")),
                 )
-                old = by_year.get(year)
+                old = by_end.get(end_date)
                 if old is None or score > old[0]:
-                    by_year[year] = (score, x)
-            return {y: item for y, (_, item) in by_year.items()}
+                    by_end[end_date] = (score, x)
+            return {end: item for end, (_, item) in by_end.items()}
 
-        ni_by = latest_annual_flow(ni_items)
-        eq_by = latest_annual_instant(eq_items)
-        years = sorted(set(ni_by) & set(eq_by))
+        ni_by_year = annual_flows(ni_items)
+        eq_by_end = instant_equity(eq_items)
+        eq_dates = sorted(eq_by_end.keys())
+
+        def equity_on_or_before(target_date, max_days=450):
+            """Find the latest balance-sheet equity at/before target date."""
+            if not target_date:
+                return None
+            try:
+                target = pd.Timestamp(target_date)
+            except Exception:
+                return None
+            eligible = [d for d in eq_dates if pd.Timestamp(d) <= target]
+            if not eligible:
+                return None
+            chosen = eligible[-1]
+            if (target - pd.Timestamp(chosen)).days > max_days:
+                return None
+            return eq_by_end[chosen]
+
         rows = []
-        for year in years:
-            # Beginning equity is the immediately preceding fiscal year-end.
-            prev = eq_by.get(year - 1)
-            cur = eq_by.get(year)
-            if not prev or not cur:
+        for year in sorted(ni_by_year):
+            ni = ni_by_year[year]
+            n = finite(ni.get("val"))
+            end = ni.get("end")
+            start = ni.get("start")
+            if n is None or not start or not end:
                 continue
-            n = finite(ni_by[year].get("val"))
+
+            # Exact fiscal-period matching first. Beginning equity is the
+            # balance immediately preceding the fiscal-period start.
+            cur = eq_by_end.get(str(pd.Timestamp(end).date()))
+            prev = equity_on_or_before(start)
+            if cur is None or prev is None:
+                continue
+
             eb = finite(prev.get("val"))
             ee = finite(cur.get("val"))
-            if n is None or eb is None or ee is None:
+            if eb is None or ee is None:
                 continue
             avg_equity = (eb + ee) / 2
             if avg_equity == 0:
                 continue
+
             rows.append({
                 "year": int(year),
+                "fiscal_year": f"FY{int(year)}",
+                "fiscal_period_end": str(pd.Timestamp(end).date()),
                 "net_income": n,
                 "equity_begin": eb,
+                "equity_begin_date": str(pd.Timestamp(prev.get("end")).date()) if prev.get("end") else None,
                 "equity_end": ee,
+                "equity_end_date": str(pd.Timestamp(cur.get("end")).date()) if cur.get("end") else str(pd.Timestamp(end).date()),
                 "roe": n / avg_equity * 100,
             })
 
@@ -552,6 +635,9 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
     if sec_roe is not None and len(sec_roe) >= 2:
         roe15=sec_roe; roe_source="SEC EDGAR / XBRL Company Facts"
+        # Keep the headline ROE definition consistent with the 15-year table
+        # for U.S. issuers instead of mixing Yahoo's proprietary calculation.
+        current_roe=finite(roe15[-1].get("roe")) if roe15 else current_roe
     else:
         roe15=annual_roe(inc,bs); roe_source="Yahoo Finance via yfinance"
 
