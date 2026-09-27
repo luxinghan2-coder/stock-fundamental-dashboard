@@ -288,15 +288,21 @@ def dividend_metrics(divs, cf, price, fcf, net_income, dividend_error=None):
 
 
 def pivot_levels(history):
-    """Calculate daily pivot points using the latest completed daily OHLC bar.
+    """Calculate weekly pivot points in the same convention as the reference quote app.
 
-    This matches the common quote-app "轴点" table shown in the reference UI:
-    Classic pivots and Fibonacci pivots are both derived from the same prior-day
-    High/Low/Close.  It is intentionally separate from Fibonacci retracement,
-    which uses a multi-month swing high/low.
+    Reference-app convention observed for the AAPL example:
+    - The displayed daily "轴点" table is based on the *previous completed week*.
+    - Weekly H/L/C are aggregated from the daily candles of Monday-Friday.
+    - For the week Sep 21-25, 2026, the pivot table therefore uses Sep 14-18,
+      whose weekly H/L/C are 338.49 / 328.35 / 336.13.
+    - Classic and Fibonacci levels are then calculated from that same weekly H/L/C.
+
+    This is deliberately separate from Fibonacci retracement, which uses the
+    252-trading-day swing high/low elsewhere in the dashboard.
     """
     out = {
-        "available": False, "date": None, "high": None, "low": None, "close": None,
+        "available": False, "date": None, "period": "previous_week",
+        "high": None, "low": None, "close": None,
         "classic": {}, "fibonacci": {},
         "fibonacci_ratios": {"R1": 0.382, "R2": 0.618, "R3": 1.0},
     }
@@ -307,34 +313,72 @@ def pivot_levels(history):
         if not all(k in cols for k in ("high", "low", "close")):
             return out
         hcol, lcol, ccol = cols["high"], cols["low"], cols["close"]
-        row = history.dropna(subset=[hcol, lcol, ccol]).iloc[-1]
-        high, low, close = float(row[hcol]), float(row[lcol]), float(row[ccol])
+
+        df = history[[hcol, lcol, ccol]].copy()
+        idx = pd.to_datetime(df.index)
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_convert(None)
+        df.index = idx.normalize()
+        df = df.dropna(subset=[hcol, lcol, ccol])
+        if df.empty:
+            return out
+
+        # Build Monday-Friday trading weeks from the daily candles.
+        weekly = df.resample("W-FRI", label="right", closed="right").agg({
+            hcol: "max", lcol: "min", ccol: "last"
+        }).dropna()
+        if weekly.empty:
+            return out
+
+        # A quote app's daily pivot table stays fixed for the whole current
+        # trading week, so it uses the immediately preceding completed week.
+        # If the latest data belongs to an older week (e.g. weekend/holiday),
+        # that latest completed week is already the appropriate reference week.
+        today = pd.Timestamp.now().normalize()
+        current_week_start = today - pd.Timedelta(days=today.weekday())
+        last_week_end = pd.Timestamp(weekly.index[-1]).normalize()
+        if last_week_end >= current_week_start and len(weekly) >= 2:
+            ref = weekly.iloc[-2]
+            ref_date = pd.Timestamp(weekly.index[-2]).normalize()
+        else:
+            ref = weekly.iloc[-1]
+            ref_date = last_week_end
+
+        high, low, close = float(ref[hcol]), float(ref[lcol]), float(ref[ccol])
         if not all(math.isfinite(x) for x in (high, low, close)) or high <= low:
             return out
+
         rng = high - low
-        pp = (high + low + close) / 3.0
+        # Match the reference quote app: round the central pivot to 2 decimals
+        # before deriving every support/resistance level.
+        pp = round((high + low + close) / 3.0, 2)
         classic = {
-            "R3": high + 2 * (pp - low),
-            "R2": pp + rng,
-            "R1": 2 * pp - low,
-            "轴心点": pp,
-            "S1": 2 * pp - high,
-            "S2": pp - rng,
-            "S3": low - 2 * (high - pp),
+            "R3": round(high + 2 * (pp - low), 2),
+            "R2": round(pp + rng, 2),
+            "R1": round(2 * pp - low, 2),
+            "轴心点": round(pp, 2),
+            "S1": round(2 * pp - high, 2),
+            "S2": round(pp - rng, 2),
+            "S3": round(low - 2 * (high - pp), 2),
         }
         fibonacci = {
-            "R3": pp + 1.000 * rng,
-            "R2": pp + 0.618 * rng,
-            "R1": pp + 0.382 * rng,
-            "轴心点": pp,
-            "S1": pp - 0.382 * rng,
-            "S2": pp - 0.618 * rng,
-            "S3": pp - 1.000 * rng,
+            "R3": round(pp + 1.000 * rng, 2),
+            "R2": round(pp + 0.618 * rng, 2),
+            "R1": round(pp + 0.382 * rng, 2),
+            "轴心点": round(pp, 2),
+            "S1": round(pp - 0.382 * rng, 2),
+            "S2": round(pp - 0.618 * rng, 2),
+            "S3": round(pp - 1.000 * rng, 2),
         }
-        idx = history.index[-1]
-        date = str(getattr(idx, "date", lambda: idx)()) if hasattr(idx, "date") else str(idx)
-        out.update({"available": True, "date": date, "high": high, "low": low, "close": close,
-                    "classic": classic, "fibonacci": fibonacci})
+        out.update({
+            "available": True,
+            "date": str(ref_date.date()),
+            "high": high,
+            "low": low,
+            "close": close,
+            "classic": classic,
+            "fibonacci": fibonacci,
+        })
     except Exception:
         pass
     return out
@@ -370,48 +414,74 @@ def fibonacci_levels(history):
     return out
 
 
-def resonance_levels(current, fib, indicators):
-    """Find zones where Fibonacci and Bollinger levels converge.
+def resonance_levels(current, pivots, indicators):
+    """Find Pivot Point / Bollinger Band resonance using the reference-app rule.
 
-    A resonance zone requires at least two independent levels within 1% of
-    their cluster center. This is descriptive market structure, not a trade signal.
+    Resonance is evaluated only between the matching structural levels:
+    - R1/R2/R3 (classic or Fibonacci Pivot) vs Bollinger upper band
+    - central Pivot vs Bollinger middle band
+    - S1/S2/S3 (classic or Fibonacci Pivot) vs Bollinger lower band
+
+    A match is considered overlapping when the absolute relative difference
+    is <= 1%. This replaces the old Fibonacci-retracement + Bollinger
+    clustering logic. It is descriptive market structure, not a trade signal.
     """
-    out = {"available": False, "tolerance_pct": 1.0, "support": [], "resistance": []}
+    out = {
+        "available": False, "tolerance_pct": 1.0,
+        "support": [], "resistance": [], "matches": []
+    }
     current = finite(current)
-    if current is None:
+    if current is None or not pivots or not pivots.get("available"):
         return out
-    levels = []
-    for label, value in (fib or {}).get("levels", {}).items():
-        value = finite(value)
-        if value is not None:
-            levels.append({"price": value, "source": f"Fib {label}"})
-    for label, key in (("布林下轨", "bb_lower"), ("布林上轨", "bb_upper")):
-        value = finite((indicators or {}).get(key))
-        if value is not None:
-            levels.append({"price": value, "source": label})
-    if len(levels) < 2:
+
+    indicators = indicators or {}
+    bb = {
+        "upper": finite(indicators.get("bb_upper")),
+        "mid": finite(indicators.get("bb_mid")),
+        "lower": finite(indicators.get("bb_lower")),
+    }
+    if not any(v is not None for v in bb.values()):
         return out
-    levels.sort(key=lambda x: x["price"])
-    clusters = []
-    for item in levels:
-        if not clusters:
-            clusters.append([item]); continue
-        anchor = sum(x["price"] for x in clusters[-1]) / len(clusters[-1])
-        if abs(item["price"] - anchor) / anchor <= 0.01:
-            clusters[-1].append(item)
-        else:
-            clusters.append([item])
-    def pack(cluster):
-        price = sum(x["price"] for x in cluster) / len(cluster)
-        return {"price": price, "count": len(cluster),
-                "sources": [x["source"] for x in cluster],
-                "distance_pct": (price / current - 1) * 100}
-    support = [pack(c) for c in clusters if len(c) >= 2 and sum(x["price"] for x in c)/len(c) < current]
-    resistance = [pack(c) for c in clusters if len(c) >= 2 and sum(x["price"] for x in c)/len(c) > current]
-    support.sort(key=lambda x: (x["count"], x["price"]), reverse=True)
-    resistance.sort(key=lambda x: (x["count"], -x["price"]), reverse=True)
-    out.update({"available": bool(support or resistance), "support": support[:3], "resistance": resistance[:3]})
+
+    specs = [
+        ("upper", ["R1", "R2", "R3"], "布林上轨"),
+        ("mid", ["轴心点"], "布林中轨"),
+        ("lower", ["S1", "S2", "S3"], "布林下轨"),
+    ]
+    matches = []
+    for method_key, method_name in (("classic", "经典"), ("fibonacci", "斐波纳契")):
+        levels = pivots.get(method_key) or {}
+        for bb_key, labels, bb_name in specs:
+            bb_value = bb.get(bb_key)
+            if bb_value is None or bb_value == 0:
+                continue
+            for label in labels:
+                pivot_value = finite(levels.get(label))
+                if pivot_value is None:
+                    continue
+                distance_pct = (pivot_value / bb_value - 1.0) * 100.0
+                if abs(distance_pct) <= 1.0:
+                    matches.append({
+                        "price": round((pivot_value + bb_value) / 2.0, 2),
+                        "pivot_price": pivot_value,
+                        "bollinger_price": bb_value,
+                        "pivot": f"{method_name} {label}",
+                        "bollinger": bb_name,
+                        "distance_pct": distance_pct,
+                        "count": 2,
+                        "sources": [f"{method_name} {label}", bb_name],
+                        "type": "support" if bb_key == "lower" or (bb_key == "mid" and pivot_value < current) else "resistance",
+                    })
+
+    # Sort closest matches first; keep every valid pair so the user can see
+    # exactly which Pivot level overlaps which Bollinger band.
+    matches.sort(key=lambda x: abs(x["distance_pct"]))
+    out["matches"] = matches
+    out["support"] = [x for x in matches if x["type"] == "support"][:6]
+    out["resistance"] = [x for x in matches if x["type"] == "resistance"][:6]
+    out["available"] = bool(matches)
     return out
+
 
 def technical_price_chart(history, fib):
     """Build OHLC candlestick data for the mobile technical-analysis chart.
@@ -748,6 +818,104 @@ def sec_annual_roe(symbol, errors):
         return None
 
 
+_TRANSLATE_CACHE = {}
+
+def translate_to_chinese(text, errors, max_chars=5000):
+    """Best-effort English->Simplified Chinese translation using a free public endpoint.
+    If translation is unavailable, return the original text rather than inventing content.
+    """
+    if not text:
+        return None
+    text = str(text).strip()
+    if not text:
+        return None
+    if re.search(r"[\u4e00-\u9fff]", text) and not re.search(r"[A-Za-z]{4,}", text):
+        return text
+    key = text[:max_chars]
+    if key in _TRANSLATE_CACHE:
+        return _TRANSLATE_CACHE[key]
+    try:
+        chunks = []
+        remaining = text[:max_chars]
+        while remaining:
+            cut = min(1200, len(remaining))
+            if cut < len(remaining):
+                candidates = [remaining.rfind(". ", 0, cut), remaining.rfind("; ", 0, cut), remaining.rfind("，", 0, cut)]
+                best = max(candidates)
+                if best > 400:
+                    cut = best + 1
+            chunks.append(remaining[:cut])
+            remaining = remaining[cut:]
+        out=[]
+        for chunk in chunks:
+            r=requests.get(
+                "https://translate.googleapis.com/translate_a/single",
+                params={"client":"gtx","sl":"en","tl":"zh-CN","dt":"t","q":chunk},
+                headers={"User-Agent":"Mozilla/5.0"}, timeout=8
+            )
+            r.raise_for_status()
+            data=r.json()
+            translated="".join(part[0] for part in (data[0] or []) if part and part[0])
+            out.append(translated or chunk)
+        result="".join(out).strip()
+        if result:
+            _TRANSLATE_CACHE[key]=result
+            return result
+    except Exception as exc:
+        errors["translation"] = str(exc)[:240]
+    return text
+
+
+def _news_sentiment(title: str) -> str:
+    """Title-only heuristic. Labels are indicative, not investment recommendations."""
+    t=(title or "").lower()
+    positive=["beat","beats","strong","growth","record","surge","jump","rises","rise","gain","upgrade","launch","wins","approved","agreement","deal","expands","sales up","profit up","revenue up","超预期","增长","上涨","创纪录","推出","获批","协议","合作","扩张"]
+    negative=["miss","misses","weak","decline","drop","falls","fall","cuts","downgrade","lawsuit","fine","penalty","delay","recall","shortage","warning","slump","risk","disappoint","disappoints","profit down","revenue down","下滑","下降","诉讼","罚款","延迟","召回","短缺","风险","不及预期","警告"]
+    ps=sum(1 for w in positive if w in t)
+    ns=sum(1 for w in negative if w in t)
+    if ps>ns and ps>0: return "利好"
+    if ns>ps and ns>0: return "利空"
+    return "中性"
+
+
+def company_news(symbol, errors, limit=8):
+    """Fetch current company news from Yahoo Finance search, preserving original article links."""
+    items=[]
+    try:
+        r=requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={"q":symbol,"quotesCount":0,"newsCount":limit},
+            headers={"User-Agent":"Mozilla/5.0"}, timeout=12
+        )
+        r.raise_for_status()
+        data=r.json() or {}
+        for x in data.get("news") or []:
+            title=(x.get("title") or "").strip()
+            link=(x.get("link") or x.get("canonicalUrl",{}).get("url") or "").strip()
+            if not title or not link: continue
+            ts=x.get("providerPublishTime")
+            dt=None
+            if ts:
+                try: dt=pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).strftime("%Y-%m-%d %H:%M")
+                except Exception: dt=None
+            items.append({
+                "title": title,
+                "title_zh": translate_to_chinese(title, errors, max_chars=800) or title,
+                "publisher": (x.get("publisher") or "").strip() or "新闻来源",
+                "link": link,
+                "published_at": dt,
+                "sentiment": _news_sentiment(title),
+            })
+    except Exception as exc:
+        errors["news"] = str(exc)[:240]
+    # de-duplicate by URL/title
+    seen=set(); out=[]
+    for x in items:
+        k=x["link"] or x["title"]
+        if k in seen: continue
+        seen.add(k); out.append(x)
+    return out[:limit]
+
 def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     symbol=clean_symbol(raw_symbol); t=yf.Ticker(symbol); errors={}
     history=get_history(t,symbol,errors)
@@ -777,7 +945,7 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     try: divs=t.get_dividends(period="max")
     except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
     dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
-    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, fib, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
+    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, pivots, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
 
     # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
@@ -832,9 +1000,12 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
 
     company=info.get("longName") or info.get("shortName") or symbol
     exchange=info.get("exchange") or ""; currency=info.get("currency") or ""
-    source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10}
-    return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":info.get("longBusinessSummary") or None,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
+    company_description_en=info.get("longBusinessSummary") or None
+    company_description_zh=translate_to_chinese(company_description_en, errors) if company_description_en else None
+    news=company_news(symbol, errors, limit=8)
+    source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10,"news":bool(news)}
+    return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":company_description_zh,"company_description_en":company_description_en,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
             "valuation":{"pe":pe,"pb":pb,"roe":current_roe,"roe_pb":safe_ratio(current_roe,pb),"pe_roe":safe_ratio(pe,current_roe)},
             "fundamentals":{"revenue":revenue,"net_income":net_income,"gross_margin":gross_margin,"free_cash_flow":fcf,"debt_ratio":debt_ratio,"debt_to_equity":finite(info.get("debtToEquity"))},
             "dividends":dividends,"roe_15y":{"years":roe15,"stats":stats([r["roe"] for r in roe15]),"definition":"ROE = 年度净利润 / ((期初股东权益 + 期末股东权益) / 2)","source":roe_source},
-            "technical":tech,"analysts":analysts,"source":{"provider":"免费数据源：Yahoo Finance/yfinance + SEC EDGAR（美股长期ROE）","status":source_status,"errors":errors,"note":"行情、财报、分红、技术面、分析师及长期ROE独立取数；单模块失败不会让整个页面失效。"}}
+            "technical":tech,"analysts":analysts,"news":news,"source":{"provider":"免费数据源：Yahoo Finance/yfinance + SEC EDGAR（美股长期ROE）+ Yahoo Finance News","status":source_status,"errors":errors,"note":"行情、财报、分红、技术面、分析师、公司简介、新闻及长期ROE独立取数；单模块失败不会让整个页面失效。新闻的利好/利空标签仅按标题关键词自动归类，不构成投资建议。"}}
