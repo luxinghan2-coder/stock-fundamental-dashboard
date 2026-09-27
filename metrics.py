@@ -244,6 +244,56 @@ def dividend_metrics(divs, cf, price, fcf, net_income, dividend_error=None):
     return out
 
 
+def fibonacci_levels(history):
+    out = {"available": False, "swing_high": None, "swing_low": None, "levels": {}, "nearest_support": None, "nearest_resistance": None}
+    if history is None or getattr(history, "empty", True) or "Close" not in history:
+        return out
+    try:
+        h = history.tail(252)
+        close = h["Close"].dropna().astype(float)
+        if len(close) < 30:
+            return out
+        swing_high = float(h["High"].dropna().astype(float).max()) if "High" in h else float(close.max())
+        swing_low = float(h["Low"].dropna().astype(float).min()) if "Low" in h else float(close.min())
+        if swing_high <= swing_low:
+            return out
+        current = float(close.iloc[-1])
+        diff = swing_high - swing_low
+        ratios = {"0.0%": 0.0, "23.6%": 0.236, "38.2%": 0.382, "50.0%": 0.5, "61.8%": 0.618, "78.6%": 0.786, "100.0%": 1.0}
+        levels = {label: swing_high - diff * ratio for label, ratio in ratios.items()}
+        below = [(label, value) for label, value in levels.items() if value < current]
+        above = [(label, value) for label, value in levels.items() if value > current]
+        support = max(below, key=lambda x: x[1]) if below else None
+        resistance = min(above, key=lambda x: x[1]) if above else None
+        out.update({"available": True, "swing_high": swing_high, "swing_low": swing_low,
+                    "levels": levels,
+                    "nearest_support": {"level": support[0], "price": support[1]} if support else None,
+                    "nearest_resistance": {"level": resistance[0], "price": resistance[1]} if resistance else None})
+    except Exception:
+        pass
+    return out
+
+
+def technical_price_chart(history, fib):
+    out = {"available": False, "points": [], "current": None, "support": None, "resistance": None}
+    if history is None or getattr(history, "empty", True) or "Close" not in history:
+        return out
+    try:
+        close = history["Close"].dropna().astype(float).tail(120)
+        if len(close) < 10:
+            return out
+        support = fib.get("nearest_support") if fib else None
+        resistance = fib.get("nearest_resistance") if fib else None
+        out["points"] = [{"date": str(idx.date()), "price": float(v)} for idx, v in close.items()]
+        out["current"] = float(close.iloc[-1])
+        out["support"] = support
+        out["resistance"] = resistance
+        out["available"] = True
+    except Exception:
+        pass
+    return out
+
+
 def technical_analysis(history):
     out = {"score": None, "state": "暂无数据", "signals": [], "indicators": {}, "history": []}
     if history is None or getattr(history, "empty", True) or "Close" not in history:
@@ -496,7 +546,7 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     try: divs=t.get_dividends(period="max")
     except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
     dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
-    tech=technical_analysis(history); analysts=analyst_view(t)
+    fib=fibonacci_levels(history); tech=technical_analysis(history); tech["fibonacci"]=fib; tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
 
     # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
