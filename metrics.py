@@ -414,21 +414,66 @@ def resonance_levels(current, fib, indicators):
     return out
 
 def technical_price_chart(history, fib):
-    out = {"available": False, "points": [], "bollinger_points": [], "current": None, "support": None, "resistance": None}
+    """Build OHLC candlestick data for the mobile technical-analysis chart.
+
+    The frontend renders real candles (Open/High/Low/Close) rather than a
+    close-price polyline.  The data is limited to the latest 120 completed
+    daily bars and includes volume, MA5/10/20/60 and Bollinger bands.
+    """
+    out = {
+        "available": False, "points": [], "bollinger_points": [],
+        "current": None, "support": None, "resistance": None,
+        "ma_points": [], "volume_max": None, "timeframe": "1D"
+    }
     if history is None or getattr(history, "empty", True) or "Close" not in history:
         return out
     try:
-        close = history["Close"].dropna().astype(float).tail(120)
-        if len(close) < 10:
+        cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in history.columns]
+        h = history[cols].copy()
+        for c in cols:
+            h[c] = pd.to_numeric(h[c], errors="coerce")
+        h = h.dropna(subset=["Close"]).tail(120)
+        if len(h) < 10:
             return out
-        support = fib.get("nearest_support") if fib else None
-        resistance = fib.get("nearest_resistance") if fib else None
+        # If an occasional OHLC field is missing, use close only for that bar's
+        # body/wick rather than inventing a historical price.
+        for c in ("Open", "High", "Low"):
+            if c not in h.columns:
+                h[c] = h["Close"]
+        h["Open"] = h["Open"].fillna(h["Close"])
+        h["High"] = h["High"].fillna(h[["Open", "Close"]].max(axis=1))
+        h["Low"] = h["Low"].fillna(h[["Open", "Close"]].min(axis=1))
+        if "Volume" not in h.columns:
+            h["Volume"] = np.nan
+
+        close = h["Close"]
         mid = close.rolling(20).mean()
         sd = close.rolling(20).std()
-        upper = mid + 2 * sd
-        lower = mid - 2 * sd
-        out["points"] = [{"date": str(idx.date()), "price": float(v)} for idx, v in close.items()]
-        out["bollinger_points"] = [{"date": str(idx.date()), "upper": finite(upper.loc[idx]), "mid": finite(mid.loc[idx]), "lower": finite(lower.loc[idx])} for idx in close.index]
+        upper, lower = mid + 2 * sd, mid - 2 * sd
+        support = fib.get("nearest_support") if fib else None
+        resistance = fib.get("nearest_resistance") if fib else None
+
+        out["points"] = []
+        for idx, row in h.iterrows():
+            out["points"].append({
+                "date": str(idx.date()),
+                "open": finite(row["Open"]), "high": finite(row["High"]),
+                "low": finite(row["Low"]), "close": finite(row["Close"]),
+                "volume": finite(row["Volume"])
+            })
+        out["bollinger_points"] = [{
+            "date": str(idx.date()), "upper": finite(upper.loc[idx]),
+            "mid": finite(mid.loc[idx]), "lower": finite(lower.loc[idx])
+        } for idx in h.index]
+        out["ma_points"] = [{
+            "date": str(idx.date()),
+            "ma5": finite(close.rolling(5).mean().loc[idx]),
+            "ma10": finite(close.rolling(10).mean().loc[idx]),
+            "ma20": finite(close.rolling(20).mean().loc[idx]),
+            "ma60": finite(close.rolling(60).mean().loc[idx])
+        } for idx in h.index]
+        vols = h["Volume"].dropna()
+        out["volume_max"] = float(vols.max()) if not vols.empty else None
         out["current"] = float(close.iloc[-1])
         out["support"] = support
         out["resistance"] = resistance
