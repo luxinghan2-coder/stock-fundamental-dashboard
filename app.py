@@ -5,23 +5,23 @@ from pathlib import Path
 from metrics import build_dashboard
 
 BASE = Path(__file__).resolve().parent
-app = FastAPI(title="股票基本面驾驶舱", version="1.0.0")
-app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+app = FastAPI(title='股票基本面驾驶舱 V2.1', version='2.1.0')
+app.mount('/static', StaticFiles(directory=BASE / 'static'), name='static')
 
-@app.get("/")
+@app.get('/')
 def index():
-    return FileResponse(BASE / "static" / "index.html")
+    return FileResponse(BASE / 'static' / 'index.html')
 
-@app.get("/api/health")
+@app.get('/api/health')
 def health():
-    return {"ok": True, "service": "stock-fundamental-dashboard"}
+    return {'ok': True, 'service': 'stock-fundamental-dashboard', 'version': '2.1.0'}
 
-@app.get("/api/stock/{symbol}")
+@app.get('/api/stock/{symbol}')
 def stock(symbol: str):
     symbol = symbol.strip()
     if not symbol:
-        raise HTTPException(status_code=400, detail="请输入股票代码")
+        raise HTTPException(status_code=400, detail='请输入股票代码')
     try:
         return build_dashboard(symbol)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"数据获取失败：{exc}")
+        raise HTTPException(status_code=502, detail=f'数据获取失败：{exc}')
