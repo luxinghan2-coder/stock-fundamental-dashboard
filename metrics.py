@@ -820,51 +820,104 @@ def sec_annual_roe(symbol, errors):
 
 _TRANSLATE_CACHE = {}
 
+_PUBLISHER_ZH = {
+    "Reuters": "路透社",
+    "Reuters Breakingviews": "路透 Breakingviews",
+    "Yahoo Finance": "雅虎财经",
+    "Bloomberg": "彭博",
+    "CNBC": "CNBC",
+    "The Wall Street Journal": "华尔街日报",
+    "Financial Times": "金融时报",
+    "MarketWatch": "MarketWatch",
+    "Benzinga": "Benzinga",
+    "Seeking Alpha": "Seeking Alpha",
+    "Barron's": "巴伦周刊",
+    "The Motley Fool": "Motley Fool",
+    "Associated Press": "美联社",
+    "AP News": "美联社",
+}
+
+def _split_translate_chunks(text, max_chars=5000):
+    chunks=[]
+    remaining=str(text)[:max_chars]
+    while remaining:
+        cut=min(1100,len(remaining))
+        if cut < len(remaining):
+            candidates=[remaining.rfind('. ',0,cut),remaining.rfind('; ',0,cut),remaining.rfind(', ',0,cut),remaining.rfind('。',0,cut)]
+            best=max(candidates)
+            if best>350: cut=best+1
+        chunks.append(remaining[:cut])
+        remaining=remaining[cut:]
+    return chunks
+
+def _translate_google(chunk):
+    r=requests.get(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client":"gtx","sl":"auto","tl":"zh-CN","dt":"t","q":chunk},
+        headers={"User-Agent":"Mozilla/5.0"}, timeout=8
+    )
+    r.raise_for_status()
+    data=r.json()
+    return "".join(part[0] for part in (data[0] or []) if part and part[0]).strip()
+
+def _translate_mymemory(chunk):
+    # Free fallback; no API key required for short public requests.
+    r=requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q":chunk,"langpair":"en|zh-CN"},
+        headers={"User-Agent":"AEL-Stock-Dashboard/2.4.7"}, timeout=10
+    )
+    r.raise_for_status()
+    data=r.json() or {}
+    translated=((data.get("responseData") or {}).get("translatedText") or "").strip()
+    if not translated: raise RuntimeError("MyMemory returned empty translation")
+    return translated
+
 def translate_to_chinese(text, errors, max_chars=5000):
-    """Best-effort English->Simplified Chinese translation using a free public endpoint.
-    If translation is unavailable, return the original text rather than inventing content.
+    """Translate source text to Simplified Chinese with two free fallbacks.
+    The dashboard never intentionally displays an English fallback as the Chinese field.
     """
     if not text:
         return None
-    text = str(text).strip()
+    text=str(text).strip()
     if not text:
         return None
+    # Already Chinese: keep it.
     if re.search(r"[\u4e00-\u9fff]", text) and not re.search(r"[A-Za-z]{4,}", text):
         return text
-    key = text[:max_chars]
-    if key in _TRANSLATE_CACHE:
-        return _TRANSLATE_CACHE[key]
-    try:
-        chunks = []
-        remaining = text[:max_chars]
-        while remaining:
-            cut = min(1200, len(remaining))
-            if cut < len(remaining):
-                candidates = [remaining.rfind(". ", 0, cut), remaining.rfind("; ", 0, cut), remaining.rfind("，", 0, cut)]
-                best = max(candidates)
-                if best > 400:
-                    cut = best + 1
-            chunks.append(remaining[:cut])
-            remaining = remaining[cut:]
-        out=[]
-        for chunk in chunks:
-            r=requests.get(
-                "https://translate.googleapis.com/translate_a/single",
-                params={"client":"gtx","sl":"en","tl":"zh-CN","dt":"t","q":chunk},
-                headers={"User-Agent":"Mozilla/5.0"}, timeout=8
-            )
-            r.raise_for_status()
-            data=r.json()
-            translated="".join(part[0] for part in (data[0] or []) if part and part[0])
-            out.append(translated or chunk)
-        result="".join(out).strip()
-        if result:
-            _TRANSLATE_CACHE[key]=result
-            return result
-    except Exception as exc:
-        errors["translation"] = str(exc)[:240]
-    return text
+    key=text[:max_chars]
+    if key in _TRANSLATE_CACHE: return _TRANSLATE_CACHE[key]
+    chunks=_split_translate_chunks(text,max_chars)
+    providers=[("google",_translate_google),("mymemory",_translate_mymemory)]
+    last_error=None
+    for name,fn in providers:
+        try:
+            out=[]
+            for chunk in chunks:
+                tr=fn(chunk)
+                if not tr: raise RuntimeError("empty translation")
+                out.append(tr)
+            result="".join(out).strip()
+            if result:
+                _TRANSLATE_CACHE[key]=result
+                return result
+        except Exception as exc:
+            last_error=f"{name}: {exc}"
+            continue
+    if last_error:
+        errors.setdefault("translation", last_error[:240])
+    # Do not surface the English source in a field explicitly labelled Chinese.
+    return None
 
+
+def publisher_to_chinese(publisher):
+    p=(publisher or "").strip()
+    if not p: return "新闻来源"
+    if p in _PUBLISHER_ZH: return _PUBLISHER_ZH[p]
+    for en,zh in _PUBLISHER_ZH.items():
+        if en.lower() in p.lower(): return zh
+    # Keep acronyms / short brand names as-is; otherwise label it as source name.
+    return p if len(p) <= 24 else "新闻媒体"
 
 def _news_sentiment(title: str) -> str:
     """Title-only heuristic. Labels are indicative, not investment recommendations."""
@@ -900,8 +953,8 @@ def company_news(symbol, errors, limit=8):
                 except Exception: dt=None
             items.append({
                 "title": title,
-                "title_zh": translate_to_chinese(title, errors, max_chars=800) or title,
-                "publisher": (x.get("publisher") or "").strip() or "新闻来源",
+                "title_zh": translate_to_chinese(title, errors, max_chars=800) or "（新闻标题中文翻译暂不可用）",
+                "publisher": publisher_to_chinese(x.get("publisher") or ""),
                 "link": link,
                 "published_at": dt,
                 "sentiment": _news_sentiment(title),
@@ -1001,7 +1054,7 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     company=info.get("longName") or info.get("shortName") or symbol
     exchange=info.get("exchange") or ""; currency=info.get("currency") or ""
     company_description_en=info.get("longBusinessSummary") or None
-    company_description_zh=translate_to_chinese(company_description_en, errors) if company_description_en else None
+    company_description_zh=translate_to_chinese(company_description_en, errors, max_chars=6000) if company_description_en else None
     news=company_news(symbol, errors, limit=8)
     source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10,"news":bool(news)}
     return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":company_description_zh,"company_description_en":company_description_en,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
