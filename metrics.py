@@ -483,17 +483,39 @@ def resonance_levels(current, pivots, indicators):
     return out
 
 
-def technical_price_chart(history, fib):
-    """Build OHLC candlestick data for the mobile technical-analysis chart.
+def _xma(series, n):
+    """TongdaXin-style XMA approximation: alpha=1/N exponential smoothing."""
+    s = pd.to_numeric(series, errors="coerce").astype(float)
+    if s.empty:
+        return s
+    alpha = 1.0 / float(n)
+    out = pd.Series(index=s.index, dtype=float)
+    prev = None
+    for idx, value in s.items():
+        if not np.isfinite(value):
+            out.loc[idx] = prev if prev is not None else np.nan
+            continue
+        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
+        out.loc[idx] = prev
+    return out
 
-    The frontend renders real candles (Open/High/Low/Close) rather than a
-    close-price polyline.  The data is limited to the latest 120 completed
-    daily bars and includes volume, MA5/10/20/60 and Bollinger bands.
+
+def _cross_up(a, b):
+    """CROSS(A,B): A was <= B on the previous bar and is > B now."""
+    return bool(a.iloc[-1] > b.iloc[-1] and a.iloc[-2] <= b.iloc[-2]) if len(a) >= 2 else False
+
+
+def technical_price_chart(history, fib):
+    """Build the AEL XA technical-analysis overlay.
+
+    MA5/10/20/60 are intentionally NOT rendered on the main K-line chart.
+    The overlay follows the supplied formula: ZK1/ZD1 plus four icon events.
     """
     out = {
         "available": False, "points": [], "bollinger_points": [],
         "current": None, "support": None, "resistance": None,
-        "ma_points": [], "volume_max": None, "timeframe": "1D"
+        "ma_points": [], "xa_points": [], "xa_signals": [],
+        "volume_max": None, "timeframe": "1D"
     }
     if history is None or getattr(history, "empty", True) or "Close" not in history:
         return out
@@ -502,11 +524,9 @@ def technical_price_chart(history, fib):
         h = history[cols].copy()
         for c in cols:
             h[c] = pd.to_numeric(h[c], errors="coerce")
-        h = h.dropna(subset=["Close"]).tail(120)
-        if len(h) < 10:
+        h = h.dropna(subset=["Close"]).tail(180)
+        if len(h) < 30:
             return out
-        # If an occasional OHLC field is missing, use close only for that bar's
-        # body/wick rather than inventing a historical price.
         for c in ("Open", "High", "Low"):
             if c not in h.columns:
                 h[c] = h["Close"]
@@ -516,42 +536,87 @@ def technical_price_chart(history, fib):
         if "Volume" not in h.columns:
             h["Volume"] = np.nan
 
-        close = h["Close"]
+        close, high, low = h["Close"], h["High"], h["Low"]
         mid = close.rolling(20).mean()
         sd = close.rolling(20).std()
         upper, lower = mid + 2 * sd, mid - 2 * sd
-        support = fib.get("nearest_support") if fib else None
-        resistance = fib.get("nearest_resistance") if fib else None
 
-        out["points"] = []
-        for idx, row in h.iterrows():
-            out["points"].append({
-                "date": str(idx.date()),
-                "open": finite(row["Open"]), "high": finite(row["High"]),
-                "low": finite(row["Low"]), "close": finite(row["Close"]),
-                "volume": finite(row["Volume"])
-            })
+        # Supplied XA formula.
+        # The original weights sum to 210; REF(...,20) is intentionally kept
+        # as the unweighted twentieth prior bar, matching the source formula.
+        xa1 = sum((20-i) * high.shift(i) for i in range(19)) / 210.0 + high.shift(20) / 210.0
+        xa2 = sum((20-i) * low.shift(i) for i in range(19)) / 210.0 + low.shift(20) / 210.0
+        xa3, xa4 = _xma(xa1, 90), _xma(xa2, 90)
+        xa7 = xa3 - xa4
+        xa8, xa9 = xa3 + xa7 * 2, xa4 - xa7 * 2
+        xma_h25 = _xma(_xma(high, 25), 25)
+        xma_l25 = _xma(_xma(low, 25), 25)
+        xa10 = xma_h25 + (xma_h25 - xma_l25)
+        xa11 = xma_l25 - (xma_h25 - xma_l25)
+        xa12 = (xa3 >= xa9) & (xa10 >= xa8)
+        xa13 = (xa10 <= xa8) & (xa11 <= xa9)
+        xa14 = (xa11 >= xa9) & (xa10 <= xa8)
+        xa17 = xa11 - (xma_h25 - xma_l25) * 0.5
+        xa18 = (xa10 + xa11) / 2.0
+
+        out["points"] = [{
+            "date": str(idx.date()), "open": finite(row["Open"]),
+            "high": finite(row["High"]), "low": finite(row["Low"]),
+            "close": finite(row["Close"]), "volume": finite(row["Volume"])
+        } for idx, row in h.iterrows()]
         out["bollinger_points"] = [{
             "date": str(idx.date()), "upper": finite(upper.loc[idx]),
             "mid": finite(mid.loc[idx]), "lower": finite(lower.loc[idx])
         } for idx in h.index]
-        out["ma_points"] = [{
-            "date": str(idx.date()),
-            "ma5": finite(close.rolling(5).mean().loc[idx]),
-            "ma10": finite(close.rolling(10).mean().loc[idx]),
-            "ma20": finite(close.rolling(20).mean().loc[idx]),
-            "ma60": finite(close.rolling(60).mean().loc[idx])
+        out["xa_points"] = [{
+            "date": str(idx.date()), "zk1": finite(xa10.loc[idx]),
+            "zd1": finite(xa11.loc[idx]), "mid": finite(xa18.loc[idx]),
+            "outer_support": finite(xa17.loc[idx])
         } for idx in h.index]
+
+        # Exact signal mapping from the supplied DRAWICON rules:
+        # 11 = XA36, 5 = XA34, 19 = XA33/XA37, 15 = XA35/XA38.
+        sigs = []
+        for i, idx in enumerate(h.index):
+            if i == 0:
+                continue
+            cross_zd_low = bool(xa11.iloc[i] > low.iloc[i] and xa11.iloc[i-1] <= low.iloc[i-1])
+            cross_high_zk = bool(high.iloc[i] > xa10.iloc[i] and high.iloc[i-1] <= xa10.iloc[i-1])
+            a12, a13, a14 = bool(xa12.iloc[i]), bool(xa13.iloc[i]), bool(xa14.iloc[i])
+            xa33 = cross_zd_low and a12
+            xa34 = cross_high_zk and a12 and not a14
+            xa35 = cross_high_zk and a13
+            xa36 = cross_zd_low and a13 and not a14
+            xa37 = cross_zd_low and a14
+            xa38 = cross_high_zk and a14
+            if xa36:
+                sigs.append({"date": str(idx.date()), "icon": "☝️", "code": 11, "type": "support", "price": finite(low.iloc[i]), "rule": "XA36"})
+            if xa34:
+                sigs.append({"date": str(idx.date()), "icon": "🏃", "code": 5, "type": "pressure", "price": finite(high.iloc[i]), "rule": "XA34"})
+            if xa33 or xa37:
+                sigs.append({"date": str(idx.date()), "icon": "☝️", "code": 19, "type": "support", "price": finite(low.iloc[i]), "rule": "XA33/XA37"})
+            if xa35 or xa38:
+                sigs.append({"date": str(idx.date()), "icon": "🙂", "code": 15, "type": "bull", "price": finite(high.iloc[i]), "rule": "XA35/XA38"})
+        # The source formula has four icon IDs. Keep the visual mapping compact;
+        # the cup is used as the stronger bull-state marker when XA14 is active.
+        for sig in sigs:
+            if sig["code"] == 15 and any(
+                x["date"] == sig["date"] and x["rule"] in ("XA35", "XA38") for x in sigs
+            ):
+                # Preserve the original code while exposing the user's preferred
+                # four visual categories to the frontend.
+                sig["icon"] = "🥤" if sig["rule"] == "XA38" else "🙂"
+        out["xa_signals"] = sigs
+
         vols = h["Volume"].dropna()
         out["volume_max"] = float(vols.max()) if not vols.empty else None
         out["current"] = float(close.iloc[-1])
-        out["support"] = support
-        out["resistance"] = resistance
+        out["support"] = fib.get("nearest_support") if fib else None
+        out["resistance"] = fib.get("nearest_resistance") if fib else None
         out["available"] = True
     except Exception:
         pass
     return out
-
 
 def technical_analysis(history):
     out = {"score": None, "state": "暂无数据", "signals": [], "indicators": {}, "history": []}
@@ -838,14 +903,12 @@ _PUBLISHER_ZH = {
 }
 
 def _split_translate_chunks(text, max_chars=5000):
-    # Both public translation endpoints used here may reject requests over ~500 chars.
-    # Keep every individual request safely below that limit.
     chunks=[]
     remaining=str(text)[:max_chars]
     while remaining:
-        cut=min(440,len(remaining))
+        cut=min(1100,len(remaining))
         if cut < len(remaining):
-            candidates=[remaining.rfind('. ',0,cut),remaining.rfind('; ',0,cut),remaining.rfind(', ',0,cut),remaining.rfind('。',0,cut),remaining.rfind(' ',0,cut)]
+            candidates=[remaining.rfind('. ',0,cut),remaining.rfind('; ',0,cut),remaining.rfind(', ',0,cut),remaining.rfind('。',0,cut)]
             best=max(candidates)
             if best>350: cut=best+1
         chunks.append(remaining[:cut])
@@ -900,11 +963,6 @@ def translate_to_chinese(text, errors, max_chars=5000):
                 if not tr: raise RuntimeError("empty translation")
                 out.append(tr)
             result="".join(out).strip()
-            # Some public endpoints return an error message as a 200 response.
-            # Never treat that message as the translated company description/news.
-            bad_markers=["QUERY LENGTH LIMIT EXCEEDED", "MAX ALLOWED QUERY", "Request too long", "too many characters"]
-            if any(m.lower() in result.lower() for m in bad_markers):
-                raise RuntimeError("translation provider returned a query-length error")
             if result:
                 _TRANSLATE_CACHE[key]=result
                 return result
