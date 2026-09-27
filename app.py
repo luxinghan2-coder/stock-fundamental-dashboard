@@ -70,11 +70,11 @@ def _scan_one(symbol: str):
         v = d.get('valuation') or {}; f = d.get('fundamentals') or {}
         roe = v.get('roe'); pe = v.get('pe'); fcf = f.get('free_cash_flow')
         tech = d.get('technical') or {}
-        strength = tech.get('score'); value = tech.get('value_score')
+        strength = tech.get('score'); value = tech.get('value_score'); composite = tech.get('composite_score')
         fundamental_complete = all(x is not None for x in [roe, f.get('revenue'), f.get('net_income'), fcf])
         # 默认规则：基本面数据完整 + 至少一个技术维度达到可观察阈值。
         # 不人为估算缺失数据；缺失即不通过。
-        eligible = fundamental_complete and (strength is not None or value is not None)
+        eligible = fundamental_complete and strength is not None and value is not None and composite is not None
         if not eligible:
             return None
         return {
@@ -84,7 +84,7 @@ def _scan_one(symbol: str):
             'currency': d.get('currency') or '',
             'fundamental_ok': fundamental_complete,
             'roe': roe, 'pe': pe, 'fcf': fcf,
-            'strength': strength, 'value_score': value,
+            'strength': strength, 'value_score': value, 'composite_score': composite,
             'state': tech.get('state') or '', 'value_state': tech.get('value_state') or '',
         }
     except Exception:
@@ -114,10 +114,9 @@ def market_scan(
             if row:
                 results.append(row)
 
-    # 默认按“技术强度 + 技术价值”的均值排序；若某项缺失则只使用已有项。
+    # 固定按综合评分排序：技术强势分50% + 技术价值分50%。
     def rank_key(x):
-        vals = [v for v in [x.get('strength'), x.get('value_score')] if isinstance(v, (int, float))]
-        return sum(vals) / len(vals) if vals else -1
+        return x.get('composite_score') if isinstance(x.get('composite_score'), (int, float)) else -1
     results.sort(key=rank_key, reverse=True)
     results = results[:limit]
     data = {
@@ -126,7 +125,7 @@ def market_scan(
             'markets': [('美股' if m=='us' else '港股' if m=='hk' else 'A股') for m in ['us','hk','cn'] if m in {x.strip().lower() for x in markets.split(',')}],
             'universe_size': len(universe),
             'matched': len(results),
-            'rules': '基本面数据完整 + 至少存在一项技术评分；缺失数据不估算',
+            'rules': '基本面数据完整 + 技术强势分、技术价值分、综合评分均可计算；缺失数据不估算',
             'ttl_seconds': _SCAN_CACHE_TTL,
         },
         'results': results,

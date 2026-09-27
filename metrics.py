@@ -534,13 +534,12 @@ def _distance_bonus(price, level, full_pct=5.0):
 
 
 def _technical_value_score(rsi, kdj_j, macd_hist, macd_hist_delta, fib_s3, bb_lower, price):
-    # Value score is deliberately different from strength score: it rewards
-    # controlled weakness/oversold + nearby structural support, not momentum.
-    parts=[]
-    weights=[]
+    # Technical Value is a transparent 5-factor, 20% each score.
+    # Missing inputs are not estimated; the final score is only calculated
+    # from available components, while the breakdown records exactly what
+    # contributed.
+    components=[]
     if rsi is not None:
-        # 30-40 is the core value zone; extreme <20 is still oversold but gets
-        # a small haircut to avoid treating a crash as automatically cheap.
         if 30 <= rsi <= 40: rsi_s=100
         elif 20 <= rsi < 30: rsi_s=92 + (rsi-20)*0.8
         elif rsi < 20: rsi_s=75 + max(0,rsi)*0.85
@@ -548,7 +547,7 @@ def _technical_value_score(rsi, kdj_j, macd_hist, macd_hist_delta, fib_s3, bb_lo
         elif 50 < rsi <= 60: rsi_s=70-(rsi-50)*3.0
         elif 60 < rsi <= 70: rsi_s=40-(rsi-60)*3.0
         else: rsi_s=max(0,20-(rsi-70)*1.0)
-        parts.append(rsi_s); weights.append(20)
+        components.append({"name":"RSI","score":float(rsi_s),"weight":20,"available":True})
     if kdj_j is not None:
         if kdj_j < 0: j_s=100
         elif kdj_j <= 20: j_s=95
@@ -556,24 +555,26 @@ def _technical_value_score(rsi, kdj_j, macd_hist, macd_hist_delta, fib_s3, bb_lo
         elif kdj_j <= 60: j_s=50
         elif kdj_j <= 80: j_s=30
         else: j_s=15
-        parts.append(j_s); weights.append(20)
+        components.append({"name":"KDJ J","score":float(j_s),"weight":20,"available":True})
     if macd_hist is not None:
-        # Negative histogram gives value; improving histogram gets an extra
-        # reversal bonus. Scale by price to keep stocks comparable.
         scale=max(abs(finite(price) or 1)*0.01, 1e-9)
         neg=max(0.0,min(1.0,(-macd_hist)/scale))
         improve=1.0 if macd_hist_delta is not None and macd_hist_delta>0 else 0.0
         macd_s=45 + 35*neg + 20*improve if macd_hist<0 else 25 + 20*improve
-        parts.append(min(100,macd_s)); weights.append(20)
+        components.append({"name":"MACD","score":float(min(100,macd_s)),"weight":20,"available":True})
     if fib_s3 is not None:
         b=_distance_bonus(price,fib_s3,full_pct=5.0)
-        if b is not None: parts.append(b); weights.append(20)
+        if b is not None: components.append({"name":"Fib S3","score":float(b),"weight":20,"available":True})
     if bb_lower is not None:
         b=_distance_bonus(price,bb_lower,full_pct=5.0)
-        if b is not None: parts.append(b); weights.append(20)
-    if not parts: return None, {}
-    total=sum(p*w for p,w in zip(parts,weights))/sum(weights)
-    return round(max(0,min(100,total))), {"weights":{"RSI":20,"KDJ_J":20,"MACD":20,"Fib_S3":20,"BOLL_lower":20}}
+        if b is not None: components.append({"name":"BOLL下轨","score":float(b),"weight":20,"available":True})
+    if not components: return None, {}
+    total=sum(x["score"]*x["weight"] for x in components)/sum(x["weight"] for x in components)
+    return round(max(0,min(100,total))), {
+        "weights":{"RSI":20,"KDJ J":20,"MACD":20,"Fib S3":20,"BOLL下轨":20},
+        "components":[{"name":x["name"],"score":round(x["score"],1),"weight":x["weight"]} for x in components],
+        "formula":"技术价值分 = RSI×20% + KDJ J×20% + MACD×20% + Fib S3×20% + BOLL下轨×20%"
+    }
 
 
 def technical_analysis(history, fib=None, pivots=None):
@@ -669,8 +670,10 @@ def technical_analysis(history, fib=None, pivots=None):
 
         out.update({
             "score":score,"state":state,"value_score":value_score,"value_state":value_state,
-            "score_breakdown":{"weights":{"均线结构":25,"MACD动能":20,"RSI动能":15,"20日动量":15,"52周位置":15,"量能":10},"components":[{"name":name,"score":round(v,1),"weight":w} for v,w,name in components]},
+            "composite_score":composite_score,"composite_state":composite_state,
+            "score_breakdown":{"weights":{"均线结构":25,"MACD动能":20,"RSI动能":15,"20日动量":15,"52周位置":15,"量能":10},"components":[{"name":name,"score":round(v,1),"weight":w} for v,w,name in components],"formula":"技术强势分 = 均线结构×25% + MACD动能×20% + RSI动能×15% + 20日动量×15% + 52周位置×15% + 量能×10%"},
             "value_breakdown":value_meta,
+            "composite_breakdown":{"weights":{"技术强势分":50,"技术价值分":50},"formula":"综合评分 = 技术强势分×50% + 技术价值分×50%"},
             "signals":signals,
             "indicators":{"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"macd_hist":hist_val,"macd_hist_delta":hist_delta,"kdj_k":k_val,"kdj_d":d_val,"kdj_j":j_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52,"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250]},
             "history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(180).items()]})
