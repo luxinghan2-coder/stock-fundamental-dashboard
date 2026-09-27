@@ -1,22 +1,24 @@
-# 股票基本面驾驶舱 V2
+# 股票基本面驾驶舱 V2.2
 
-在 V1 基础上升级的免费数据优先版 H5/PWA 原型。
+A股 / 港股 / 美股基本面 H5/PWA 原型。
 
-## V2
-- A股 / 港股 / 美股代码识别
-- 基本面尽量从财务报表本地计算，减少对 Yahoo `info` 单字段的依赖
-- PE / PB / ROE / ROE÷PB / PE÷ROE
-- 营收 / 净利润 / 毛利率 / 自由现金流 / 资产负债率 / 负债权益比
-- TTM 股息率、3/5/10年股息 CAGR、连续分红年数
-- 股息支付率、FCF支付率、回购、股东总支付率
-- 20/60/120/250日均线、RSI、MACD、布林位置、20日动量、52周位置、成交量比
-- 技术状态 0-100：仅作量化状态，不等同买入/卖出建议
-- 免费数据源能提供时显示分析师评级、目标价、EPS/营收预期及评级变化
-- 15年 ROE 统计与曲线
-- 数据缺失显示“暂无数据”，不人为填充
+## V2.2
+- 行情采用 yfinance history + Yahoo chart endpoint fallback
+- 股息独立取数；区分“无现金股息”和“数据不可用”
+- 股息率、3/5/10Y CAGR、连续分红、净利润支付率、FCF支付率、回购、股东总支付率
+- 技术分析本地计算：MA20/60/120/250、RSI14、MACD、布林带位置、20日动量、52周位置
+- 分析师评级、目标价、EPS/营收预期、评级变化
+- 美股长期 ROE 优先使用 SEC EDGAR XBRL Company Facts；SEC API 无需 API key
+- A股 / 港股继续使用免费市场数据源；缺失不人为填充
+- 单个数据模块失败不会拖垮整个页面
 
-## 启动
+## Railway
+```bash
 uvicorn app:app --host 0.0.0.0 --port $PORT
+```
 
-## 数据原则
-V2 默认仍使用 Yahoo Finance via yfinance，技术指标、分红趋势及部分财务比率尽量本地计算。不同市场的数据覆盖度可能不同；分析师数据仅在数据源实际提供时展示。
+## SEC User-Agent
+生产环境建议在 Railway Variables 中设置：
+`SEC_USER_AGENT=StockFundamentalDashboard/2.2 your-email@example.com`
+
+SEC data.sec.gov 的程序化访问需要遵守 SEC 的访问政策并提供可识别的 User-Agent。

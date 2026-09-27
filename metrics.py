@@ -1,17 +1,35 @@
 import math
+import os
 import re
 from typing import Any
+
 import numpy as np
+import pandas as pd
+import requests
 import yfinance as yf
+
+SEC_UA = os.getenv(
+    "SEC_USER_AGENT",
+    "stock-fundamental-dashboard/2.2 contact@example.com",
+)
+SEC_HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate", "Host": "data.sec.gov"}
+_SEC_TICKERS = None
 
 
 def clean_symbol(raw: str) -> str:
-    s = str(raw or '').strip().upper().replace(' ', '')
-    if re.fullmatch(r'\d{6}', s):
-        return s + ('.SS' if s.startswith(('5','6','68','9')) else '.SZ')
-    if re.fullmatch(r'\d{1,5}', s):
-        return s.zfill(4) + '.HK'
+    s = str(raw or "").strip().upper().replace(" ", "")
+    if re.fullmatch(r"\d{6}", s):
+        return s + (".SS" if s.startswith(("5", "6", "68", "9")) else ".SZ")
+    if re.fullmatch(r"\d{1,5}", s):
+        return s.zfill(4) + ".HK"
+    # Yahoo uses hyphens for share classes such as BRK.B.
+    if "." in s and re.fullmatch(r"[A-Z]{1,6}\.[A-Z]", s):
+        s = s.replace(".", "-")
     return s
+
+
+def is_us_symbol(symbol: str) -> bool:
+    return not symbol.endswith((".HK", ".SS", ".SZ")) and bool(re.fullmatch(r"[A-Z0-9-]+", symbol))
 
 
 def finite(v):
@@ -34,7 +52,7 @@ def _names(names):
 
 
 def latest_row(df, names):
-    if df is None or getattr(df, 'empty', True):
+    if df is None or getattr(df, "empty", True):
         return None
     for name in _names(names):
         if name in df.index:
@@ -50,7 +68,7 @@ def latest_row(df, names):
 
 
 def series_value(df, names, col):
-    if df is None or getattr(df, 'empty', True):
+    if df is None or getattr(df, "empty", True):
         return None
     try:
         for row in _names(names):
@@ -79,21 +97,81 @@ def _safe_get(obj, attr, errors, default=None, *args, **kwargs):
         return default
 
 
+def normalize_history(df):
+    if df is None or getattr(df, "empty", True):
+        return None
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        # yf.download can return (Price, Ticker) columns.
+        if out.columns.nlevels == 2:
+            first = out.columns.get_level_values(0)
+            if "Close" in first:
+                out.columns = first
+            else:
+                out.columns = out.columns.get_level_values(-1)
+    if "Close" not in out.columns:
+        return None
+    out = out.dropna(subset=["Close"])
+    return out if not out.empty else None
+
+
+def yahoo_chart_history(symbol, errors):
+    """Direct Yahoo chart endpoint fallback; avoids yfinance history-cache failures."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"range": "2y", "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"}
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        r.raise_for_status()
+        payload = r.json()
+        result = (payload.get("chart") or {}).get("result") or []
+        if not result:
+            raise RuntimeError(((payload.get("chart") or {}).get("error") or {}).get("description", "Yahoo chart returned no result"))
+        result = result[0]
+        ts = result.get("timestamp") or []
+        quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        if not ts or not quote.get("close"):
+            raise RuntimeError("Yahoo chart returned no daily prices")
+        idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None)
+        data = {"Open": quote.get("open"), "High": quote.get("high"), "Low": quote.get("low"), "Close": quote.get("close"), "Volume": quote.get("volume")}
+        return pd.DataFrame(data, index=idx).dropna(subset=["Close"])
+    except Exception as exc:
+        errors["yahoo_chart"] = str(exc)[:240]
+        return None
+
+
+def get_history(ticker, symbol, errors):
+    try:
+        h = ticker.history(period="2y", interval="1d", auto_adjust=False, repair=False, raise_errors=False)
+        h = normalize_history(h)
+        if h is not None and len(h) >= 30:
+            return h
+    except Exception as exc:
+        errors["history"] = str(exc)[:240]
+    try:
+        h = yf.download(symbol, period="2y", interval="1d", auto_adjust=False, progress=False, threads=False, repair=False)
+        h = normalize_history(h)
+        if h is not None and len(h) >= 30:
+            return h
+    except Exception as exc:
+        errors["download"] = str(exc)[:240]
+    return yahoo_chart_history(symbol, errors)
+
+
 def annual_roe(inc, bs):
     if inc is None or inc.empty or bs is None or bs.empty:
         return []
     bs_cols = list(bs.columns)
     rows = []
     for col in list(inc.columns):
-        year = getattr(col, 'year', None)
+        year = getattr(col, "year", None)
         if year is None:
             continue
-        net_income = series_value(inc, ['Net Income', 'Net Income Common Stockholders'], col)
-        equity_end = series_value(bs, ['Stockholders Equity', 'Common Stock Equity', 'Stockholders Equity Including Minority Interest'], col)
-        prior = [c for c in bs_cols if getattr(c, 'year', None) == year - 1]
+        net_income = series_value(inc, ["Net Income", "Net Income Common Stockholders"], col)
+        equity_end = series_value(bs, ["Stockholders Equity", "Common Stock Equity", "Stockholders Equity Including Minority Interest"], col)
+        prior = [c for c in bs_cols if getattr(c, "year", None) == year - 1]
         equity_begin = None
         if prior:
-            equity_begin = series_value(bs, ['Stockholders Equity', 'Common Stock Equity', 'Stockholders Equity Including Minority Interest'], prior[0])
+            equity_begin = series_value(bs, ["Stockholders Equity", "Common Stock Equity", "Stockholders Equity Including Minority Interest"], prior[0])
         if net_income is None or equity_begin is None or equity_end is None:
             continue
         avg_equity = (equity_begin + equity_end) / 2
@@ -101,39 +179,36 @@ def annual_roe(inc, bs):
             continue
         roe = net_income / avg_equity * 100
         if math.isfinite(roe):
-            rows.append({'year': int(year), 'net_income': net_income, 'equity_begin': equity_begin, 'equity_end': equity_end, 'roe': roe})
-    rows.sort(key=lambda x: x['year'])
+            rows.append({"year": int(year), "net_income": net_income, "equity_begin": equity_begin, "equity_end": equity_end, "roe": roe})
+    rows.sort(key=lambda x: x["year"])
     return rows[-15:]
 
 
 def stats(values):
     vals = [finite(x) for x in values if finite(x) is not None]
     if not vals:
-        return {'count': 0, 'average': None, 'median': None, 'std_dev': None, 'range': None, 'max': None, 'min': None}
+        return {"count": 0, "average": None, "median": None, "std_dev": None, "range": None, "max": None, "min": None}
     arr = np.array(vals, dtype=float)
-    return {'count': len(vals), 'average': float(arr.mean()), 'median': float(np.median(arr)),
-            'std_dev': float(arr.std(ddof=1)) if len(arr) > 1 else 0.0,
-            'range': float(arr.max() - arr.min()), 'max': float(arr.max()), 'min': float(arr.min())}
+    return {"count": len(vals), "average": float(arr.mean()), "median": float(np.median(arr)), "std_dev": float(arr.std(ddof=1)) if len(arr) > 1 else 0.0,
+            "range": float(arr.max() - arr.min()), "max": float(arr.max()), "min": float(arr.min())}
 
 
-def dividend_metrics(divs, cf, price, fcf, net_income):
-    out = {'ttm_dividend_per_share': None, 'dividend_yield': None, 'history': [],
-           'cagr_3y': None, 'cagr_5y': None, 'cagr_10y': None, 'consecutive_years': 0,
-           'dividend_payout_ratio': None, 'fcf_payout_ratio': None, 'buybacks': None,
-           'shareholder_payout': None, 'shareholder_payout_ratio': None, 'trend': '暂无数据'}
-    if divs is None or getattr(divs, 'empty', True):
-        return out
-    try:
-        divs = divs.dropna().astype(float)
-        annual = divs.groupby(divs.index.year).sum()
-        out['history'] = [{'year': int(y), 'dividend_per_share': float(v)} for y, v in annual.items()]
-        if len(annual):
-            # TTM = all cash dividends paid in the last 365 days.
-            cutoff = divs.index.max() - __import__('pandas').Timedelta(days=365)
+def dividend_metrics(divs, cf, price, fcf, net_income, dividend_error=None):
+    out = {"status": "unavailable" if dividend_error else "no_dividend", "ttm_dividend_per_share": 0.0 if not dividend_error else None,
+           "dividend_yield": 0.0 if not dividend_error else None, "history": [], "cagr_3y": None, "cagr_5y": None, "cagr_10y": None,
+           "consecutive_years": 0, "dividend_payout_ratio": None, "fcf_payout_ratio": None, "buybacks": None,
+           "shareholder_payout": None, "shareholder_payout_ratio": None, "trend": "无现金股息" if not dividend_error else "暂无数据"}
+    if divs is not None and not getattr(divs, "empty", True):
+        try:
+            divs = divs.dropna().astype(float)
+            annual = divs.groupby(divs.index.year).sum()
+            out["status"] = "has_dividend"
+            out["history"] = [{"year": int(y), "dividend_per_share": float(v)} for y, v in annual.items()]
+            cutoff = divs.index.max() - pd.Timedelta(days=365)
             ttm = float(divs[divs.index > cutoff].sum())
-            out['ttm_dividend_per_share'] = ttm if ttm > 0 else float(annual.iloc[-1])
+            out["ttm_dividend_per_share"] = ttm if ttm > 0 else float(annual.iloc[-1])
             if price:
-                out['dividend_yield'] = out['ttm_dividend_per_share'] / price * 100
+                out["dividend_yield"] = out["ttm_dividend_per_share"] / price * 100
 
             def cagr(years):
                 end_year = int(annual.index[-1]); target = end_year - years
@@ -144,44 +219,41 @@ def dividend_metrics(divs, cf, price, fcf, net_income):
                 start, end = float(annual.loc[start_year]), float(annual.iloc[-1])
                 if start <= 0 or end <= 0: return None
                 return ((end / start) ** (1 / actual) - 1) * 100
-            out['cagr_3y'], out['cagr_5y'], out['cagr_10y'] = cagr(3), cagr(5), cagr(10)
+            out["cagr_3y"], out["cagr_5y"], out["cagr_10y"] = cagr(3), cagr(5), cagr(10)
             last = int(annual.index[-1]); count = 0
             for y in range(last, last - 30, -1):
                 if y in annual.index and annual.loc[y] > 0: count += 1
                 else: break
-            out['consecutive_years'] = count
-            if out['cagr_5y'] is not None:
-                out['trend'] = '上升' if out['cagr_5y'] > 1 else ('下降' if out['cagr_5y'] < -1 else '基本稳定')
-    except Exception:
-        pass
+            out["consecutive_years"] = count
+            if out["cagr_5y"] is not None:
+                out["trend"] = "上升" if out["cagr_5y"] > 1 else ("下降" if out["cagr_5y"] < -1 else "基本稳定")
+        except Exception:
+            pass
 
-    dividends_paid = latest_row(cf, ['Cash Dividends Paid', 'Common Stock Dividend Paid', 'Common Stock Payments', 'Payment Of Dividends'])
-    buybacks = latest_row(cf, ['Repurchase Of Capital Stock', 'Repurchase Of Capital Stock Issuance', 'Common Stock Payments'])
-    dividends_paid = abs(dividends_paid) if dividends_paid is not None else None
+    dividends_paid = latest_row(cf, ["Cash Dividends Paid", "Common Stock Dividend Paid", "Common Stock Payments", "Payment Of Dividends"])
+    buybacks = latest_row(cf, ["Repurchase Of Capital Stock", "Repurchase Of Capital Stock Issuance", "Common Stock Payments"])
+    dividends_paid = abs(dividends_paid) if dividends_paid is not None else (0.0 if out["status"] == "no_dividend" else None)
     buybacks = abs(buybacks) if buybacks is not None else None
-    out['buybacks'] = buybacks
-    if dividends_paid is not None and net_income not in (None, 0):
-        out['dividend_payout_ratio'] = dividends_paid / abs(net_income) * 100
-    if dividends_paid is not None and fcf not in (None, 0):
-        out['fcf_payout_ratio'] = dividends_paid / abs(fcf) * 100
+    out["buybacks"] = buybacks
+    if dividends_paid is not None and net_income not in (None, 0): out["dividend_payout_ratio"] = dividends_paid / abs(net_income) * 100
+    if dividends_paid is not None and fcf not in (None, 0): out["fcf_payout_ratio"] = dividends_paid / abs(fcf) * 100
     if dividends_paid is not None or buybacks is not None:
         total = (dividends_paid or 0) + (buybacks or 0)
-        out['shareholder_payout'] = total
-        if fcf not in (None, 0):
-            out['shareholder_payout_ratio'] = total / abs(fcf) * 100
+        out["shareholder_payout"] = total
+        if fcf not in (None, 0): out["shareholder_payout_ratio"] = total / abs(fcf) * 100
     return out
 
 
 def technical_analysis(history):
-    out = {'score': None, 'state': '暂无数据', 'signals': [], 'indicators': {}, 'history': []}
-    if history is None or getattr(history, 'empty', True) or 'Close' not in history:
+    out = {"score": None, "state": "暂无数据", "signals": [], "indicators": {}, "history": []}
+    if history is None or getattr(history, "empty", True) or "Close" not in history:
         return out
     try:
-        close = history['Close'].dropna().astype(float)
+        close = history["Close"].dropna().astype(float)
         if len(close) < 30: return out
-        volume = history['Volume'].dropna().astype(float) if 'Volume' in history else None
+        volume = history["Volume"].dropna().astype(float) if "Volume" in history else None
         latest = float(close.iloc[-1])
-        mas = {n: (float(close.rolling(n).mean().iloc[-1]) if len(close) >= n else None) for n in (20,60,120,250)}
+        mas = {n: (float(close.rolling(n).mean().iloc[-1]) if len(close) >= n else None) for n in (20, 60, 120, 250)}
         delta = close.diff(); gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean(); loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan); rsi = float((100 - 100/(1+rs)).iloc[-1]) if finite(rs.iloc[-1]) is not None else None
         ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
@@ -198,72 +270,160 @@ def technical_analysis(history):
         for n,w in [(20,10),(60,10),(120,10),(250,15)]:
             ma=mas[n]
             if ma is not None:
-                score += w if latest>ma else -w; signals.append(f'MA{n}之上' if latest>ma else f'MA{n}之下')
-        if rsi is not None:
-            score += 8 if 50<=rsi<=70 else (-5 if rsi>75 else (2 if rsi<30 else -2))
-        score += 8 if macd_val>signal_val else -8; signals.append('MACD强于信号线' if macd_val>signal_val else 'MACD弱于信号线')
-        if bb_pos is not None:
-            score += 4 if 0.2<=bb_pos<=0.8 else (-3 if bb_pos>0.95 else 0)
+                score += w if latest>ma else -w; signals.append(f"MA{n}之上" if latest>ma else f"MA{n}之下")
+        if rsi is not None: score += 8 if 50<=rsi<=70 else (-5 if rsi>75 else (2 if rsi<30 else -2))
+        score += 8 if macd_val>signal_val else -8; signals.append("MACD强于信号线" if macd_val>signal_val else "MACD弱于信号线")
+        if bb_pos is not None: score += 4 if 0.2<=bb_pos<=0.8 else (-3 if bb_pos>0.95 else 0)
         if ret20 is not None: score += max(-5,min(5,ret20/4))
-        score=max(0,min(100,round(score))); state='偏强' if score>=65 else ('中性' if score>=45 else '偏弱')
-        out.update({'score':score,'state':state,'signals':signals,'indicators':{'ma20':mas[20],'ma60':mas[60],'ma120':mas[120],'ma250':mas[250],'rsi14':rsi,'macd':macd_val,'macd_signal':signal_val,'bollinger_position':bb_pos,'momentum_20d':ret20,'volume_ratio_20d':vol_ratio,'52w_high':high52,'52w_low':low52,'52w_position':pos52},'history':[{'date':str(i.date()),'close':float(v)} for i,v in close.tail(120).items()]})
+        score=max(0,min(100,round(score))); state="偏强" if score>=65 else ("中性" if score>=45 else "偏弱")
+        out.update({"score":score,"state":state,"signals":signals,"indicators":{"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250],"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"bollinger_position":bb_pos,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52},"history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(120).items()]})
     except Exception:
         pass
     return out
 
 
 def analyst_view(ticker):
-    out={'available':False,'rating':{},'targets':{},'earnings':{},'revenue':{},'changes':[]}
+    out={"available":False,"rating":{},"targets":{},"earnings":{},"revenue":{},"changes":[]}
     try:
         rec=ticker.get_recommendations()
         if rec is not None and not rec.empty:
-            row=rec.iloc[-1]; out['rating']={str(k):finite(v) for k,v in row.to_dict().items() if finite(v) is not None}; out['available']=True
+            row=rec.iloc[-1]; out["rating"]={str(k):finite(v) for k,v in row.to_dict().items() if finite(v) is not None}; out["available"]=True
     except Exception: pass
     try:
-        x=ticker.get_analyst_price_targets() or {}; out['targets']={k:finite(v) for k,v in x.items() if finite(v) is not None}; out['available']|=bool(out['targets'])
+        x=ticker.get_analyst_price_targets() or {}; out["targets"]={k:finite(v) for k,v in x.items() if finite(v) is not None}; out["available"]|=bool(out["targets"])
     except Exception: pass
-    for attr,key,index in [('get_earnings_estimate','earnings','0y'),('get_revenue_estimate','revenue','0y')]:
+    for attr,key,index in [("get_earnings_estimate","earnings","0y"),("get_revenue_estimate","revenue","0y")]:
         try:
             df=getattr(ticker,attr)()
             if df is not None and not df.empty:
-                row=df.loc[index] if index in df.index else df.iloc[0]; out[key]={str(k):finite(v) for k,v in row.to_dict().items() if finite(v) is not None}; out['available']=True
+                row=df.loc[index] if index in df.index else df.iloc[0]; out[key]={str(k):finite(v) for k,v in row.to_dict().items() if finite(v) is not None}; out["available"]=True
         except Exception: pass
     try:
         df=ticker.get_upgrades_downgrades()
         if df is not None and not df.empty:
-            out['changes']=df.tail(8).reset_index().to_dict('records'); out['available']=True
+            out["changes"]=df.tail(8).reset_index().to_dict("records"); out["available"]=True
     except Exception: pass
     return out
 
 
+def sec_cik_for_ticker(ticker):
+    global _SEC_TICKERS
+    if _SEC_TICKERS is None:
+        r = requests.get("https://www.sec.gov/files/company_tickers.json", headers={"User-Agent": SEC_UA}, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        _SEC_TICKERS = {str(v["ticker"]).upper(): str(v["cik_str"]).zfill(10) for v in data.values() if v.get("ticker")}
+    return _SEC_TICKERS.get(ticker.upper())
+
+
+def _sec_fact(facts, tags):
+    for taxonomy, tag in tags:
+        unit = facts.get(taxonomy, {}).get(tag)
+        if not unit:
+            continue
+        # Prefer USD facts; then first available unit.
+        if "USD" in unit: return unit["USD"]
+        first = next(iter(unit.values()), None)
+        if first: return first
+    return []
+
+
+def sec_annual_roe(symbol, errors):
+    """15-year ROE from SEC Company Facts for US-listed common stocks."""
+    if not is_us_symbol(symbol):
+        return None
+    try:
+        cik = sec_cik_for_ticker(symbol.replace("-", "-"))
+        if not cik:
+            errors["sec"] = "ticker not found in SEC company_tickers"
+            return None
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        r = requests.get(url, headers=SEC_HEADERS, timeout=15)
+        r.raise_for_status(); data = r.json()
+        facts = data.get("facts", {})
+        ni = _sec_fact(facts, [("us-gaap", "NetIncomeLoss"), ("us-gaap", "ProfitLoss"), ("us-gaap", "NetIncomeLossAvailableToCommonStockholdersBasic")])
+        eq = _sec_fact(facts, [("us-gaap", "StockholdersEquity"), ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"), ("us-gaap", "PartnersCapital")])
+        if not ni or not eq:
+            errors["sec"] = "SEC facts missing net income or equity tags"
+            return []
+
+        def annual_values(items):
+            by_year = {}
+            for x in items:
+                fy=x.get("fy"); fp=x.get("fp"); form=x.get("form"); end=x.get("end"); start=x.get("start"); val=finite(x.get("val"))
+                if val is None or not fy or fp != "FY" or form not in ("10-K","20-F","40-F") or not end or not start:
+                    continue
+                # Avoid quarterly-like facts mislabeled FY: require roughly 9-15 months.
+                try:
+                    days=(pd.Timestamp(end)-pd.Timestamp(start)).days
+                    if days < 250 or days > 400: continue
+                except Exception: continue
+                year=int(fy)
+                # Keep the latest filed fact for each fiscal year.
+                old=by_year.get(year)
+                if old is None or str(x.get("filed","")) > str(old.get("filed","")):
+                    by_year[year]=x
+            return by_year
+
+        ni_by=annual_values(ni); eq_by=annual_values(eq)
+        years=sorted(set(ni_by) & set(eq_by))
+        rows=[]
+        for year in years:
+            begin_fact=eq_by.get(year-1)
+            end_fact=eq_by.get(year)
+            n=finite(ni_by[year].get("val")); eb=finite(begin_fact.get("val")) if begin_fact else None; ee=finite(end_fact.get("val")) if end_fact else None
+            if n is None or eb is None or ee is None or (eb+ee)==0: continue
+            roe=n/((eb+ee)/2)*100
+            rows.append({"year":year,"net_income":n,"equity_begin":eb,"equity_end":ee,"roe":roe})
+        return rows[-15:]
+    except Exception as exc:
+        errors["sec"] = str(exc)[:240]
+        return None
+
+
 def build_dashboard(raw_symbol: str) -> dict[str, Any]:
     symbol=clean_symbol(raw_symbol); t=yf.Ticker(symbol); errors={}
-    # Fetch independently. info is deliberately last/fallback because it is a large, failure-prone endpoint.
-    history=_safe_get(t,'history',errors,None,period='2y',interval='1d',auto_adjust=False,repair=True)
+    history=get_history(t,symbol,errors)
     price=None
-    if history is not None and not history.empty and 'Close' in history:
-        try: price=finite(history['Close'].dropna().iloc[-1])
+    if history is not None and not history.empty:
+        try: price=finite(history["Close"].dropna().iloc[-1])
         except Exception: pass
     if price is None:
-        fi=_safe_get(t,'fast_info',errors,{}) or {}
-        price=finite(fi.get('last_price') if hasattr(fi,'get') else None)
+        fi=_safe_get(t,"fast_info",errors,{}) or {}
+        try: price=finite(fi.get("last_price"))
+        except Exception: pass
 
-    inc=_safe_get(t,'financials',errors,None); bs=_safe_get(t,'balance_sheet',errors,None); cf=_safe_get(t,'cashflow',errors,None)
-    info=_safe_get(t,'info',errors,{}) or {}
-    revenue=latest_row(inc,['Total Revenue','Operating Revenue']); net_income=latest_row(inc,['Net Income','Net Income Common Stockholders'])
-    gross_profit=latest_row(inc,['Gross Profit']); gross_margin=(gross_profit/revenue*100 if gross_profit is not None and revenue not in (None,0) else pct(info.get('grossMargins')))
-    assets=latest_row(bs,['Total Assets']); liabilities=latest_row(bs,['Total Liabilities Net Minority Interest','Total Liabilities']); equity=latest_row(bs,['Stockholders Equity','Common Stock Equity','Stockholders Equity Including Minority Interest'])
+    inc=_safe_get(t,"financials",errors,None); bs=_safe_get(t,"balance_sheet",errors,None); cf=_safe_get(t,"cashflow",errors,None)
+    info=_safe_get(t,"info",errors,{}) or {}
+    revenue=latest_row(inc,["Total Revenue","Operating Revenue"]); net_income=latest_row(inc,["Net Income","Net Income Common Stockholders"])
+    gross_profit=latest_row(inc,["Gross Profit"]); gross_margin=(gross_profit/revenue*100 if gross_profit is not None and revenue not in (None,0) else pct(info.get("grossMargins")))
+    assets=latest_row(bs,["Total Assets"]); liabilities=latest_row(bs,["Total Liabilities Net Minority Interest","Total Liabilities"]); equity=latest_row(bs,["Stockholders Equity","Common Stock Equity","Stockholders Equity Including Minority Interest"])
     debt_ratio=safe_ratio(liabilities,assets); debt_ratio=debt_ratio*100 if debt_ratio is not None else None
-    roe=current_roe=None
-    roe_info=finite(info.get('returnOnEquity')); current_roe=roe_info*100 if roe_info is not None else (net_income/equity*100 if net_income is not None and equity not in (None,0) else None)
-    ocf=latest_row(cf,['Operating Cash Flow','Total Cash From Operating Activities']); capex=latest_row(cf,['Capital Expenditure','Capital Expenditures']); fcf=ocf+capex if ocf is not None and capex is not None else None
-    shares=latest_row(bs,['Ordinary Shares Number','Share Issued','Common Stock Shares Outstanding'])
-    pe=finite(info.get('trailingPE')); pb=finite(info.get('priceToBook'))
+    roe_info=finite(info.get("returnOnEquity")); current_roe=roe_info*100 if roe_info is not None else (net_income/equity*100 if net_income is not None and equity not in (None,0) else None)
+    ocf=latest_row(cf,["Operating Cash Flow","Total Cash From Operating Activities"]); capex=latest_row(cf,["Capital Expenditure","Capital Expenditures"]); fcf=ocf+capex if ocf is not None and capex is not None else None
+    shares=latest_row(bs,["Ordinary Shares Number","Share Issued","Common Stock Shares Outstanding"])
+    pe=finite(info.get("trailingPE")); pb=finite(info.get("priceToBook"))
     if pe is None and price is not None and net_income is not None and shares not in (None,0): pe=safe_ratio(price,net_income/shares)
     if pb is None and price is not None and equity is not None and shares not in (None,0): pb=safe_ratio(price,equity/shares)
-    divs=_safe_get(t,'dividends',errors,None); dividends=dividend_metrics(divs,cf,price,fcf,net_income)
-    roe15=annual_roe(inc,bs); tech=technical_analysis(history); analysts=analyst_view(t)
-    company=info.get('longName') or info.get('shortName') or symbol
-    exchange=info.get('exchange') or ''; currency=info.get('currency') or ''
-    source_status={'history':bool(history is not None and not getattr(history,'empty',True)),'financials':bool(inc is not None and not getattr(inc,'empty',True)),'balance_sheet':bool(bs is not None and not getattr(bs,'empty',True)),'cashflow':bool(cf is not None and not getattr(cf,'empty',True)),'dividends':bool(divs is not None and not getattr(divs,'empty',True)),'analysts':analysts['available']}
-    return {'query':raw_symbol,'symbol':symbol,'company':company,'exchange':exchange,'currency':currency,'market':info.get('market'),'market_data':{'price':price,'market_cap':finite(info.get('marketCap'))},'valuation':{'pe':pe,'pb':pb,'roe':current_roe,'roe_pb':safe_ratio(current_roe,pb),'pe_roe':safe_ratio(pe,current_roe)},'fundamentals':{'revenue':revenue,'net_income':net_income,'gross_margin':gross_margin,'free_cash_flow':fcf,'debt_ratio':debt_ratio,'debt_to_equity':finite(info.get('debtToEquity'))},'dividends':dividends,'roe_15y':{'years':roe15,'stats':stats([r['roe'] for r in roe15]),'definition':'ROE = 年度净利润 / ((期初股东权益 + 期末股东权益) / 2)','std_definition':'15年有效年度ROE的样本标准差'},'technical':tech,'analysts':analysts,'source':{'provider':'Yahoo Finance via yfinance 1.7.0（免费）','status':source_status,'errors':errors,'note':'各模块独立取数；单个数据模块失败不会让整个页面失效。'}}
+
+    dividend_error=None
+    try: divs=t.get_dividends(period="max")
+    except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
+    dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
+    tech=technical_analysis(history); analysts=analyst_view(t)
+
+    # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
+    sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
+    if sec_roe is not None and len(sec_roe) >= 2:
+        roe15=sec_roe; roe_source="SEC EDGAR / XBRL Company Facts"
+    else:
+        roe15=annual_roe(inc,bs); roe_source="Yahoo Finance via yfinance"
+
+    company=info.get("longName") or info.get("shortName") or symbol
+    exchange=info.get("exchange") or ""; currency=info.get("currency") or ""
+    source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10}
+    return {"query":raw_symbol,"symbol":symbol,"company":company,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
+            "valuation":{"pe":pe,"pb":pb,"roe":current_roe,"roe_pb":safe_ratio(current_roe,pb),"pe_roe":safe_ratio(pe,current_roe)},
+            "fundamentals":{"revenue":revenue,"net_income":net_income,"gross_margin":gross_margin,"free_cash_flow":fcf,"debt_ratio":debt_ratio,"debt_to_equity":finite(info.get("debtToEquity"))},
+            "dividends":dividends,"roe_15y":{"years":roe15,"stats":stats([r["roe"] for r in roe15]),"definition":"ROE = 年度净利润 / ((期初股东权益 + 期末股东权益) / 2)","source":roe_source},
+            "technical":tech,"analysts":analysts,"source":{"provider":"免费数据源：Yahoo Finance/yfinance + SEC EDGAR（美股长期ROE）","status":source_status,"errors":errors,"note":"行情、财报、分红、技术面、分析师及长期ROE独立取数；单模块失败不会让整个页面失效。"}}
