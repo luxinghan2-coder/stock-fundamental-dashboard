@@ -1053,7 +1053,7 @@ def company_news(symbol, errors, limit=8):
         seen.add(k); out.append(x)
     return out[:limit]
 
-def build_dashboard(raw_symbol: str) -> dict[str, Any]:
+def build_dashboard(raw_symbol: str, include_slow: bool = True) -> dict[str, Any]:
     symbol=clean_symbol(raw_symbol); t=yf.Ticker(symbol); errors={}
     history=get_history(t,symbol,errors)
     price=None
@@ -1137,12 +1137,21 @@ def build_dashboard(raw_symbol: str) -> dict[str, Any]:
 
     company=info.get("longName") or info.get("shortName") or symbol
     exchange=info.get("exchange") or ""; currency=info.get("currency") or ""
-    company_description_en=info.get("longBusinessSummary") or None
-    company_description_zh=translate_to_chinese(company_description_en, errors, max_chars=9000) if company_description_en else None
-    news=company_news(symbol, errors, limit=8)
-    source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":analysts["available"],"roe_long_history": len(roe15) >= 10,"news":bool(news)}
+    # 非核心慢数据（公司简介翻译、新闻、分析师数据）与核心行情解耦。
+    # include_slow=False 时，核心接口不会等待这些外部请求。
+    if include_slow:
+        company_description_en=info.get("longBusinessSummary") or None
+        company_description_zh=translate_to_chinese(company_description_en, errors, max_chars=9000) if company_description_en else None
+        news=company_news(symbol, errors, limit=8)
+        slow_analysts=analysts
+    else:
+        company_description_en=None
+        company_description_zh=None
+        news=[]
+        slow_analysts={"available": False, "rating": {}, "targets": {}, "earnings": {}, "revenue": {}, "note": "核心数据已先返回；分析师数据异步加载。"}
+    source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":slow_analysts["available"],"roe_long_history": len(roe15) >= 10,"news":bool(news)}
     return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":company_description_zh,"company_description_en":company_description_en,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
             "valuation":{"pe":pe,"pb":pb,"roe":current_roe,"roe_pb":safe_ratio(current_roe,pb),"pe_roe":safe_ratio(pe,current_roe)},
             "fundamentals":{"revenue":revenue,"net_income":net_income,"gross_margin":gross_margin,"free_cash_flow":fcf,"debt_ratio":debt_ratio,"debt_to_equity":finite(info.get("debtToEquity"))},
             "dividends":dividends,"roe_15y":{"years":roe15,"stats":stats([r["roe"] for r in roe15]),"definition":"ROE = 年度净利润 / ((期初股东权益 + 期末股东权益) / 2)","source":roe_source},
-            "technical":tech,"analysts":analysts,"news":news,"source":{"provider":"免费数据源：Yahoo Finance/yfinance + SEC EDGAR（美股长期ROE）+ Yahoo Finance News","status":source_status,"errors":errors,"note":"行情、财报、分红、技术面、分析师、公司简介、新闻及长期ROE独立取数；单模块失败不会让整个页面失效。新闻的利好/利空标签仅按标题关键词自动归类，不构成投资建议。"}}
+            "technical":tech,"analysts":slow_analysts,"news":news,"source":{"provider":"免费数据源：Yahoo Finance/yfinance + SEC EDGAR（美股长期ROE）+ Yahoo Finance News","status":source_status,"errors":errors,"note":"行情、财报、分红、技术面、分析师、公司简介、新闻及长期ROE独立取数；单模块失败不会让整个页面失效。新闻的利好/利空标签仅按标题关键词自动归类，不构成投资建议。"}}
