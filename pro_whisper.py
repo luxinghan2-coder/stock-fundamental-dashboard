@@ -170,6 +170,55 @@ def _quarterly_fallback(symbol):
     }
 
 
+def _target_period_from_history(qtr):
+    """Infer the next fiscal period from the latest reported fiscal period.
+
+    This is deliberately a *guard rail*, not an estimate.  If a provider does
+    not expose fiscalDateEnding, its estimate may only be admitted when its
+    earnings-report date also lines up with the same upcoming report window.
+    """
+    last = qtr.get("last_quarter") if isinstance(qtr, dict) else None
+    if not last:
+        return {"target_end": None, "last_actual_end": None}
+    try:
+        last_dt = pd.Timestamp(last).normalize()
+        target = (last_dt + pd.DateOffset(months=3)).normalize()
+        return {"target_end": target.date().isoformat(), "last_actual_end": last_dt.date().isoformat()}
+    except Exception:
+        return {"target_end": None, "last_actual_end": last}
+
+
+def _date_distance_days(a, b):
+    try:
+        return abs((pd.Timestamp(a).date() - pd.Timestamp(b).date()).days)
+    except Exception:
+        return None
+
+
+def _period_matches(row, target_period, target_earnings_date=None):
+    """Hard fiscal-quarter gate for consensus rows.
+
+    1. Prefer an explicit fiscalDateEnding/period_ending.
+    2. If absent, require the provider's earnings date to be close to the
+       target earnings date (when one is known).
+    3. If neither exists, reject the row rather than mixing quarters.
+    """
+    if not row or not target_period:
+        return False
+    target_end = target_period.get("target_end")
+    explicit = row.get("fiscal_date_ending") or row.get("period_ending")
+    if explicit and target_end:
+        d = _date_distance_days(explicit, target_end)
+        return d is not None and d <= 35
+    ed = row.get("earnings_date")
+    if ed and target_earnings_date:
+        d = _date_distance_days(ed, target_earnings_date)
+        return d is not None and d <= 7
+    # No period evidence = unsafe.  This is what prevents a stale historical
+    # EPS (e.g. SNDK's old 33.28) from contaminating the current quarter.
+    return False
+
+
 def _public_web_estimates(symbol):
     """Keyless public estimate fallback.
 
@@ -219,7 +268,7 @@ def _consensus_earnings_whispers(symbol):
     if err:out["error"]=err;return out
     rows=(js or {}).get("data") or []; row=next((x for x in rows if str(x.get("Ticker","")).upper()==symbol.upper()),None)
     if not row:return out
-    out.update({"eps":_finite(row.get("EarningsEst")),"revenue":_finite(row.get("RevenueEst")),"whisper_eps":_finite(row.get("Whisper")),"revision":_finite(row.get("Revision")),"implied_move":_finite(row.get("ImpliedMove")),"earnings_date":row.get("EPSDate"),"grade":row.get("Grade"),"score":row.get("Score"),"sentiment":row.get("Sentiment")})
+    out.update({"eps":_finite(row.get("EarningsEst")),"revenue":_finite(row.get("RevenueEst")),"whisper_eps":_finite(row.get("Whisper")),"revision":_finite(row.get("Revision")),"implied_move":_finite(row.get("ImpliedMove")),"earnings_date":row.get("EPSDate"),"period_ending":row.get("FiscalDateEnding") or row.get("FiscalDate") or row.get("PeriodEnding"),"grade":row.get("Grade"),"score":row.get("Score"),"sentiment":row.get("Sentiment")})
     out["available"]=out["eps"] is not None or out["revenue"] is not None
     return out
 
@@ -238,7 +287,7 @@ def _consensus_fmp(symbol):
         except Exception:pass
     if row is None and rows: row=rows[-1]
     if not row:return out
-    out.update({"eps":_finite(row.get("epsEstimated")),"revenue":_finite(row.get("revenueEstimated")),"earnings_date":row.get("date")}); out["available"]=out["eps"] is not None or out["revenue"] is not None; return out
+    out.update({"eps":_finite(row.get("epsEstimated")),"revenue":_finite(row.get("revenueEstimated")),"earnings_date":row.get("date"),"period_ending":row.get("fiscalDateEnding") or row.get("fiscalDate")}); out["available"]=out["eps"] is not None or out["revenue"] is not None; return out
 
 
 def _consensus_alpha(symbol):
@@ -255,7 +304,7 @@ def _consensus_alpha(symbol):
         except Exception:pass
     if row is None and rows:row=rows[0]
     if not row:return out
-    out.update({"eps":_finite(row.get("epsAvg")),"revenue":_finite(row.get("revenueAvg")),"eps_low":_finite(row.get("epsLow")),"eps_high":_finite(row.get("epsHigh")),"revenue_low":_finite(row.get("revenueLow")),"revenue_high":_finite(row.get("revenueHigh")),"analysts_eps":_finite(row.get("numberAnalystsEps")),"analysts_revenue":_finite(row.get("numberAnalystsRevenue"))}); out["available"]=out["eps"] is not None or out["revenue"] is not None; return out
+    out.update({"eps":_finite(row.get("epsAvg")),"revenue":_finite(row.get("revenueAvg")),"eps_low":_finite(row.get("epsLow")),"eps_high":_finite(row.get("epsHigh")),"revenue_low":_finite(row.get("revenueLow")),"revenue_high":_finite(row.get("revenueHigh")),"analysts_eps":_finite(row.get("numberAnalystsEps")),"analysts_revenue":_finite(row.get("numberAnalystsRevenue")),"fiscal_date_ending":str(row.get("fiscalDateEnding")) if row.get("fiscalDateEnding") else None}); out["available"]=out["eps"] is not None or out["revenue"] is not None; return out
 
 
 def _consensus_finnhub_calendar(symbol):
@@ -282,7 +331,7 @@ def _yahoo_consensus(symbol):
                         if isinstance(k,tuple) and len(k)>=2 and str(k[0]).lower()==group.lower() and str(k[1]).lower()==field.lower():return _finite(v)
                     x=r.get(group);return _finite(x.get(field)) if isinstance(x,dict) else None
                 eps=g("earningsEstimate","avg") or g("earningsEstimate","current");rev=g("revenueEstimate","avg") or g("revenueEstimate","current");cur=g("epsTrend","current");e7=g("epsTrend","7daysAgo");e30=g("epsTrend","30daysAgo");e90=g("epsTrend","90daysAgo")
-                out.update({"eps":eps,"revenue":rev,"revision_7d_pct":(cur/e7-1)*100 if cur is not None and e7 not in (None,0) else None,"revision_30d_pct":(cur/e30-1)*100 if cur is not None and e30 not in (None,0) else None,"revision_90d_pct":(cur/e90-1)*100 if cur is not None and e90 not in (None,0) else None});break
+                out.update({"eps":eps,"revenue":rev,"revision_7d_pct":(cur/e7-1)*100 if cur is not None and e7 not in (None,0) else None,"revision_30d_pct":(cur/e30-1)*100 if cur is not None and e30 not in (None,0) else None,"revision_90d_pct":(cur/e90-1)*100 if cur is not None and e90 not in (None,0) else None,"period_ending":str(r.get("endDate") or r.get("periodEnd") or r.get("fiscalDateEnding") or "") or None});break
         dates=t.get_earnings_dates(limit=12)
         if dates is not None and not dates.empty:
             now=pd.Timestamp.now(tz="UTC");future=[]
@@ -297,30 +346,62 @@ def _yahoo_consensus(symbol):
     return out
 
 
-def _consensus_bundle(symbol):
+def _consensus_bundle(symbol, target_period=None):
     funcs=[_consensus_earnings_whispers,_consensus_fmp,_consensus_alpha,_consensus_finnhub_calendar,_yahoo_consensus,_public_web_estimates]
     results=[]
     with ThreadPoolExecutor(max_workers=len(funcs)) as ex:
         fs={ex.submit(fn,symbol):fn.__name__ for fn in funcs}
         for f in as_completed(fs):
-            try:results.append(f.result())
-            except Exception as e:results.append({"available":False,"error":str(e)[:180],"source":fs[f]})
+            try: results.append(f.result())
+            except Exception as e: results.append({"available":False,"error":str(e)[:180],"source":fs[f]})
     rank={"Earnings Whispers Data API":0,"Financial Modeling Prep":1,"Alpha Vantage Earnings Estimates":2,"Finnhub earnings calendar":3,"Yahoo Finance earningsTrend":4,"Public estimate pages":5}
     results.sort(key=lambda x:rank.get(x.get("source"),99))
-    eps_candidates=[x for x in results if x.get("eps") is not None]; rev_candidates=[x for x in results if x.get("revenue") is not None]
+
+    # Determine the most credible upcoming report date from rows that survived
+    # the fiscal-period gate.  First pass uses explicit fiscal period metadata.
+    period_rows=[x for x in results if x.get("available") and _period_matches(x,target_period, None)] if target_period else []
+    target_earnings_date=next((x.get("earnings_date") for x in period_rows if x.get("earnings_date")),None)
+
+    # If no explicit fiscal end is exposed, Yahoo/Finnhub/EW report dates can
+    # establish the common event date. Use the earliest future date among those
+    # providers, then re-run the gate for date-only providers.
+    if not target_earnings_date:
+        future_dates=[]
+        now=pd.Timestamp.now(tz="UTC")
+        for x in results:
+            ed=x.get("earnings_date")
+            if ed:
+                try:
+                    d=pd.Timestamp(ed)
+                    if d.tzinfo is None:d=d.tz_localize("UTC")
+                    if d>=now-pd.Timedelta(days=1): future_dates.append(d)
+                except Exception: pass
+        if future_dates: target_earnings_date=min(future_dates).isoformat()
+
+    valid=[]
+    for x in results:
+        if not x.get("available"): continue
+        if _period_matches(x,target_period,target_earnings_date):
+            y=dict(x); y["period_validated"]=True; valid.append(y)
+        else:
+            y=dict(x); y["period_validated"]=False; y["rejected_reason"]="未通过目标财季锁定"; valid.append(y)
+
+    rank_valid=[x for x in valid if x.get("period_validated")]
+    eps_candidates=[x for x in rank_valid if x.get("eps") is not None]
+    rev_candidates=[x for x in rank_valid if x.get("revenue") is not None]
     def choose(cands,key):
         if not cands:return None
-        # Prefer licensed/official providers. Otherwise use the median of the
-        # public providers so one stale page cannot dominate.
         preferred=[x for x in cands if x.get("source") in ("Earnings Whispers Data API","Financial Modeling Prep","Alpha Vantage Earnings Estimates","Finnhub earnings calendar","Yahoo Finance earningsTrend")]
-        if len(preferred)>=2:
-            vals=[x[key] for x in preferred if _finite(x.get(key)) is not None]
-            if len(vals)>=2:
-                med=float(pd.Series(vals).median())
-                return min(preferred,key=lambda x:abs(x[key]-med))
-        return cands[0]
-    eps_src=choose(eps_candidates,"eps");rev_src=choose(rev_candidates,"revenue")
-    return {"results":results,"eps":eps_src,"revenue":rev_src,"earnings_date":next((x.get("earnings_date") for x in results if x.get("earnings_date")),None),"chosen":eps_src or rev_src or {}}
+        pool=preferred if preferred else cands
+        vals=[_finite(x.get(key)) for x in pool if _finite(x.get(key)) is not None]
+        if len(vals)>=2:
+            med=float(pd.Series(vals).median())
+            return min(pool,key=lambda x:abs(float(x[key])-med))
+        return pool[0]
+    eps_src=choose(eps_candidates,"eps"); rev_src=choose(rev_candidates,"revenue")
+    return {"results":valid,"eps":eps_src,"revenue":rev_src,
+            "earnings_date":target_earnings_date,"target_period":target_period,
+            "period_lock":"strict","chosen":eps_src or rev_src or {}}
 
 
 def _historical_surprise(symbol):
@@ -476,9 +557,16 @@ def analyze_whisper(symbol):
     with _LOCK:
         c=_CACHE.get(requested)
         if c and now-c[0]<TTL:return c[1]
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        f_cons=ex.submit(_consensus_bundle,requested);f_hist=ex.submit(_historical_surprise,requested);f_qtr=ex.submit(_quarterly_fallback,requested);f_guid=ex.submit(_guidance_from_public_web,requested)
-        cons=f_cons.result();hist=f_hist.result();qtr=f_qtr.result();guid=f_guid.result()
+    # Quarter lock is established BEFORE consensus selection.  This prevents
+    # a stale EPS from a just-reported quarter from being paired with the next
+    # quarter's revenue (the exact failure seen on SNDK v2.6).
+    qtr=_quarterly_fallback(requested)
+    target_period=_target_period_from_history(qtr)
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_cons=ex.submit(_consensus_bundle,requested,target_period)
+        f_hist=ex.submit(_historical_surprise,requested)
+        f_guid=ex.submit(_guidance_from_public_web,requested)
+        cons=f_cons.result();hist=f_hist.result();guid=f_guid.result()
     earnings_date=cons.get("earnings_date")
     market=_market_signal(requested,earnings_date)
     eps_src=cons.get("eps") or {};rev_src=cons.get("revenue") or {}
@@ -491,21 +579,22 @@ def analyze_whisper(symbol):
     rev_implied,rev_mparts=_market_implied_adjustment(rev_whisper,market,hist,"revenue")
     eps_pricein=(eps_implied/eps_cons-1)*100 if eps_implied is not None and eps_cons else None
     rev_pricein=(rev_implied/rev_cons-1)*100 if rev_implied is not None and rev_cons else None
-    exact_ew=bool(_env("EW_API_KEY") and any(x.get("source")=="Earnings Whispers Data API" and x.get("available") for x in cons.get("results",[])))
-    ew=next((x for x in cons.get("results",[]) if x.get("source")=="Earnings Whispers Data API" and x.get("available")),{})
+    exact_ew=bool(_env("EW_API_KEY") and any(x.get("source")=="Earnings Whispers Data API" and x.get("available") and x.get("period_validated") for x in cons.get("results",[])))
+    ew=next((x for x in cons.get("results",[]) if x.get("source")=="Earnings Whispers Data API" and x.get("available") and x.get("period_validated")),{})
     confidence=max(_confidence(len(eps_wparts)+len(eps_mparts),market.get("available"),eps_base_source,exact_ew),_confidence(len(rev_wparts)+len(rev_mparts),market.get("available"),rev_base_source,exact_ew))
     out={
       "ok":True,"symbol":requested,"as_of":datetime.now(timezone.utc).isoformat(),"next_earnings_date":earnings_date,
-      "model":"AEL Market-Implied Whisper v2.6","status":"inferred","confidence_pct":confidence,
+      "model":"AEL Market-Implied Whisper v2.6.1","status":"inferred","confidence_pct":confidence,
+      "target_period":target_period.get("target_end"),"last_actual_period":target_period.get("last_actual_end"),"period_lock":"strict",
       "data_mode":"observed-consensus→AEL-whisper→market-implied" if (eps_cons is not None or rev_cons is not None) else "fundamental-nowcast→AEL-whisper→market-implied",
       "revenue":{"consensus":rev_cons,"base":rev_base,"whisper":rev_whisper,"implied":rev_implied,"whisper_premium_pct":(rev_whisper/rev_cons-1)*100 if rev_whisper is not None and rev_cons else None,"pricein_pct":rev_pricein,"base_source":rev_base_source,"low":rev_src.get("revenue_low"),"high":rev_src.get("revenue_high"),"whisper_evidence":rev_wparts,"market_evidence":rev_mparts,"status":"inferred","reason":"共识 → 修正 → 指引定位 → 基本面Nowcast → 市场价格/期权Price-in。"},
       "eps":{"consensus":eps_cons,"base":eps_base,"whisper":eps_whisper,"implied":eps_implied,"whisper_premium_pct":(eps_whisper/eps_cons-1)*100 if eps_whisper is not None and eps_cons else None,"pricein_pct":eps_pricein,"base_source":eps_base_source,"low":eps_src.get("eps_low"),"high":eps_src.get("eps_high"),"whisper_evidence":eps_wparts,"market_evidence":eps_mparts,"status":"inferred","reason":"共识 → 修正 → 指引定位 → 基本面Nowcast → 市场价格/期权Price-in。"},
       "market_beat_threshold":{"revenue":rev_implied,"eps":eps_implied},
       "market_signals":market,"historical_surprise":hist,"fundamental_nowcast":qtr,"guidance":guid,
-      "provider_status":[{"source":x.get("source"),"available":bool(x.get("available")),"error":x.get("error")} for x in cons.get("results",[])],
+      "provider_status":[{"source":x.get("source"),"available":bool(x.get("available")) and bool(x.get("period_validated")),"period_validated":bool(x.get("period_validated")),"error":x.get("error") or x.get("rejected_reason")} for x in cons.get("results",[])],
       "licensed_reference":{"available":exact_ew,"whisper_eps":ew.get("whisper_eps"),"consensus_eps":ew.get("eps"),"consensus_revenue":ew.get("revenue"),"source":"Earnings Whispers Data API" if exact_ew else None},
       "sources":{"consensus":eps_src.get("source") or rev_src.get("source") or qtr.get("source"),"history":"Yahoo historical earnings","market":"Yahoo price + listed options","guidance":guid.get("source") if guid.get("available") else None},
-      "method_note":"AEL v2.6 固定三层：① SELL-SIDE CONSENSUS：多源交叉验证；② AEL WHISPER ESTIMATE：以共识为锚，叠加预测修正、公司指引定位、历史惊喜偏差与基本面Nowcast，模拟最接近公开可验证‘analyst-like whisper’的数字；③ AEL MARKET-IMPLIED：再叠加价格动量、异常成交量、事件期权IV、IV偏斜与历史市场惊喜，估计市场已经 Price-in 的本季门槛。AEL 不声称看到 Earnings Whispers 私有模型或私人买方订单簿。配置合法 EW_API_KEY 后，官方 Whisper 仅作为独立校准参考。"
+      "method_note":"AEL v2.6.1 固定三层：① SELL-SIDE CONSENSUS：多源交叉验证，且所有 EPS/Revenue 必须先通过同一目标财季的严格 Quarter Lock；② AEL WHISPER ESTIMATE：以锁定后的共识为锚，叠加预测修正、公司指引定位、历史惊喜偏差与基本面Nowcast；③ AEL MARKET-IMPLIED：再叠加价格动量、异常成交量、事件期权IV、IV偏斜与历史市场惊喜，估计市场已经 Price-in 的本季门槛。任何无法证明属于目标财季的数据都被拒绝，绝不允许跨季度拼接。AEL 不声称看到 Earnings Whispers 私有模型或私人买方订单簿。配置合法 EW_API_KEY 后，官方 Whisper 仅作为独立校准参考。"
     }
     with _LOCK:_CACHE[requested]=(now,out)
     return out
