@@ -586,23 +586,88 @@ def _consensus_bundle(symbol, target_period=None):
             "period_lock":"strict","chosen":eps_src or rev_src or {}}
 
 
-def _historical_surprise(symbol):
-    out={"available":False,"eps_mean_pct":None,"eps_median_pct":None,"eps_recent_weighted_pct":None,"count":0,"error":None,"source":"Yahoo historical earnings"}
+def _historical_consensus_bias(symbol):
+    """Estimate a company-specific *analyst bias* from historical consensus errors.
+
+    This is intentionally not a raw historical surprise extrapolation.  AEL uses
+    the historical gap between reported results and the contemporaneous estimate,
+    then shrinks it for sample size and instability.  The goal is to capture a
+    persistent company/coverage bias without assuming that a 60% beat repeats.
+    """
+    out={
+        "available":False,
+        "eps_bias_pct":None,"revenue_bias_pct":None,
+        "eps_mean_pct":None,"revenue_mean_pct":None,
+        "eps_std_pct":None,"revenue_std_pct":None,
+        "count_eps":0,"count_revenue":0,
+        "source":"Yahoo historical earnings + estimates",
+        "error":None
+    }
     try:
-        t=yf.Ticker(symbol);d=t.get_earnings_dates(limit=12)
+        t=yf.Ticker(symbol); d=t.get_earnings_dates(limit=12)
         if d is None or d.empty:return out
-        vals=[]
+        def num(row,*names):
+            for k in names:
+                if k in row.index:
+                    v=_finite(row.get(k))
+                    if v is not None:return v
+            return None
+        eps_vals=[]; rev_vals=[]
         for _,r in d.iterrows():
-            v=None
-            for k in ("Surprise(%)","surprisePercent","Surprise"):
-                if k in r.index:v=_finite(r.get(k))
-                if v is not None:break
-            if v is not None and abs(v)<100:vals.append(v)
-        if not vals:return out
-        weights=list(range(len(vals),0,-1));out["count"]=len(vals);out["eps_mean_pct"]=sum(vals)/len(vals);out["eps_median_pct"]=float(pd.Series(vals).median());out["eps_recent_weighted_pct"]=sum(v*w for v,w in zip(vals,weights))/sum(weights);out["available"]=True
+            # Prefer directly reported Surprise(%) for EPS when present.
+            ep=num(r,"Surprise(%)","surprisePercent","Surprise")
+            if ep is None:
+                est=num(r,"EPS Estimate","EPS Estimate (GAAP)","Estimate")
+                act=num(r,"Reported EPS","Reported EPS (GAAP)","Actual")
+                if est not in (None,0) and act is not None: ep=(act/est-1)*100
+            if ep is not None and abs(ep)<=100:eps_vals.append(float(ep))
+            est_r=num(r,"Revenue Estimate","Revenue Est.","Revenue Estimate (GAAP)")
+            act_r=num(r,"Reported Revenue","Revenue","Actual Revenue")
+            if est_r not in (None,0) and act_r is not None:
+                rp=(act_r/est_r-1)*100
+                if abs(rp)<=50:rev_vals.append(float(rp))
+        def calc(vals, cap):
+            if not vals:return None,None,None,0
+            # newest observation gets the largest weight; quarter order is the
+            # order returned by Yahoo's earnings-date history.
+            ws=[0.72**i for i in range(len(vals))]
+            wsum=sum(ws)
+            clipped=[_clamp(v,-cap,cap) for v in vals]
+            mean=sum(v*w for v,w in zip(clipped,ws))/wsum
+            std=float(pd.Series(clipped).std(ddof=1)) if len(clipped)>1 else 0.0
+            n=len(clipped)
+            sample_shrink=math.sqrt(n/(n+3))
+            stability=min(1.0, 8.0/max(std,8.0))
+            bias=mean*sample_shrink*stability
+            return bias,mean,std,n
+        eb,em,es,en=calc(eps_vals,30.0)
+        rb,rm,rs,rn=calc(rev_vals,15.0)
+        out.update({
+            "available":bool(en or rn),
+            "eps_bias_pct":eb,"revenue_bias_pct":rb,
+            "eps_mean_pct":em,"revenue_mean_pct":rm,
+            "eps_std_pct":es,"revenue_std_pct":rs,
+            "count_eps":en,"count_revenue":rn
+        })
     except Exception as e:out["error"]=str(e)[:180]
     return out
 
+
+def _historical_surprise(symbol):
+    """Backward-compatible compact history object used by the market layer."""
+    bias=_historical_consensus_bias(symbol)
+    return {
+        "available":bias.get("available",False),
+        "eps_mean_pct":bias.get("eps_mean_pct"),
+        "eps_median_pct":None,
+        "eps_recent_weighted_pct":bias.get("eps_bias_pct"),
+        "eps_bias_pct":bias.get("eps_bias_pct"),
+        "revenue_bias_pct":bias.get("revenue_bias_pct"),
+        "count":bias.get("count_eps",0),
+        "count_revenue":bias.get("count_revenue",0),
+        "error":bias.get("error"),
+        "source":bias.get("source")
+    }
 
 def _market_signal(symbol, earnings_date=None):
     out={"available":False,"momentum_5d_pct":None,"momentum_20d_pct":None,"volume_ratio":None,"event_implied_move_pct":None,"iv_skew_pct":None,"error":None,"source":"Yahoo price + listed options"}
@@ -670,37 +735,45 @@ def _analyst_revision(consensus):
     return None,None
 
 
-def _whisper_estimate(base, consensus, hist, qtr, guidance, kind):
-    """Analyst-like whisper estimator.
+def _whisper_estimate(base, consensus, hist, qtr, guidance, kind, days_to_earnings=None):
+    """Build an analyst-like AEL Whisper estimate.
 
-    Consensus is the anchor. Revision drift, guidance positioning, historical
-    surprise and the independent fundamental nowcast create a bounded whisper
-    premium/discount. The effect is intentionally small: AEL is approximating a
-    private analyst update, not mechanically extrapolating past beats.
+    The calibration intentionally models *persistent forecast bias*, not raw
+    historical surprise.  Historical beat rates are shrunk for instability and
+    sample size; recent estimate revisions and management guidance receive more
+    weight as the report approaches.  This mirrors the observable mechanics
+    described by Earnings Whispers without claiming access to private analyst data.
     """
     if base is None:return None,[],None
     factors=[]
     drift,key=_analyst_revision(consensus or {})
+    proximity=1.0
+    if days_to_earnings is not None:
+        proximity=_clamp(1.0+(21-max(0,days_to_earnings))/42,0.75,1.5)
     if drift is not None:
-        factors.append(("预测修正",_clamp(drift,-12,12),0.30))
-    hs=_finite(hist.get("eps_recent_weighted_pct")) if kind=="eps" else None
-    if hs is not None:
-        factors.append(("历史惊喜偏差",_clamp(hs,-15,15),0.18))
+        factors.append(("预测修正",_clamp(drift,-10,10),0.34*proximity))
+    bias=_finite(hist.get(f"{kind}_bias_pct"))
+    if bias is not None:
+        # The bias is already shrunk for volatility/sample size.  Keep another
+        # soft cap so a regime change cannot dominate the current estimate.
+        cap=7.0 if kind=="eps" else 4.0
+        factors.append(("公司级 Analyst Bias",_clamp(bias,-cap,cap),0.28))
     g_lo=_finite(guidance.get(f"{kind}_low"));g_hi=_finite(guidance.get(f"{kind}_high"))
     if g_lo is not None and g_hi is not None and g_hi>=g_lo:
         mid=(g_lo+g_hi)/2; pos=(mid/base-1)*100 if base else 0
-        factors.append(("公司指引定位",_clamp(pos,-12,12),0.25))
+        factors.append(("公司指引定位",_clamp(pos,-8,8),0.24*proximity))
     qv=_finite(qtr.get(kind))
     if qv is not None and base:
         nowcast_gap=(qv/base-1)*100
-        factors.append(("基本面Nowcast",_clamp(nowcast_gap,-15,15),0.27))
+        factors.append(("基本面Nowcast",_clamp(nowcast_gap,-10,10),0.20))
     if not factors:return base,[],"consensus-only"
     raw=sum(v*w for _,v,w in factors)/sum(w for _,_,w in factors)
-    # Revenue is generally less noisy than EPS; keep its whisper premium tighter.
     cap=8.0 if kind=="eps" else 5.0
     adj=_clamp(raw,-cap,cap)
-    return base*(1+adj/100),[{"factor":n,"contribution_pct":round(v*w/sum(ww for _,_,ww in factors),3)} for n,v,w in factors],key
-
+    return base*(1+adj/100),[{
+        "factor":n,
+        "contribution_pct":round(v*w/sum(ww for _,_,ww in factors),3)
+    } for n,v,w in factors],key
 
 def _market_implied_adjustment(whisper, market, hist, kind):
     if whisper is None:return None,[]
@@ -751,12 +824,19 @@ def analyze_whisper(symbol):
         cons=f_cons.result();hist=f_hist.result();guid=f_guid.result()
     earnings_date=cons.get("earnings_date")
     market=_market_signal(requested,earnings_date)
+    days_to_earnings=None
+    try:
+        if earnings_date:
+            ed=pd.Timestamp(earnings_date)
+            if ed.tzinfo is None: ed=ed.tz_localize("UTC")
+            days_to_earnings=max(0,int((ed-pd.Timestamp.now(tz="UTC")).total_seconds()/86400))
+    except Exception: pass
     eps_src=cons.get("eps") or {};rev_src=cons.get("revenue") or {}
     eps_cons=_finite(eps_src.get("eps"));rev_cons=_finite(rev_src.get("revenue"))
     eps_base=eps_cons if eps_cons is not None else _finite(qtr.get("eps"));rev_base=rev_cons if rev_cons is not None else _finite(qtr.get("revenue"))
     eps_base_source=eps_src.get("source") if eps_cons is not None else qtr.get("source");rev_base_source=rev_src.get("source") if rev_cons is not None else qtr.get("source")
-    eps_whisper,eps_wparts,eps_revision_key=_whisper_estimate(eps_base,eps_src,hist,qtr,guid,"eps")
-    rev_whisper,rev_wparts,rev_revision_key=_whisper_estimate(rev_base,rev_src,hist,qtr,guid,"revenue")
+    eps_whisper,eps_wparts,eps_revision_key=_whisper_estimate(eps_base,eps_src,hist,qtr,guid,"eps",days_to_earnings)
+    rev_whisper,rev_wparts,rev_revision_key=_whisper_estimate(rev_base,rev_src,hist,qtr,guid,"revenue",days_to_earnings)
     eps_implied,eps_mparts=_market_implied_adjustment(eps_whisper,market,hist,"eps")
     rev_implied,rev_mparts=_market_implied_adjustment(rev_whisper,market,hist,"revenue")
     eps_pricein=(eps_implied/eps_cons-1)*100 if eps_implied is not None and eps_cons else None
@@ -766,17 +846,17 @@ def analyze_whisper(symbol):
     confidence=max(_confidence(len(eps_wparts)+len(eps_mparts),market.get("available"),eps_base_source,exact_ew),_confidence(len(rev_wparts)+len(rev_mparts),market.get("available"),rev_base_source,exact_ew))
     out={
       "ok":True,"symbol":requested,"as_of":datetime.now(timezone.utc).isoformat(),"next_earnings_date":earnings_date,
-      "model":"AEL Market-Implied Whisper v2.6.1","status":"inferred","confidence_pct":confidence,
-      "target_period":target_period.get("target_end"),"last_actual_period":target_period.get("last_actual_end"),"period_lock":"strict",
+      "model":"AEL Market-Implied Whisper v2.6.3 Calibration","status":"inferred","confidence_pct":confidence,
+      "target_period":target_period.get("target_end"),"last_actual_period":target_period.get("last_actual_end"),"period_lock":"smart-strict","days_to_earnings":days_to_earnings,
       "data_mode":"observed-consensus→AEL-whisper→market-implied" if (eps_cons is not None or rev_cons is not None) else "fundamental-nowcast→AEL-whisper→market-implied",
       "revenue":{"consensus":rev_cons,"base":rev_base,"whisper":rev_whisper,"implied":rev_implied,"whisper_premium_pct":(rev_whisper/rev_cons-1)*100 if rev_whisper is not None and rev_cons else None,"pricein_pct":rev_pricein,"base_source":rev_base_source,"low":rev_src.get("revenue_low"),"high":rev_src.get("revenue_high"),"whisper_evidence":rev_wparts,"market_evidence":rev_mparts,"status":"inferred","reason":"共识 → 修正 → 指引定位 → 基本面Nowcast → 市场价格/期权Price-in。"},
       "eps":{"consensus":eps_cons,"base":eps_base,"whisper":eps_whisper,"implied":eps_implied,"whisper_premium_pct":(eps_whisper/eps_cons-1)*100 if eps_whisper is not None and eps_cons else None,"pricein_pct":eps_pricein,"base_source":eps_base_source,"low":eps_src.get("eps_low"),"high":eps_src.get("eps_high"),"whisper_evidence":eps_wparts,"market_evidence":eps_mparts,"status":"inferred","reason":"共识 → 修正 → 指引定位 → 基本面Nowcast → 市场价格/期权Price-in。"},
       "market_beat_threshold":{"revenue":rev_implied,"eps":eps_implied},
-      "market_signals":market,"historical_surprise":hist,"fundamental_nowcast":qtr,"guidance":guid,
+      "market_signals":market,"historical_surprise":hist,"analyst_bias":{"eps_pct":hist.get("eps_bias_pct"),"revenue_pct":hist.get("revenue_bias_pct"),"eps_samples":hist.get("count",0),"revenue_samples":hist.get("count_revenue",0),"source":hist.get("source")},"fundamental_nowcast":qtr,"guidance":guid,
       "provider_status":[{"source":x.get("source"),"available":bool(x.get("available")) and bool(x.get("period_validated")),"period_validated":bool(x.get("period_validated")),"error":x.get("error") or x.get("rejected_reason")} for x in cons.get("results",[])],
       "licensed_reference":{"available":exact_ew,"whisper_eps":ew.get("whisper_eps"),"consensus_eps":ew.get("eps"),"consensus_revenue":ew.get("revenue"),"source":"Earnings Whispers Data API" if exact_ew else None},
       "sources":{"consensus":eps_src.get("source") or rev_src.get("source") or qtr.get("source"),"history":"Yahoo historical earnings","market":"Yahoo price + listed options","guidance":guid.get("source") if guid.get("available") else None},
-      "method_note":"AEL v2.6.1 固定三层：① SELL-SIDE CONSENSUS：多源交叉验证，且所有 EPS/Revenue 必须先通过同一目标财季的严格 Quarter Lock；② AEL WHISPER ESTIMATE：以锁定后的共识为锚，叠加预测修正、公司指引定位、历史惊喜偏差与基本面Nowcast；③ AEL MARKET-IMPLIED：再叠加价格动量、异常成交量、事件期权IV、IV偏斜与历史市场惊喜，估计市场已经 Price-in 的本季门槛。任何无法证明属于目标财季的数据都被拒绝，绝不允许跨季度拼接。AEL 不声称看到 Earnings Whispers 私有模型或私人买方订单簿。配置合法 EW_API_KEY 后，官方 Whisper 仅作为独立校准参考。"
+      "method_note":"AEL v2.6.3 Calibration 三层：① SELL-SIDE CONSENSUS：多源交叉验证并通过 Smart Quarter Resolver；② AEL WHISPER ESTIMATE：以同财季共识为锚，加入近期预测修正、公司指引定位、经样本量与波动率收缩后的公司级 Analyst Bias，以及基本面 Nowcast；③ AEL MARKET-IMPLIED：在 Whisper 之上加入价格动量、异常成交量、事件期权 IV/偏斜与历史市场反应。历史 Surprise 不再机械外推，而用于估计“公司级共识偏差”；该偏差会随样本不足和历史波动自动收缩。AEL 不声称看到 Earnings Whispers 私有模型或私人买方订单簿；若配置合法 EW_API_KEY，官方 Whisper 仅作为独立校准参考。"
     }
     with _LOCK:_CACHE[requested]=(now,out)
     return out
