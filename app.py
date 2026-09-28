@@ -20,7 +20,7 @@ from pro_macro import analyze_macro
 from pro_backtest import run_backtest
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.20.2-PRO-BACKTEST-FIX'
+APP_VERSION = '2.5.20.4-LITE-QUALITY-SPEED'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -84,8 +84,17 @@ _UNIVERSE_CACHE = {}
 _FUNDAMENTAL_CACHE = {}
 _FUNDAMENTAL_CACHE_TTL = int(os.getenv('AEL_FUNDAMENTAL_CACHE_TTL', '21600'))
 ROE_MIN_PCT = float(os.getenv('AEL_ROE_MIN_PCT', '10'))
-FUNDAMENTAL_WORKERS = max(1, min(8, int(os.getenv('AEL_FUNDAMENTAL_WORKERS', '8'))))
-FUNDAMENTAL_CANDIDATES = max(50, min(200, int(os.getenv('AEL_FUNDAMENTAL_CANDIDATES', '120'))))
+FUNDAMENTAL_WORKERS = max(1, min(10, int(os.getenv('AEL_FUNDAMENTAL_WORKERS', '8'))))
+# Fast-first quality validation: check a smaller technical shortlist first; only
+# expand when too few names qualify. This cuts hundreds of slow per-symbol
+# fundamental requests on normal scans without weakening the final TOP20 gate.
+FUNDAMENTAL_CANDIDATES = max(60, min(200, int(os.getenv('AEL_FUNDAMENTAL_CANDIDATES', '160'))))
+FUNDAMENTAL_FIRST_PASS = max(40, min(FUNDAMENTAL_CANDIDATES, int(os.getenv('AEL_FUNDAMENTAL_FIRST_PASS', '80'))))
+FUNDAMENTAL_MIN_PASSED = max(20, min(20, int(os.getenv('AEL_FUNDAMENTAL_MIN_PASSED', '20'))))
+SCAN_HISTORY_PERIOD = os.getenv('AEL_SCAN_HISTORY_PERIOD', '15mo')
+# Lite quality controls: keep hard gates conservative, then rank by business quality
+# so technical heat alone cannot push speculative/junk names into TOP20.
+SPECULATION_HARD_LIMIT = float(os.getenv('AEL_LITE_SPECULATION_HARD_LIMIT', '80'))
 _SCAN_JOBS = {}
 _SCAN_LOCK = threading.Lock()
 
@@ -446,43 +455,110 @@ def _scan_universe(markets: str, group: str = 'all'):
         source='固定核心指数成分池 → 批量历史行情 → ROE + 市值硬门槛'
     return rows, source, otc_counts, cap_rejected
 
-def _fundamental_gate(symbol, market=None, market_cap_hint=None):
-    """Fast Lite qualification gate: real Yahoo ROE + market-cap hard gates.
-    No financial statements are downloaded during MARKET SCAN. Full fundamentals
-    remain available in SINGLE. Missing/invalid values never pass by estimation.
+def _quality_score(data):
+    """Bounded 0-100 business-quality score used only after hard eligibility gates."""
+    parts=[]
+    roe=data.get('roe')
+    if roe is not None:
+        parts.append((max(0,min(100,(roe-5)/20*100)),35,'ROE'))
+    margin=data.get('profit_margin')
+    if margin is not None:
+        parts.append((max(0,min(100,(margin+0.02)/0.22*100)),20,'利润率'))
+    if data.get('cash_quality') is not None:
+        parts.append((float(data['cash_quality']),25,'现金流'))
+    de=data.get('debt_to_equity')
+    if de is not None:
+        parts.append((100 if de<=50 else 80 if de<=100 else 60 if de<=200 else 35 if de<=300 else 10,20,'负债水平'))
+    if not parts:
+        return None
+    return round(sum(v*w for v,w,_ in parts)/sum(w for _,w,_ in parts))
+
+
+def _speculation_risk(tech):
+    """Detect extreme price/volume heat without penalizing ordinary momentum."""
+    ind=tech.get('indicators') or {}
+    rsi=ind.get('rsi14')
+    ret20=ind.get('momentum_20d')
+    pos52=ind.get('52w_position')
+    vol_ratio=ind.get('volume_ratio_20d')
+    risk=0.0
+    if rsi is not None and rsi>75: risk += min(30,(rsi-75)*2.0)
+    if rsi is not None and rsi>82: risk += 15
+    if ret20 is not None and ret20>20: risk += min(25,(ret20-20)*0.5)
+    if ret20 is not None and ret20>40: risk += 15
+    if pos52 is not None and pos52>90: risk += min(15,(pos52-90)*0.3)
+    if vol_ratio is not None and vol_ratio>2: risk += min(20,(vol_ratio-2)*8)
+    return round(min(100,risk),1)
+
+
+def _fundamental_gate(symbol, market=None, market_cap_hint=None, sector=None, industry=None, tech=None):
+    """Lite quality gate: real Yahoo business metrics + market-cap + anti-speculation.
+    Financials use a sector-aware cash-flow rule because FCF is not a meaningful
+    screening metric for banks/insurers. Missing critical data never passes.
     """
     cached=_FUNDAMENTAL_CACHE.get(symbol)
-    cache_market_ok=(cached and cached.get('market')==market and cached.get('market_cap_hint')==market_cap_hint)
+    cache_market_ok=(cached and cached.get('market')==market and cached.get('market_cap_hint')==market_cap_hint and cached.get('sector')==sector)
     if cache_market_ok and time()-cached['ts'] < _FUNDAMENTAL_CACHE_TTL:
         return cached['ok'], cached['data']
     try:
         t=yf.Ticker(symbol)
         info=t.info or {}
-        roe=None
-        try:
-            raw=info.get('returnOnEquity')
-            roe=float(raw)*100 if raw is not None else None
-        except Exception:
-            roe=None
-        market_cap=market_cap_hint
-        if market_cap is None:
+        def num(key):
             try:
-                market_cap=float(info.get('marketCap')) if info.get('marketCap') is not None else None
+                v=info.get(key)
+                return float(v) if v is not None and pd.notna(v) else None
             except Exception:
-                market_cap=None
+                return None
+        raw_roe=num('returnOnEquity'); roe=raw_roe*100 if raw_roe is not None else None
+        market_cap=market_cap_hint if market_cap_hint is not None else num('marketCap')
+        profit_margin=num('profitMargins')
+        op_margin=num('operatingMargins')
+        fcf=num('freeCashflow')
+        ocf=num('operatingCashflow')
+        debt_to_equity=num('debtToEquity')
+        total_equity=num('totalStockholderEquity')
+        trailing_eps=num('trailingEps')
+        revenue=num('totalRevenue')
+        net_income=num('netIncomeToCommon')
+        revenue_growth=num('revenueGrowth')
+        earnings_growth=num('earningsGrowth')
+        beta=num('beta')
         roe_ok=roe is not None and roe >= ROE_MIN_PCT
         cap_ok=True if market not in MARKET_CAP_MIN else (market_cap is not None and market_cap >= MARKET_CAP_MIN[market])
-        ok=roe_ok and cap_ok
+        financial_sector=str(sector or '').lower() in {'financial services','financial','banks','insurance'} or str(industry or '').lower().startswith(('banks','insurance'))
+        revenue_ok=(revenue is not None and revenue>0) if not financial_sector else True
+        earnings_ok=((net_income is not None and net_income>0) or (trailing_eps is not None and trailing_eps>0))
+        equity_ok=(total_equity is None or total_equity>0)
+        if financial_sector:
+            cash_quality=70 if ocf is not None and ocf>0 else None
+            cash_ok=True
+        else:
+            cash_quality=100 if fcf is not None and fcf>0 else (70 if ocf is not None and ocf>0 else 0)
+            cash_ok=(fcf is not None and fcf>0) or (ocf is not None and ocf>0)
+        margin_ok=(profit_margin is None or profit_margin>0)
+        # Extreme growth/heat combinations are treated as speculative rather than
+        # as quality. We only hard-reject the most obvious blow-off patterns.
+        speculation=_speculation_risk(tech or {})
+        hard_heat=(speculation>=SPECULATION_HARD_LIMIT)
+        ok=roe_ok and cap_ok and revenue_ok and earnings_ok and equity_ok and cash_ok and margin_ok and not hard_heat
         data={'roe':roe,'roe_min_pct':ROE_MIN_PCT,'market_cap':market_cap,
               'market_cap_min':MARKET_CAP_MIN.get(market),'market_cap_currency':MARKET_CAP_CURRENCY.get(market),
-              'roe_ok':roe_ok,'market_cap_ok':cap_ok}
-        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':ok,'data':data,'market':market,'market_cap_hint':market_cap_hint}
+              'roe_ok':roe_ok,'market_cap_ok':cap_ok,'revenue':revenue,'net_income':net_income,
+              'profit_margin':profit_margin,'operating_margin':op_margin,'free_cashflow':fcf,
+              'operating_cashflow':ocf,'debt_to_equity':debt_to_equity,'trailing_eps':trailing_eps,
+              'revenue_growth':revenue_growth,'earnings_growth':earnings_growth,'beta':beta,
+              'financial_sector':financial_sector,'revenue_ok':revenue_ok,'earnings_ok':earnings_ok,'equity_ok':equity_ok,'total_equity':total_equity,
+              'cash_ok':cash_ok,'cash_quality':cash_quality,'margin_ok':margin_ok,
+              'speculation_risk':speculation,'speculation_ok':not hard_heat}
+        data['quality_score']=_quality_score(data)
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':ok,'data':data,'market':market,'market_cap_hint':market_cap_hint,'sector':sector}
         return ok, data
     except Exception as exc:
         data={'roe':None,'roe_min_pct':ROE_MIN_PCT,'market_cap':None,
               'market_cap_min':MARKET_CAP_MIN.get(market),'market_cap_currency':MARKET_CAP_CURRENCY.get(market),
-              'roe_ok':False,'market_cap_ok':False,'error':str(exc)[:180]}
-        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data,'market':market,'market_cap_hint':market_cap_hint}
+              'roe_ok':False,'market_cap_ok':False,'revenue_ok':False,'earnings_ok':False,
+              'cash_ok':False,'margin_ok':False,'speculation_ok':False,'quality_score':None,'error':str(exc)[:180]}
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data,'market':market,'market_cap_hint':market_cap_hint,'sector':sector}
         return False, data
 
 
@@ -505,7 +581,7 @@ def _extract_history(frame, symbol):
 def _scan_history_batch(symbols):
     if not symbols: return {}, {}
     try:
-        data=yf.download(symbols, period='2y', interval='1d', auto_adjust=False,
+        data=yf.download(symbols, period=SCAN_HISTORY_PERIOD, interval='1d', auto_adjust=False,
                          group_by='ticker', threads=False, progress=False, repair=False, timeout=20)
         histories={s:_extract_history(data,s) for s in symbols}
         errors={s:'历史行情为空或字段不完整' for s,h in histories.items() if h is None}
@@ -573,44 +649,86 @@ def _scan_batch(rows):
 
 
 def _apply_fundamental_gate(rows, errors):
-    """Second-stage fundamental verification. Only the best technical candidates
-    per market are queried, preserving the original hard fundamental gate without
-    making the entire market wait on hundreds/thousands of financial statements."""
+    """Quality-first Lite gate with an adaptive fast path.
+
+    Pass 1 validates only the top technical shortlist per market. If a market
+    does not produce enough qualified names for a TOP20 result, Pass 2 expands
+    into the remaining technical candidates. This preserves the hard quality
+    gates while materially reducing slow per-symbol Yahoo fundamental calls.
+    """
     groups={'us':[],'hk':[],'cn':[]}
     for row in rows:
         mk=row.get('market') or market_of(row.get('symbol',''))
         groups.setdefault(mk,[]).append(row)
-    candidates=[]
+
+    def sort_key(x):
+        return (float(x.get('composite_score',-1)), float(x.get('value_score',-1)),
+                float(x.get('strength',-1)), str(x.get('symbol','')))
+
+    # Technical pre-filter: obvious blow-off names never consume a slow
+    # fundamental request. This is only a gate, not a score contribution.
+    ordered={}
     for mk,items in groups.items():
-        items.sort(key=lambda x:(float(x.get('composite_score',-1)), float(x.get('strength',-1)), float(x.get('value_score',-1)), str(x.get('symbol',''))), reverse=True)
-        candidates.extend(items[:FUNDAMENTAL_CANDIDATES])
+        items=sorted(items, key=sort_key, reverse=True)
+        clean=[]
+        hot=[]
+        for row in items:
+            risk=_speculation_risk(row)
+            if risk >= SPECULATION_HARD_LIMIT:
+                errors[row.get('symbol','')]='技术层反过热过滤：短期价格/成交异常'
+                hot.append(row)
+            else:
+                clean.append(row)
+        ordered[mk]=(clean, hot)
+
     def check(row):
         mk=row.get('market') or market_of(row.get('symbol',''))
-        ok,data=_fundamental_gate(row.get('symbol',''), mk, row.get('market_cap'))
+        ok,data=_fundamental_gate(row.get('symbol',''), mk, row.get('market_cap'), row.get('sector'), row.get('industry'), row)
         return row,ok,data
+
+    def validate(batch, passed):
+        if not batch: return
+        with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS, thread_name_prefix='ael-fund') as pool:
+            futures=[pool.submit(check,row) for row in batch]
+            for future in as_completed(futures):
+                row,ok,data=future.result(); symbol=row.get('symbol','')
+                if not ok:
+                    reasons=[]
+                    if not data.get('roe_ok'): reasons.append(f'ROE < {ROE_MIN_PCT:g}% 或暂无数据')
+                    if not data.get('market_cap_ok'):
+                        cap_min=float(data.get('market_cap_min') or 0)/1e9
+                        reasons.append(f'市值 < {cap_min:g}B {data.get("market_cap_currency") or ""} 或暂无数据')
+                    if not data.get('revenue_ok'): reasons.append('营收无效')
+                    if not data.get('earnings_ok'): reasons.append('盈利为负或暂无数据')
+                    if not data.get('equity_ok'): reasons.append('股东权益异常')
+                    if not data.get('cash_ok'): reasons.append('经营现金流/自由现金流质量不足')
+                    if not data.get('margin_ok'): reasons.append('利润率为负')
+                    if not data.get('speculation_ok'): reasons.append('短期价格/成交过热')
+                    errors[symbol]='质量资格过滤未通过：'+'；'.join(reasons)
+                    continue
+                row=dict(row)
+                row.update({'fundamental_ok':True,'fundamental_status':'基本面合格','roe':data.get('roe'),
+                            'revenue':data.get('revenue'),'net_income':data.get('net_income'),'fcf':data.get('free_cashflow'),
+                            'market_cap':data.get('market_cap'),'quality_score':data.get('quality_score'),
+                            'speculation_risk':data.get('speculation_risk') or 0,'quality_breakdown':data})
+                passed.append(row)
+
     passed=[]
-    with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS, thread_name_prefix='ael-fund') as pool:
-        futures=[pool.submit(check,row) for row in candidates]
-        for future in as_completed(futures):
-            row,ok,data=future.result()
-            symbol=row.get('symbol','')
-            if not ok:
-                reasons=[]
-                if not data.get('roe_ok'): reasons.append(f'ROE < {ROE_MIN_PCT:g}% 或暂无数据')
-                if not data.get('market_cap_ok'):
-                    cap_min=float(data.get('market_cap_min') or 0)/1e9
-                    reasons.append(f'市值 < {cap_min:g}B {data.get("market_cap_currency") or ""} 或暂无数据')
-                errors[symbol]='基本面/市值资格过滤未通过：'+'；'.join(reasons)
-                continue
-            row=dict(row)
-            row.update({
-                'fundamental_ok':True,
-                'fundamental_status':f'ROE ≥ {ROE_MIN_PCT:g}%',
-                'roe':data.get('roe'),'revenue':None,'net_income':None,'fcf':None,'market_cap':data.get('market_cap')
-            })
-            passed.append(row)
-    passed.sort(key=lambda x:(str(x.get('market','')), -float(x.get('composite_score',-1)), -float(x.get('strength',-1)), -float(x.get('value_score',-1)), str(x.get('symbol',''))))
-    return passed, len(candidates), len(passed)
+    candidates_count=0
+    for mk,(clean,_hot) in ordered.items():
+        first=clean[:FUNDAMENTAL_FIRST_PASS]
+        candidates_count += len(first)
+        validate(first, passed)
+        # If fewer than TOP20 qualified names survive, expand only this market.
+        if len([x for x in passed if (x.get('market') or market_of(x.get('symbol',''))) == mk]) < FUNDAMENTAL_MIN_PASSED:
+            extra=clean[FUNDAMENTAL_FIRST_PASS:FUNDAMENTAL_CANDIDATES]
+            candidates_count += len(extra)
+            validate(extra, passed)
+
+    passed.sort(key=lambda x:(float(x.get('composite_score',-1)),float(x.get('value_score',-1)),
+                              float(x.get('strength',-1)),float(x.get('quality_score',-1)),str(x.get('symbol',''))), reverse=True)
+    return passed, candidates_count, len(passed)
+
 
 def _daily_sector_performance(moves, selected_markets, scan_group='all', group_label='全市场'):
     """Latest trading-day breadth/performance from all market-cap-eligible names.
@@ -655,6 +773,7 @@ def _rank_results(rows, limit=20):
         # Stable multi-pass sort keeps the documented priority while making
         # the final ticker tie-break ascending (A -> Z), not descending.
         group.sort(key=lambda x: str(x.get('symbol','')))
+        group.sort(key=lambda x: float(x.get('quality_score',-1)), reverse=True)
         group.sort(key=lambda x: float(x.get('value_score',-1)), reverse=True)
         group.sort(key=lambda x: float(x.get('strength',-1)), reverse=True)
         group.sort(key=lambda x: float(x.get('composite_score',-1)), reverse=True)
@@ -700,7 +819,7 @@ def _job_snapshot(job):
             'current_market':job.get('current_market'),'current_sector':job.get('current_sector'),
             'current_sector_completed':job.get('current_sector_completed',0),'current_sector_total':job.get('current_sector_total',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{}),
-            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% + market cap minimum (hard gate)'},
+            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'fundamental_first_pass':FUNDAMENTAL_FIRST_PASS,'history_period':SCAN_HISTORY_PERIOD,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% + 市值 + 盈利/现金流 + 反过热质量门槛'},
             'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],
             'universe_source':job.get('universe_source'),
@@ -788,8 +907,8 @@ def _run_scan_job(job):
             if not cancelled:
                 _SCAN_CACHE[cache_key]={'ts':time(),'data':{
                     'ok':True,'scan':{'markets':job['selected_markets'],'universe_size':job['total'],'matched':sum(len(v) for v in ranked.values()),
-                                     'top_n':20,'rules':'核心指数成分池→批量历史行情→高性价比50%+动能50%→ROE + 市值硬门槛→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
-                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% + market cap minimum (hard gate)'},
+                                     'top_n':20,'rules':'核心指数成分池→批量历史行情→技术候选→ROE/市值/盈利/现金流/反过热质量门槛→质量调整后排名各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
+                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'fundamental_first_pass':FUNDAMENTAL_FIRST_PASS,'history_period':SCAN_HISTORY_PERIOD,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% + 市值 + 盈利/现金流 + 反过热质量门槛'},
             'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
                     'results_by_market':ranked,'sector_rotation':{mk:_sector_rank([x for x in job['rows'] if x.get('market')==mk],10) for mk in job['selected_markets']},
