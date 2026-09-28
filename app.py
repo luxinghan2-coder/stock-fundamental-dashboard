@@ -17,9 +17,10 @@ from pro_options import router as pro_options_router
 from pro_factor import analyze_factor
 from pro_risk import analyze_risk, analyze_portfolio
 from pro_macro import analyze_macro
+from pro_backtest import run_backtest
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.19.1-PRO-MACRO-FED-POLY'
+APP_VERSION = '2.5.20-PRO-BACKTEST-LAB'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -150,6 +151,25 @@ def pro_risk_portfolio(
         return analyze_portfolio(syms, ws, benchmark, period, capital)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'组合风险分析失败：{exc}')
+
+
+@app.get('/api/pro/backtest')
+def pro_backtest(
+    symbols: str = Query(..., min_length=3),
+    benchmark: str = Query('SPY'),
+    strategy: str = Query('momentum', pattern='^(equal_weight|momentum|trend|low_vol)$'),
+    period: str = Query('5y', pattern='^(3y|5y|10y|max)$'),
+    rebalance: str = Query('monthly', pattern='^(monthly|quarterly|semiannual)$'),
+    top_k: int = Query(5, ge=1, le=20),
+    lookback: int = Query(120, ge=20, le=504),
+    cost_bps: float = Query(10.0, ge=0, le=200),
+    validation: str = Query('standard', pattern='^(standard|strict)$'),
+):
+    try:
+        syms = [x.strip() for x in symbols.split(',') if x.strip()]
+        return run_backtest(syms, benchmark, strategy, period, rebalance, top_k, lookback, cost_bps, validation)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'回测数据获取失败：{exc}')
 
 
 @app.get('/api/pro/macro')
