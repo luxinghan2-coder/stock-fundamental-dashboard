@@ -1,22 +1,53 @@
-# 股票基本面驾驶舱 V2.3.2
+# AEL V2.5.19.2｜Pro 宏观 / Fed / 市场预期版
 
-A股 / 港股 / 美股基本面分析 H5/PWA。
+## 这一版做什么
+- 修复 Pro Macro/Fed 的单一数据源故障隔离。
+- 关键数据增加官方直连：美国财政部、纽约联储、BLS、Federal Reserve。
+- FRED 保留为历史序列与备用源，不再作为整个宏观页面的单点依赖。
+- 新增 Polymarket Fed 市场预期：只展示市场隐含概率，不等同于 Federal Reserve 官方预测，并将事件与结果中文化。
+- Macro/Fed UI 改为中文、移动端优先、先看结论再看细节；FOMC 月份/会议日历/Polymarket 事件全部中文展示。
+- 技术错误默认折叠，不再把 HTTPS/traceback 直接铺在主页面。
+- Risk Lab 重构为“风险体检”：单股体检 + 组合体检，加入最大回撤、历史单日VaR、Beta/相关性、集中度与可选组合金额换算。
+- Lite 冻结：`metrics.py`、`requirements.txt` SHA256 与基线一致。
 
-## V2.3.2 修复
-- 美股长期 ROE 使用 SEC EDGAR / XBRL Company Facts。
-- SEC ROE 按 fiscal-period end date 配对：年度净利润 + 对应财年期初权益 + 对应财年期末权益，避免 Apple 等非自然年财年的年份错位。
-- ROE 明细显示 FY 财年标签与财年截止日期。
-- 美股当前 ROE 与 SEC 15 年 ROE 定义保持一致。
-- 股息历史区分完整年度与当前年度 YTD。
-- 3Y / 5Y / 10Y 股息 CAGR 只使用完整年度，不把未结束年度混入 CAGR。
-- TTM 股息率继续按最近 365 天现金股息计算。
-- 保留 V2.3.1 已有的基本面、分红、技术指标、Fibonacci、价格曲线、分析师图表与 K/M/B/T 金额格式。
-- 数据缺失时显示“暂无数据”，不人为填充。
+## 上传顺序
+ZIP 已按上传便利性排序：
+1. `app.py`
+2. `requirements.txt`
+3. `metrics.py`
+4. `pro_macro.py`
+5. `pro_factor.py`
+6. `pro_risk.py`
+7. `pro_options.py`
+8. `static/index.html`
+9. 文档
 
-## 数据源
-- Yahoo Finance / yfinance：行情、财报、分红、技术指标、分析师数据。
-- SEC EDGAR / XBRL Company Facts：美股长期 ROE。
+## 关键接口
+- `GET /api/health`
+- `GET /api/pro/macro`
+- `GET /api/pro/factors/analyze/{symbol}`
+- `GET /api/pro/risk/analyze/{symbol}`
+- `GET /api/pro/risk/portfolio`
 
-## Railway
-启动命令：
-`uvicorn app:app --host 0.0.0.0 --port $PORT`
+## 数据原则
+- 真实数据优先。
+- 缺失 = `暂无数据`。
+- 不用旧值冒充最新值。
+- Polymarket 只作为市场预期层，不写入 Lite 股票评分。
+- Macro Regime 只描述环境，不自动给股票加减分。
+
+## 部署后首测
+1. `/api/health`
+2. Pro → 宏观 → 刷新宏观数据
+3. 检查 Federal Reserve / Treasury / NY Fed / BLS / Polymarket 数据源状态
+4. 检查 Factor / Risk
+5. 切回 Lite，确认 SINGLE 与 MARKET SCAN 不受影响
+
+## Pro Buy-Side Expectation / ATS Evidence
+
+- `GET /api/pro/expectation/{symbol}` remains on-demand and isolated from Lite.
+- Pro 买方预期优先使用免费/公开源：Yahoo/yfinance、SEC 13F、CFTC COT、xStocks；可选 `FINNHUB_API_KEY` / `ALPHAVANTAGE_API_KEY` 增强盈利数据；FINRA ATS 需要 `FINRA_API_TOKEN`，不配置时不会伪造暗池数据。
+- FINRA data is weekly/delayed and does not reveal trade direction; AEL therefore exposes ATS share/activity and an `inferred` activity score, never a claim of net dark-pool buying.
+- Missing token, timeout, empty data, or source failure affects only the ATS evidence card; other Pro/Lite data continues normally.
+
+- V2.5.24: Buy-Side Expectation expanded with free/public earnings-trend, SEC 13F quarterly evidence, optional free-key Alpha Vantage/Finnhub earnings evidence, explicit not-applicable states, and source-status diagnostics. These sources are isolated from Lite and are not used to fabricate private buy-side order books.

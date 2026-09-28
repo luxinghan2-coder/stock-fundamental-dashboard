@@ -11,6 +11,9 @@ import threading
 import os
 import re
 import requests
+import zipfile
+import tempfile
+from pathlib import Path
 import yfinance as yf
 import pandas as pd
 
@@ -174,11 +177,15 @@ def _dark_expectation(ats, options, analyst):
 
 def _analyst_source(symbol):
     out = {"available": False, "target_mean": None, "target_median": None,
-           "recommendation_mean": None, "number_of_analysts": None, "error": None}
+           "recommendation_mean": None, "number_of_analysts": None, "cusip": None,
+           "target_low": None, "target_high": None, "error": None}
     try:
         info = yf.Ticker(symbol).info or {}
         out["target_mean"] = _finite(info.get("targetMeanPrice"))
         out["target_median"] = _finite(info.get("targetMedianPrice"))
+        out["target_low"] = _finite(info.get("targetLowPrice"))
+        out["target_high"] = _finite(info.get("targetHighPrice"))
+        out["cusip"] = info.get("cusip") or info.get("cusipNumber")
         out["recommendation_mean"] = _finite(info.get("recommendationMean"))
         out["number_of_analysts"] = _finite(info.get("numberOfAnalystOpinions"))
         out["available"] = any(out[k] is not None for k in ("target_mean", "target_median", "recommendation_mean"))
@@ -466,6 +473,247 @@ def _next_earnings_dark_source(symbol, ats=None):
         out["error"]=str(exc)[:180]
         return out
 
+
+
+# ---------------------------------------------------------------------------
+# Free/public evidence sources
+# ---------------------------------------------------------------------------
+_SEC_13F_URL = os.getenv(
+    "AEL_SEC_13F_URL",
+    "https://dcm.sec.gov/files/datastandardsinnovation/data/form-13f-data-sets/01jun2026-31aug2026_form13f.zip",
+)
+_SEC_13F_CACHE = os.getenv("AEL_SEC_13F_CACHE", "/tmp/ael_13f_2026_jun_aug.zip")
+_SEC_13F_LOCK = threading.Lock()
+
+
+def _yahoo_earnings_revision_source(symbol):
+    """Use Yahoo/yfinance's public earnings-trend table when available.
+
+    This is a *revision/consensus observation*, not a private buy-side forecast.
+    It is deliberately separate from the dark-expectation score.
+    """
+    out = {"available": False, "rows": [], "current_eps": None,
+           "eps_revision_7d_pct": None, "eps_revision_30d_pct": None,
+           "eps_revision_90d_pct": None, "analyst_count": None,
+           "next_earnings_date": None, "error": None,
+           "source": "Yahoo Finance / yfinance earnings trend"}
+    try:
+        t = yf.Ticker(symbol)
+        # yfinance exposes earnings_trend as a DataFrame on versions that
+        # support the endpoint. Keep this defensive because Yahoo occasionally
+        # changes the response shape.
+        trend = getattr(t, "earnings_trend", None)
+        if trend is not None and hasattr(trend, "copy"):
+            df = trend.copy()
+            if not df.empty:
+                if "period" in df.columns:
+                    df = df.reset_index(drop=True)
+                for _, row in df.iterrows():
+                    period = str(row.get("period") or row.get("index") or "")
+                    cur = _finite(row.get("current"))
+                    c7 = _finite(row.get("7daysAgo"))
+                    c30 = _finite(row.get("30daysAgo"))
+                    c90 = _finite(row.get("90daysAgo"))
+                    analysts = _finite(row.get("numberOfAnalysts"))
+                    if cur is not None:
+                        rec = {"period": period, "current": cur,
+                               "7daysAgo": c7, "30daysAgo": c30,
+                               "90daysAgo": c90, "numberOfAnalysts": analysts}
+                        out["rows"].append(rec)
+                        if not out["current_eps"] and period in ("0q", "+0q", "0y", "+0y"):
+                            out["current_eps"] = cur
+                        if out["analyst_count"] is None and analysts is not None:
+                            out["analyst_count"] = analysts
+                        if period in ("0q", "+0q"):
+                            for key, base in (("eps_revision_7d_pct", c7), ("eps_revision_30d_pct", c30), ("eps_revision_90d_pct", c90)):
+                                if cur is not None and base not in (None, 0):
+                                    out[key] = (cur / base - 1) * 100
+        # Earnings dates are also useful if the trend endpoint is sparse.
+        dates = t.get_earnings_dates(limit=8)
+        if dates is not None and not dates.empty:
+            now = pd.Timestamp.now(tz="UTC")
+            future = []
+            for idx in dates.index:
+                try:
+                    dt = pd.Timestamp(idx)
+                    dt = dt.tz_localize("UTC") if dt.tzinfo is None else dt.tz_convert("UTC")
+                    if dt > now:
+                        future.append(dt)
+                except Exception:
+                    continue
+            if future:
+                out["next_earnings_date"] = min(future).isoformat()
+        out["available"] = bool(out["rows"] or out["next_earnings_date"])
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)[:180]
+        return out
+
+
+def _alphavantage_earnings_estimates_source(symbol):
+    """Optional free-key Alpha Vantage consensus estimates.
+
+    Alpha Vantage offers EARNINGS_ESTIMATES with a free API key subject to its
+    free-tier limits. The key is optional; failure never blocks the Pro page.
+    """
+    out = {"available": False, "estimates": [], "error": None,
+           "source": "Alpha Vantage EARNINGS_ESTIMATES (optional free key)"}
+    key = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+    if not key:
+        out["error"] = "未配置 ALPHAVANTAGE_API_KEY；已使用 Yahoo 免费公开数据替代"
+        return out
+    try:
+        r = requests.get("https://www.alphavantage.co/query", params={
+            "function": "EARNINGS_ESTIMATES", "symbol": symbol, "apikey": key,
+        }, timeout=3.5, headers={"User-Agent": "AEL/2.5 Pro"})
+        r.raise_for_status(); d = r.json() or {}
+        if d.get("Note") or d.get("Information"):
+            out["error"] = str(d.get("Note") or d.get("Information"))[:180]
+            return out
+        rows = d.get("estimates") or d.get("data") or []
+        if isinstance(rows, list):
+            for x in rows[:12]:
+                if not isinstance(x, dict):
+                    continue
+                out["estimates"].append({k: x.get(k) for k in (
+                    "symbol", "horizon", "fiscalDateEnding", "epsAvg", "epsHigh", "epsLow",
+                    "revenueAvg", "revenueHigh", "revenueLow", "analystCount", "growth"
+                ) if k in x})
+        out["available"] = bool(out["estimates"])
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)[:180]
+        return out
+
+
+def _finnhub_free_earnings_source(symbol):
+    """Optional Finnhub free-tier earnings calendar/surprise evidence."""
+    out = {"available": False, "next_earnings_date": None,
+           "eps_surprises": [], "revenue_surprises": [], "error": None,
+           "source": "Finnhub free earnings calendar / earnings surprises"}
+    key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not key:
+        out["error"] = "未配置 FINNHUB_API_KEY；该免费扩展保持关闭"
+        return out
+    try:
+        today = pd.Timestamp.now(tz="UTC").date()
+        start = (today - pd.Timedelta(days=365)).isoformat()
+        end = (today + pd.Timedelta(days=45)).isoformat()
+        base = "https://finnhub.io/api/v1"
+        cal = requests.get(base + "/calendar/earnings", params={
+            "from": start, "to": end, "symbol": symbol, "international": "false", "token": key,
+        }, timeout=3.5, headers={"User-Agent": "AEL/2.5 Pro"})
+        cal.raise_for_status(); cd = cal.json() or {}
+        events = cd.get("earningsCalendar") or []
+        future = [x for x in events if str(x.get("date") or "") >= today.isoformat()]
+        if future:
+            out["next_earnings_date"] = sorted(future, key=lambda x: str(x.get("date")))[0].get("date")
+        hist = requests.get(base + "/stock/earnings", params={"symbol": symbol, "limit": 8, "token": key},
+                            timeout=3.5, headers={"User-Agent": "AEL/2.5 Pro"})
+        hist.raise_for_status(); hd = hist.json() or []
+        if isinstance(hd, list):
+            for x in hd[:8]:
+                if x.get("surprisePercent") is not None:
+                    out["eps_surprises"].append({"period": x.get("period"), "surprise_pct": x.get("surprisePercent"), "actual": x.get("actual"), "estimate": x.get("estimate")})
+        out["available"] = bool(out["next_earnings_date"] or out["eps_surprises"])
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)[:180]
+        return out
+
+
+def _sec_13f_source(symbol, cusip=None):
+    """Free SEC 13F quarterly evidence, lazily cached.
+
+    SEC publishes flattened 13F datasets quarterly. We download the latest
+    dataset only on-demand, cache it locally, and scan the infotable for the
+    requested CUSIP. This is intentionally labeled quarterly/lagged evidence;
+    it is not real-time institutional positioning.
+    """
+    out = {"available": False, "report_date": None, "holder_count": None,
+           "total_value_usd": None, "top_holders": [], "change": None,
+           "error": None, "source": "SEC Form 13F quarterly dataset"}
+    if not cusip:
+        out["error"] = "缺少 CUSIP，无法从 SEC 13F 数据集精确匹配证券"
+        return out
+    target = re.sub(r"[^0-9A-Za-z]", "", str(cusip)).upper()
+    if not target:
+        out["error"] = "CUSIP 无效"
+        return out
+    cache_path = Path(_SEC_13F_CACHE)
+    try:
+        with _SEC_13F_LOCK:
+            if not cache_path.exists() or cache_path.stat().st_size < 1_000_000:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache_path.with_suffix(".tmp")
+                with requests.get(_SEC_13F_URL, stream=True, timeout=(4, 25), headers={
+                    "User-Agent": "AEL research contact@example.com",
+                    "Accept": "application/zip,*/*",
+                }) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        total = 0
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > 140 * 1024 * 1024:
+                                raise RuntimeError("SEC 13F 数据集超过安全下载上限")
+                            f.write(chunk)
+                tmp.replace(cache_path)
+        rows = []
+        with zipfile.ZipFile(cache_path, "r") as zf:
+            names = zf.namelist()
+            info_name = next((n for n in names if "infotable" in n.lower() and n.lower().endswith((".tsv", ".csv"))), None)
+            if not info_name:
+                out["error"] = "SEC 13F ZIP 未找到 infotable 数据文件"
+                return out
+            with zf.open(info_name) as fh:
+                sep = "\t" if info_name.lower().endswith(".tsv") else ","
+                for chunk in pd.read_csv(fh, sep=sep, dtype=str, chunksize=120_000, on_bad_lines="skip", low_memory=False):
+                    norm = {c: re.sub(r"[^a-z0-9]", "", str(c).lower()) for c in chunk.columns}
+                    cus_col = next((c for c,n in norm.items() if n in ("cusip", "cusipnumber")), None)
+                    if not cus_col:
+                        continue
+                    m = chunk[cus_col].astype(str).str.replace(r"[^0-9A-Za-z]", "", regex=True).str.upper() == target
+                    if m.any():
+                        rows.append(chunk.loc[m].copy())
+        if not rows:
+            out["error"] = "最新 SEC 13F 季度数据集中未找到该 CUSIP"
+            return out
+        df = pd.concat(rows, ignore_index=True)
+        norm = {c: re.sub(r"[^a-z0-9]", "", str(c).lower()) for c in df.columns}
+        def col(*names):
+            wanted=set(names)
+            return next((c for c,n in norm.items() if n in wanted), None)
+        holder_col=col("filingmanagername", "managername", "nameoffilingmanager")
+        value_col=col("value", "marketvalue")
+        shares_col=col("sshprnamt", "shares")
+        date_col=col("reportdate", "filingdate")
+        issuer_col=col("nameofissuer", "issuername")
+        if value_col:
+            df["_value"] = pd.to_numeric(df[value_col], errors="coerce")
+            # SEC 13F value is reported in thousands of dollars.
+            df["_value_usd"] = df["_value"] * 1000
+        else:
+            df["_value_usd"] = None
+        if date_col:
+            dates=pd.to_datetime(df[date_col], errors="coerce")
+            out["report_date"] = dates.max().date().isoformat() if dates.notna().any() else None
+        out["holder_count"] = int(df[holder_col].nunique()) if holder_col else int(len(df))
+        out["total_value_usd"] = float(df["_value_usd"].sum()) if df["_value_usd"].notna().any() else None
+        if holder_col:
+            top=df.sort_values("_value_usd", ascending=False).head(10)
+            out["top_holders"]=[{"holder": str(r.get(holder_col) or "未知"),
+                                  "value_usd": _finite(r.get("_value_usd")),
+                                  "shares": _finite(r.get(shares_col)) if shares_col else None,
+                                  "issuer": str(r.get(issuer_col) or "") if issuer_col else ""} for _,r in top.iterrows()]
+        out["available"] = bool(out["holder_count"])
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)[:180]
+        return out
+
 def _xstock_source(symbol):
     """Optional public xStocks metadata for an on-chain US equity token.
 
@@ -528,7 +776,16 @@ def analyze_expectation(symbol: str):
     # Optional sources are parallel and independently fail-safe.
     results = {}
     with ThreadPoolExecutor(max_workers=6) as ex:
-        futs = {ex.submit(_analyst_source, symbol): "analyst", ex.submit(_options_source, symbol): "options", ex.submit(_finra_ats_source, symbol): "ats_dark_pool", ex.submit(_next_earnings_dark_source, symbol): "next_earnings_dark", ex.submit(_crypto_onchain_source, symbol): "onchain_dark"}
+        futs = {
+            ex.submit(_analyst_source, symbol): "analyst",
+            ex.submit(_options_source, symbol): "options",
+            ex.submit(_finra_ats_source, symbol): "ats_dark_pool",
+            ex.submit(_next_earnings_dark_source, symbol): "next_earnings_dark",
+            ex.submit(_crypto_onchain_source, symbol): "onchain_dark",
+            ex.submit(_yahoo_earnings_revision_source, symbol): "earnings_revision_yahoo",
+            ex.submit(_alphavantage_earnings_estimates_source, symbol): "earnings_revision_av",
+            ex.submit(_finnhub_free_earnings_source, symbol): "earnings_revision_finnhub",
+        }
         if token_symbol:
             futs[ex.submit(_xstock_source, token_symbol)] = "onchain_equity"
         for fut in as_completed(futs):
@@ -543,6 +800,10 @@ def analyze_expectation(symbol: str):
     options = results.get("options", {"available": False})
     ats = results.get("ats_dark_pool", {"available": False})
     next_earnings = results.get("next_earnings_dark", {"available": False, "status":"unavailable"})
+    earnings_yahoo = results.get("earnings_revision_yahoo", {"available": False})
+    earnings_av = results.get("earnings_revision_av", {"available": False})
+    earnings_finnhub = results.get("earnings_revision_finnhub", {"available": False})
+    sec_13f = _sec_13f_source(symbol, analyst.get("cusip"))
     onchain = results.get("onchain_dark", {"available": False, "status":"unavailable"})
     if token_symbol:
         onchain_equity = results.get("onchain_equity", onchain_equity)
@@ -554,11 +815,21 @@ def analyze_expectation(symbol: str):
     # Explicitly keep unavailable institutional sources separate. No proxy is
     # presented as actual dark-pool/ATS/13F/CFTC observation.
     sources = {
-        "earnings_revision": {"status": "unavailable", "reason": "当前版本未接入稳定的实时盈利预测修正数据源"},
+        "earnings_revision": {
+            "status": "observed" if any(x.get("available") for x in (earnings_yahoo, earnings_av, earnings_finnhub)) else "unavailable",
+            "data": {"yahoo": earnings_yahoo if earnings_yahoo.get("available") else {},
+                     "alphavantage": earnings_av if earnings_av.get("available") else {},
+                     "finnhub": earnings_finnhub if earnings_finnhub.get("available") else {}},
+            "reason": "Yahoo 免费公开盈利趋势；可选 Alpha Vantage/Finnhub 免费 API 增强。"
+                      if any(x.get("available") for x in (earnings_yahoo, earnings_av, earnings_finnhub))
+                      else "未取得盈利预测趋势数据"},
         "ats_dark_pool": {"status": "observed" if ats.get("available") else "unavailable", "data": ats if ats.get("available") else {}, "reason": ats.get("error") or "FINRA ATS数据可用"},
         "dark_expectation": dark,
-        "institutional_13f": {"status": "unavailable", "reason": "未接入13F历史披露解析；避免把滞后披露伪装成实时仓位"},
-        "cftc_positioning": {"status": "unavailable", "reason": "当前标的未按期货品种接入CFTC持仓源"},
+        "institutional_13f": {"status": "observed" if sec_13f.get("available") else "unavailable",
+                              "data": sec_13f if sec_13f.get("available") else {},
+                              "reason": sec_13f.get("error") or "SEC 13F 最新季度披露；存在报告滞后，不代表实时仓位"},
+        "cftc_positioning": {"status": "not_applicable" if not str(symbol).upper().endswith("=F") else "unavailable",
+                                "reason": "CFTC COT 仅适用于相应期货品种；股票不适用" if not str(symbol).upper().endswith("=F") else "该期货品种的 COT 源需按合约映射"},
         "onchain_dark": {"status": "observed" if onchain.get("available") else "unavailable", "data": onchain if onchain.get("available") else {}, "reason": onchain.get("error") or "链上交易所/大额流量数据可用"},
         "next_earnings_dark": {"status": next_earnings.get("status", "unavailable"), "data": next_earnings if next_earnings.get("available") else {}, "reason": next_earnings.get("error") or "下一份财报的买方事件预期推断可用"},
         "onchain_equity": {"status": "observed" if onchain_equity.get("available") else "unavailable", "data": onchain_equity if onchain_equity.get("available") else {}, "reason": onchain_equity.get("error") or "xStocks公开资产元数据可用"},
@@ -579,7 +850,7 @@ def analyze_expectation(symbol: str):
             "optional_sources": {k:v.get("status") for k,v in sources.items()},
             "errors": {k:v.get("data",{}).get("error") for k,v in sources.items() if isinstance(v.get("data"), dict) and v.get("data",{}).get("error")},
         },
-        "method_note": "AEL Pro 的“下一份财报买方暗盘预期”不使用卖方目标价、分析师评级或EPS共识修正作为核心输入；只从财报事件期权成交/持仓、IV偏斜代理、财报前价格与成交量、以及可用的FINRA ATS活动痕迹推断市场参与者的事件定位。卖方数据只保留为独立参考，不进入暗盘核心分数。结果全部标记为inferred，绝不声称拥有私人买方订单簿。链上美股通过xStocks公开Assets API做资产存在性/底层股票映射，失败只影响该扩展卡。",
+        "method_note": "AEL Pro 的买方暗盘预期只使用公开可验证痕迹：上市期权、价格/成交量、财报事件日期、可用 FINRA ATS、SEC 13F 季度披露；卖方目标价/评级与盈利预测只作为独立参考，不进入暗盘核心分数。SEC 13F 是季度滞后披露，FINRA ATS 是周度聚合且需要授权令牌；两者都不等同私人买方订单簿。加密资产链上卡使用可验证公开链上/市场数据，失败只影响本卡。",
     }
     with _LOCK:
         _CACHE[symbol] = (now, out)
