@@ -354,7 +354,7 @@ def _fomc_calendar() -> dict[str, Any]:
         for mon, d1, d2 in re.findall(pattern, scope):
             dt1 = datetime(year, months.index(mon)+1, int(d1)).date()
             dt2 = datetime(year, months.index(mon)+1, int(d2 or d1)).date()
-            meetings.append({'start': dt1.isoformat(), 'end': dt2.isoformat(), 'label': f'{mon} {d1}' + (f'-{d2}' if d2 else '')})
+            meetings.append({'start': dt1.isoformat(), 'end': dt2.isoformat(), 'label': f'{_zh_month(mon)}{d1}日' + (f'-{d2}日' if d2 else ''), 'month_en': mon})
         unique=[]; seen=set()
         for m in meetings:
             if m['start'] not in seen:
@@ -373,6 +373,48 @@ def _parse_json_list(value):
         try: return json.loads(value)
         except Exception: return []
     return []
+
+
+def _zh_month(name: str) -> str:
+    return {'January':'一月','February':'二月','March':'三月','April':'四月','May':'五月','June':'六月','July':'七月','August':'八月','September':'九月','October':'十月','November':'十一月','December':'十二月'}.get(name, name)
+
+
+def _zh_poly_outcome(text: str) -> str:
+    t=str(text or '').strip()
+    low=t.lower()
+    if low in {'yes','true'}: return '是'
+    if low in {'no','false'}: return '否'
+    if 'decrease' in low or 'lower' in low or 'cut' in low:
+        m=re.search(r'(\d+(?:\.\d+)?)\s*(?:bps|basis points)', low)
+        return f'降息{m.group(1)}个基点' if m else '降息'
+    if 'increase' in low or 'raise' in low or 'hike' in low:
+        m=re.search(r'(\d+(?:\.\d+)?)\s*(?:bps|basis points)', low)
+        return f'加息{m.group(1)}个基点' if m else '加息'
+    if 'no change' in low or 'unchanged' in low or 'maintain' in low:
+        return '维持不变'
+    return t
+
+
+def _zh_poly_question(text: str) -> str:
+    t=' '.join(str(text or '').split())
+    low=t.lower()
+    if 'there be no change' in low or 'no change in fed' in low:
+        return '10月美联储会议：利率是否维持不变？'
+    if 'decrease interest rates by 50 bps' in low or 'decrease the target rate by 50' in low:
+        return '10月美联储会议：是否降息50个基点？'
+    if 'decrease interest rates by 25 bps' in low or 'decrease the target rate by 25' in low:
+        return '10月美联储会议：是否降息25个基点？'
+    if 'increase interest rates by 50 bps' in low or 'increase the target rate by 50' in low:
+        return '10月美联储会议：是否加息50个基点？'
+    if 'increase interest rates by 25 bps' in low or 'increase the target rate by 25' in low:
+        return '10月美联储会议：是否加息25个基点？'
+    if 'increase interest rates' in low:
+        return '10月美联储会议：是否加息？'
+    if 'decrease interest rates' in low or 'cut interest rates' in low:
+        return '10月美联储会议：是否降息？'
+    if 'fed decision' in low:
+        return '美联储下一次利率决定'
+    return t
 
 
 def _polymarket_fed() -> dict[str, Any]:
@@ -412,8 +454,8 @@ def _polymarket_fed() -> dict[str, Any]:
                 if p is not None:
                     probs.append({'outcome': str(outcome), 'probability': p*100})
             if probs:
-                rows.append({'question':m.get('question'), 'slug':m.get('slug'), 'url':f"https://polymarket.com/event/{m.get('slug')}" if m.get('slug') else None, 'probabilities':probs, 'volume':_num(m.get('volume')), 'volume_24h':_num(m.get('volume24hr')), 'liquidity':_num(m.get('liquidity')), 'active':m.get('active'), 'updated_at':m.get('updatedAt')})
-        return {'event_title':event.get('title'), 'event_slug':event.get('slug'), 'event_url':f"https://polymarket.com/event/{event.get('slug')}" if event.get('slug') else POLY_FED_PAGE, 'markets':rows[:8], 'source':'Polymarket', 'source_url':POLY_FED_PAGE, 'as_of':datetime.now(timezone.utc).isoformat(), 'errors':errors}
+                rows.append({'question':m.get('question'), 'question_zh':_zh_poly_question(m.get('question')), 'slug':m.get('slug'), 'url':f"https://polymarket.com/event/{m.get('slug')}" if m.get('slug') else None, 'probabilities':[dict(x, outcome_zh=_zh_poly_outcome(x.get('outcome'))) for x in probs], 'volume':_num(m.get('volume')), 'volume_24h':_num(m.get('volume24hr')), 'liquidity':_num(m.get('liquidity')), 'active':m.get('active'), 'updated_at':m.get('updatedAt')})
+        return {'event_title':event.get('title'), 'event_title_zh':'美联储利率决定市场预期', 'event_slug':event.get('slug'), 'event_url':f"https://polymarket.com/event/{event.get('slug')}" if event.get('slug') else POLY_FED_PAGE, 'markets':rows[:8], 'source':'Polymarket', 'source_url':POLY_FED_PAGE, 'as_of':datetime.now(timezone.utc).isoformat(), 'errors':errors}
     return _cached_get('polymarket:fed', load, ttl=180)
 
 

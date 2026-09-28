@@ -15,7 +15,7 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 from pro_options import router as pro_options_router
 from pro_factor import analyze_factor
-from pro_risk import analyze_risk
+from pro_risk import analyze_risk, analyze_portfolio
 from pro_macro import analyze_macro
 
 BASE = Path(__file__).resolve().parent
@@ -134,6 +134,22 @@ def pro_risk_analyze(symbol: str, benchmark: str = Query('SPY'), period: str = Q
         return analyze_risk(symbol, benchmark, period)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'Risk Lab 数据获取失败：{exc}')
+
+
+@app.get('/api/pro/risk/portfolio')
+def pro_risk_portfolio(
+    symbols: str = Query(..., min_length=1),
+    weights: str = Query('', description='逗号分隔权重；留空则等权'),
+    benchmark: str = Query('SPY'),
+    period: str = Query('2y', pattern='^(1y|2y|5y|max)$'),
+    capital: float | None = Query(None, gt=0),
+):
+    try:
+        syms=[x.strip() for x in symbols.split(',') if x.strip()]
+        ws=None if not weights.strip() else [float(x.strip()) for x in weights.split(',') if x.strip()]
+        return analyze_portfolio(syms, ws, benchmark, period, capital)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'组合风险分析失败：{exc}')
 
 
 @app.get('/api/pro/macro')
