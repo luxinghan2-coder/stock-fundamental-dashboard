@@ -23,7 +23,7 @@ from pro_expectation import analyze_expectation
 from asset_data import get_asset, get_asset_index, get_asset_news
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.21.8-PRO-LITE-EXPECTATION-FIX'
+APP_VERSION = '2.5.21.9-PRO-LITE-MULTIASSET-FALLBACK-FIX'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
