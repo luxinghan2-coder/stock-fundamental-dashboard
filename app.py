@@ -7,6 +7,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 from time import time
+from io import BytesIO
 from datetime import datetime, timezone
 import requests
 import yfinance as yf
@@ -14,8 +15,8 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.8'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.8', version=APP_VERSION)
+APP_VERSION = '2.5.9'
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.9', version=APP_VERSION)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
@@ -32,7 +33,8 @@ DEFAULT_SCAN_UNIVERSE = [
 SCAN_BATCH_SIZE = max(50, min(250, int(os.getenv('AEL_SCAN_BATCH_SIZE', '250'))))
 SCAN_WORKERS = max(1, min(6, int(os.getenv('AEL_SCAN_WORKERS', '4'))))
 SCAN_CACHE_TTL = int(os.getenv('AEL_SCAN_CACHE_TTL', '900'))
-UNIVERSE_CACHE_TTL = int(os.getenv('AEL_UNIVERSE_CACHE_TTL', '3600'))
+UNIVERSE_CACHE_TTL = int(os.getenv('AEL_UNIVERSE_CACHE_TTL', '86400'))
+INDEX_UNIVERSE_CACHE_TTL = int(os.getenv('AEL_INDEX_UNIVERSE_CACHE_TTL', '86400'))
 SCREENER_PAGE_SIZE = 250
 # 0 = follow Yahoo's reported total dynamically; no artificial 12,000-symbol cap.
 # A positive value remains available as an emergency operator override.
@@ -49,8 +51,18 @@ US_OTC_EXCHANGES = {'PNK', 'OQB', 'OQX', 'OTC'}
 
 # V2.5.5: independent sector/industry scan presets. Values are Yahoo Finance
 # screener industry names; one preset may map to multiple industries.
+INDEX_UNIVERSES = {
+    'us': {
+        'label': '道琼斯 + 纳斯达克100 + 标普500',
+        'codes': ['dowjones','nasdaq100','sp500'],
+    },
+    'hk': {'label': '恒生指数成分股', 'codes': ['hsi']},
+    'cn': {'label': '中证500 + 科创板', 'codes': ['csi500'], 'star_from_yahoo': True},
+}
+INDEX_CONSTITUENT_BASE = 'https://yfiua.github.io/index-constituents/constituents-{code}.csv'
+
 SCAN_GROUPS = {
-    'all': {'label': '全市场', 'industries': []},
+    'all': {'label': '核心指数池', 'industries': []},
     'semiconductors': {'label': '半导体', 'industries': ['Semiconductors']},
     'semiconductor_equipment': {'label': '半导体设备', 'industries': ['Semiconductor Equipment & Materials']},
     'software': {'label': '软件', 'industries': ['Software—Application', 'Software—Infrastructure']},
@@ -157,6 +169,67 @@ def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE
         raise RuntimeError('Yahoo screener returned invalid quotes')
     return result
 
+def _extract_symbols_from_table(df, market):
+    symbols=[]
+    for col in df.columns:
+        vals=df[col].astype(str)
+        for v in vals:
+            v=v.strip()
+            if market=='hk':
+                import re
+                m=re.search(r'(?<!\d)(\d{1,5})(?:\.0)?(?!\d)', v)
+                if m:
+                    symbols.append(m.group(1).zfill(4)+'.HK')
+            else:
+                import re
+                m=re.search(r'(?<!\d)([A-Z]{1,5})(?:\.0)?(?![A-Z])', v.upper())
+                if m and m.group(1) not in {'SEHK','NYSE','NASDAQ','SYMBOL','TICKER'}:
+                    symbols.append(m.group(1))
+    return symbols
+
+
+def _fetch_index_universe(market):
+    cache=_UNIVERSE_CACHE.get(('INDEX',market))
+    if cache and time()-cache['ts'] < INDEX_UNIVERSE_CACHE_TTL:
+        return cache['rows']
+    import re
+    symbols=set(); names={}; source_parts=[]
+    cfg=INDEX_UNIVERSES[market]
+    headers={'User-Agent':'AEL/2.5.9 index-universe'}
+    for code in cfg.get('codes',[]):
+        url=INDEX_CONSTITUENT_BASE.format(code=code)
+        try:
+            r=requests.get(url,headers=headers,timeout=12)
+            r.raise_for_status()
+            df=pd.read_csv(BytesIO(r.content),dtype=str)
+            sym_col=next((c for c in df.columns if str(c).lower() in {'symbol','ticker','code'}),df.columns[0])
+            name_col=next((c for c in df.columns if str(c).lower() in {'name','company','security'}),None)
+            for _,row in df.iterrows():
+                sym=str(row.get(sym_col) or '').strip().upper()
+                if not sym: continue
+                symbols.add(sym)
+                if name_col: names[sym]=str(row.get(name_col) or sym)
+            source_parts.append(code)
+        except Exception:
+            continue
+    if market=='cn' and cfg.get('star_from_yahoo'):
+        # STAR Market is defined by the 688xxx Shanghai STAR listing prefix.
+        # This directory call is cached for 24h and is only used to build the
+        # universe; the actual scan still downloads history in batches.
+        try:
+            cn_rows=_discover_market('cn', industries=None)
+            for r in cn_rows:
+                sym=str(r.get('symbol') or '').upper()
+                if re.fullmatch(r'688\d{3}\.SH',sym):
+                    symbols.add(sym); names[sym]=r.get('company') or sym
+            source_parts.append('STAR')
+        except Exception:
+            pass
+    rows=[{'symbol':sym,'company':names.get(sym,sym),'sector':'未分类','industry':'未分类','exchange':'','currency':'','market_cap':None,'market':market,'index_universe':INDEX_UNIVERSES[market]['label']} for sym in sorted(symbols)]
+    _UNIVERSE_CACHE[('INDEX',market)]={'ts':time(),'rows':rows}
+    return rows
+
+
 def _discover_market(region: str, industries=None):
     industries=tuple(industries or ())
     cache_key=(region, industries)
@@ -229,20 +302,36 @@ def _scan_universe(markets: str, group: str = 'all'):
     if override is not None and group == 'all':
         return override, 'environment override', {'us':0,'hk':0,'cn':0}, {'us':0,'hk':0,'cn':0}
     selected=[m.strip().lower() for m in markets.split(',') if m.strip() in {'us','hk','cn'}]
-    if not selected: selected=['us','hk','cn']
+    if not selected: selected=['us']
     group_cfg=SCAN_GROUPS.get(group, SCAN_GROUPS['all'])
     industries=group_cfg['industries']
     rows=[]; otc_counts={'us':0,'hk':0,'cn':0}; cap_rejected={'us':0,'hk':0,'cn':0}
     for mk in selected:
-        market_rows=_discover_market(mk, industries=industries)
-        primary, otc, rejected_cap = _filter_primary_universe(market_rows, mk)
-        otc_counts[mk]=len(otc); cap_rejected[mk]=rejected_cap
-        for r in primary:
-            r=dict(r); r['market']=mk; rows.append(r)
-    source='Yahoo Finance screener directory → market-cap filter → OTC isolation'
-    if industries: source='Yahoo Finance industry screener → market-cap filter → OTC isolation'
+        if industries:
+            # Sector scans are still bounded by the selected core-index universe.
+            # This prevents a 'semiconductor' scan from silently expanding back
+            # to thousands of unrelated small-cap/OTC names.
+            core=_fetch_index_universe(mk)
+            core_symbols={r['symbol'] for r in core}
+            market_rows=[r for r in _discover_market(mk, industries=industries) if r.get('symbol') in core_symbols]
+            primary, otc, rejected_cap = _filter_primary_universe(market_rows, mk)
+            otc_counts[mk]=len(otc); cap_rejected[mk]=rejected_cap
+            rows.extend(primary)
+        else:
+            # Fixed core-index universe: membership itself is the primary
+            # filter. We intentionally do NOT run the broad market-cap
+            # directory here; that would undo the speed benefit of the index
+            # universe. Index membership is refreshed/cached daily.
+            market_rows=_fetch_index_universe(mk)
+            for r in market_rows:
+                if mk=='us' and _is_us_otc(r):
+                    otc_counts[mk]+=1; continue
+                x=dict(r); x['market']=mk; rows.append(x)
+    if industries:
+        source='Yahoo Finance industry screener → market-cap filter → OTC isolation'
+    else:
+        source='固定核心指数成分池 → 批量历史行情 → ROE硬门槛'
     return rows, source, otc_counts, cap_rejected
-
 
 def _fundamental_gate(symbol):
     """Fast Lite fundamental gate: real Yahoo ROE only, with a hard threshold.
@@ -567,7 +656,7 @@ def _run_scan_job(job):
             if not cancelled:
                 _SCAN_CACHE[cache_key]={'ts':time(),'data':{
                     'ok':True,'scan':{'markets':job['selected_markets'],'universe_size':job['total'],'matched':sum(len(v) for v in ranked.values()),
-                                     'top_n':20,'rules':'市值/OTC过滤→批量历史行情→高性价比50%+动能50%→ROE硬门槛→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
+                                     'top_n':20,'rules':'核心指数成分池→批量历史行情→高性价比50%+动能50%→ROE硬门槛→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
                                      'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% (hard gate)'},
             'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
