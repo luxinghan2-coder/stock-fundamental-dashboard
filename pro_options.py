@@ -226,14 +226,68 @@ def _money(v: Any) -> float | None:
     return x if x is not None and x >= 0 else None
 
 
-def _strategy_score(row: dict[str, Any], strategy: str) -> tuple[float, dict[str, Any]]:
+def _personalized_delta_profile(
+    strategy: str,
+    risk_profile: str = "balanced",
+    market_view: str = "neutral",
+    assignment_tolerance: str = "medium",
+) -> dict[str, Any]:
+    """Generate a user-facing research Delta target from explicit preferences.
+
+    This is a parameter recommendation, not a probability estimate and not a
+    trading instruction. The calculation is deliberately deterministic and
+    transparent so the user can reproduce it.
+    """
+    risk = str(risk_profile or "balanced").lower()
+    view = str(market_view or "neutral").lower()
+    assignment = str(assignment_tolerance or "medium").lower()
+    if risk not in {"conservative", "balanced", "aggressive"}:
+        risk = "balanced"
+    if view not in {"bullish", "neutral", "bearish"}:
+        view = "neutral"
+    if assignment not in {"low", "medium", "high"}:
+        assignment = "medium"
+
+    base = {"conservative": 0.18, "balanced": 0.25, "aggressive": 0.32}[risk]
+    if strategy == "CSP":
+        view_adj = {"bullish": 0.035, "neutral": 0.0, "bearish": -0.035}[view]
+    else:
+        view_adj = {"bullish": -0.035, "neutral": 0.0, "bearish": 0.035}[view]
+    assignment_adj = {"low": -0.05, "medium": 0.0, "high": 0.05}[assignment]
+    width = {"conservative": 0.04, "balanced": 0.05, "aggressive": 0.06}[risk]
+    center = max(0.10, min(0.45, base + view_adj + assignment_adj))
+    lo = max(0.05, center - width)
+    hi = min(0.50, center + width)
+    signed_center = -center if strategy == "CSP" else center
+    signed_lo = -hi if strategy == "CSP" else lo
+    signed_hi = -lo if strategy == "CSP" else hi
+    return {
+        "strategy": strategy,
+        "risk_profile": risk,
+        "market_view": view,
+        "assignment_tolerance": assignment,
+        "target_abs": round(center, 3),
+        "target_delta": round(signed_center, 3),
+        "range_abs": [round(lo, 3), round(hi, 3)],
+        "range_delta": [round(signed_lo, 3), round(signed_hi, 3)],
+        "width": round(width, 3),
+        "method": "风险偏好 + 标的观点 + 被指派/行权接受度；DTE作为时间过滤，不直接奖励更短期限。",
+        "note": "仅为个性化研究参数，不代表真实概率、保证金要求或交易建议。",
+    }
+
+
+def _strategy_score(row: dict[str, Any], strategy: str, delta_target_abs: float | None = None) -> tuple[float, dict[str, Any]]:
     """Transparent research score; DTE is a filter, not a reward.
 
     Priority follows the original cockpit: capital-return quality + IV first,
     then Delta, liquidity and spread. Missing factors are excluded from the
     denominator instead of being silently converted to zero.
     """
-    target_delta = -0.25 if strategy == "CSP" else 0.25
+    target_abs = _finite(delta_target_abs)
+    if target_abs is None:
+        target_abs = 0.25
+    target_abs = _clamp(target_abs, 0.05, 0.80)
+    target_delta = -target_abs if strategy == "CSP" else target_abs
     components: list[tuple[str, float, float | None]] = []
 
     net_ann = _finite(row.get("net_annualized_yield"))
@@ -267,7 +321,7 @@ def _strategy_score(row: dict[str, Any], strategy: str) -> tuple[float, dict[str
     breakdown = {
         "weights": {k: w for k, w, _ in components},
         "normalized": {k: round(v, 1) for k, _, v in components if v is not None},
-        "formula": "资金回报30% + IV25% + Delta15% + 流动性15% + 买卖价差15%；缺失因子按剩余权重归一化。DTE仅作筛选条件。",
+        "formula": "资金回报30% + IV25% + Delta15% + 流动性15% + 买卖价差15%；缺失因子按剩余权重归一化。Delta目标由个性化引擎提供，DTE仅作时间过滤。",
         "weight_coverage": round(weight_total, 1),
     }
     return (round(score, 1) if score is not None else None), breakdown
@@ -427,10 +481,17 @@ def pro_options_scanner(
     margin_mode: str = Query("ratio"),
     margin_value: float = Query(25.0, ge=0, le=100),
     limit: int = Query(20, ge=1, le=100),
+    delta_target_abs: float | None = Query(None, ge=0.05, le=0.80),
+    risk_profile: str = Query("balanced"),
+    market_view: str = Query("neutral"),
+    assignment_tolerance: str = Query("medium"),
 ):
     strategy = strategy.upper()
     if strategy not in {"CSP", "CC"}:
         raise HTTPException(status_code=400, detail="strategy 只能是 CSP / CC")
+    delta_profile = _personalized_delta_profile(strategy, risk_profile, market_view, assignment_tolerance)
+    if delta_target_abs is None:
+        delta_target_abs = float(delta_profile["target_abs"])
     margin_mode = margin_mode.lower()
     if margin_mode not in {"ratio", "fixed", "cash"}:
         raise HTTPException(status_code=400, detail="margin_mode 只能是 ratio / fixed / cash")
@@ -453,7 +514,7 @@ def pro_options_scanner(
         status, reasons = _opening_status(row, strategy)
         row["opening_status"] = status
         row["opening_reasons"] = reasons
-        score, breakdown = _strategy_score(row, strategy)
+        score, breakdown = _strategy_score(row, strategy, delta_target_abs)
         row["strategy_score"] = score
         row["score_breakdown"] = breakdown
 
@@ -464,7 +525,8 @@ def pro_options_scanner(
     ))
     data["results"] = rows[:limit]
     data["strategy"] = strategy
-    data["strategy_formula"] = "资金回报30% + IV25% + Delta15% + 流动性15% + 买卖价差15%；缺失因子按剩余权重归一化。DTE仅作筛选条件。"
+    data["delta_profile"] = {**delta_profile, "target_abs": round(float(delta_target_abs), 3), "target_delta": (-float(delta_target_abs) if strategy == "CSP" else float(delta_target_abs)), "personalized": True}
+    data["strategy_formula"] = "资金回报30% + IV25% + Delta15% + 流动性15% + 买卖价差15%；缺失因子按剩余权重归一化。Delta与用户个性化目标的贴合度占15%，DTE仅作时间过滤。"
     data["fee_model"] = {"fee_open": fee_open, "fee_close": fee_close, "fees_total": fee_open + fee_close}
     data["capital_model"] = {
         "mode": margin_mode,
@@ -484,6 +546,7 @@ def pro_options_scanner(
         "delta_available": sum(1 for r in rows if r.get("delta") is not None),
         "quotes_available": sum(1 for r in rows if r.get("bid") is not None and r.get("ask") is not None),
         "greeks_available": sum(1 for r in rows if any(r.get(k) is not None for k in ("delta","gamma","theta","vega","rho"))),
+        "iv_source_note": "IV/Greeks 仅采用 Alpaca 返回值；缺失不估算。",
     }
     return data
 

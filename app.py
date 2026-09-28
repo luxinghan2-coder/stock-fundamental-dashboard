@@ -16,7 +16,7 @@ from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot
 from pro_options import router as pro_options_router
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.13-PRO'
+APP_VERSION = '2.5.15-PRO'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
