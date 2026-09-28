@@ -100,10 +100,12 @@ def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE
     if size < 1 or size > 250:
         raise ValueError('Yahoo screener page size must be between 1 and 250')
     try:
-        query = yf.EquityQuery('and', [
-            yf.EquityQuery('eq', ['region', region.lower()]),
-            yf.EquityQuery('eq', ['quoteType', 'EQUITY']),
-        ])
+        # EquityQuery is already an equity screener; `quoteType` is not a
+        # valid EquityQuery field in current yfinance and causes Railway to
+        # fail before the request is sent. Region is sufficient to scope the
+        # equity universe, while the screener endpoint itself returns equity
+        # quotes.
+        query = yf.EquityQuery('eq', ['region', region.lower()])
         result = yf.screen(
             query,
             offset=int(offset),
