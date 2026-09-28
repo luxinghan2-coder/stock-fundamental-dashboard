@@ -16,6 +16,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# Per-process calibration cache. Backtest is opt-in and never runs on the main Whisper path.
+_CALIBRATION_CACHE = {}
+
 
 def _finite(v):
     try:
@@ -61,7 +64,9 @@ def _ael_historical_estimate(consensus: float, prior_errors: List[float]) -> flo
 def _error_pct(pred: Optional[float], actual: Optional[float]) -> Optional[float]:
     if pred is None or actual is None or actual == 0:
         return None
-    return (pred / actual - 1.0) * 100.0
+    # Normalize by |actual| so negative EPS does not invert the meaning of
+    # forecast error. This remains a relative error metric, not a probability.
+    return (pred - actual) / abs(actual) * 100.0
 
 
 def _mae(values):
@@ -101,12 +106,72 @@ def _metric_block(preds, actuals):
     }
 
 
+def _beat_signal(pred, consensus, actual):
+    if pred is None or consensus is None or actual is None:
+        return None
+    # AEL Whisper signals a beat when its estimate is above Consensus; the
+    # realized outcome is a beat when Actual is above Consensus.
+    predicted_beat = pred > consensus
+    actual_beat = actual > consensus
+    return predicted_beat == actual_beat
+
+
+def _beat_metrics(rows, pred_key, consensus_key, actual_key):
+    vals=[_beat_signal(r.get(pred_key), r.get(consensus_key), r.get(actual_key)) for r in rows]
+    vals=[x for x in vals if x is not None]
+    return {"n":len(vals),"accuracy_pct":(sum(vals)/len(vals)*100.0) if vals else None}
+
+
 def _safe_dates(symbol: str, limit: int):
     t = yf.Ticker(symbol)
     d = t.get_earnings_dates(limit=limit)
     if d is None or d.empty:
         return pd.DataFrame()
     return d
+
+
+def _calibration_from_metrics(eps_c, eps_w, rev_c, rev_w, valid_n):
+    """Turn historical replay into a calibration score, not a probability.
+
+    The score rewards: (1) enough valid samples, (2) lower Whisper error than
+    Consensus, and (3) lower dispersion. It is intentionally capped below 100
+    and is never presented as a probability of correctness.
+    """
+    if valid_n < 8:
+        return None, "INSUFFICIENT"
+    improvements = [
+        x for x in (
+            _improvement(eps_c.get("mae_pct"), eps_w.get("mae_pct")),
+            _improvement(rev_c.get("mae_pct"), rev_w.get("mae_pct")),
+        ) if x is not None and math.isfinite(x)
+    ]
+    mean_improve = float(np.mean(improvements)) if improvements else 0.0
+    dispersions = [
+        x for x in (eps_w.get("rmse_pct"), rev_w.get("rmse_pct"))
+        if x is not None and math.isfinite(x)
+    ]
+    dispersion = float(np.mean(dispersions)) if dispersions else None
+
+    # Sample confidence: 8 samples starts the scale; 20+ saturates this term.
+    sample_score = 30.0 + 20.0 * min(1.0, (valid_n - 8) / 12.0)
+    # Stability: lower RMSE receives more points, with 20% error as a neutral
+    # midpoint. This is deliberately conservative.
+    stability_score = 30.0 if dispersion is None else _clamp(36.0 - dispersion * 0.75, 8.0, 30.0)
+    # Improvement can help or hurt, but cannot dominate the score.
+    improvement_score = _clamp(20.0 + mean_improve * 0.45, 5.0, 30.0)
+    score = int(round(_clamp(sample_score + stability_score + improvement_score, 0.0, 100.0)))
+    label = "HIGH" if score >= 75 else ("MEDIUM" if score >= 55 else "LOW")
+    return score, label
+
+
+def _improvement(base, model):
+    if base is None or model is None or base <= 0:
+        return None
+    return (1.0 - model / base) * 100.0
+
+
+def get_cached_calibration(symbol: str):
+    return _CALIBRATION_CACHE.get(str(symbol or "").strip().upper())
 
 
 def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
@@ -123,30 +188,33 @@ def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
     if d.empty:
         return {"ok": False, "symbol": requested, "error": "公开财报历史不足，无法建立回测样本"}
 
-    rows = []
-    # Yahoo returns newest events first.  Historical replay must use only rows
-    # older than the event being replayed, never the event's own surprise.
-    prior_eps_errors: List[float] = []
-    prior_rev_errors: List[float] = []
-
+    # Yahoo returns newest-first. Build a chronological list first, then replay
+    # each event using only estimates/errors from strictly OLDER events.
+    raw_rows = []
     for idx, r in d.iterrows():
-        if len(rows) >= quarters:
-            break
         eps_est = _num(r, "EPS Estimate", "EPS Estimate (GAAP)", "Estimate")
         eps_actual = _num(r, "Reported EPS", "Reported EPS (GAAP)", "Actual")
         rev_est = _num(r, "Revenue Estimate", "Revenue Est.", "Revenue Estimate (GAAP)")
         rev_actual = _num(r, "Reported Revenue", "Revenue", "Actual Revenue")
-        surprise = _num(r, "Surprise(%)", "surprisePercent", "Surprise")
         try:
-            event_date = pd.Timestamp(idx).isoformat()
+            event_ts = pd.Timestamp(idx)
         except Exception:
-            event_date = str(idx)
+            event_ts = pd.Timestamp.utcnow()
+        raw_rows.append((event_ts, eps_est, eps_actual, rev_est, rev_actual))
 
+    raw_rows.sort(key=lambda x: x[0])
+    raw_rows = raw_rows[-quarters:]
+
+    rows = []
+    prior_eps_errors: List[float] = []
+    prior_rev_errors: List[float] = []
+
+    for event_ts, eps_est, eps_actual, rev_est, rev_actual in raw_rows:
+        # Only older events contribute to this event's reconstructed bias.
         eps_whisper = _ael_historical_estimate(eps_est, prior_eps_errors) if eps_est is not None else None
         rev_whisper = _ael_historical_estimate(rev_est, prior_rev_errors) if rev_est is not None else None
-
         row = {
-            "event_date": event_date,
+            "event_date": event_ts.isoformat(),
             "eps_consensus": eps_est,
             "eps_whisper": eps_whisper,
             "eps_actual": eps_actual,
@@ -162,83 +230,50 @@ def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
             "market_implied_historical": False,
         }
         rows.append(row)
-
-        # Only after the current event has been replayed may its surprise enter
-        # the next older/chronologically later model state. Since the API is
-        # newest-first, prepend current error for the next iteration.
         if eps_est is not None and eps_actual is not None:
-            prior_eps_errors.insert(0, _error_pct(eps_est, eps_actual))
+            prior_eps_errors.append(_error_pct(eps_est, eps_actual))
         if rev_est is not None and rev_actual is not None:
-            prior_rev_errors.insert(0, _error_pct(rev_est, rev_actual))
+            prior_rev_errors.append(_error_pct(rev_est, rev_actual))
 
     eps_rows = [r for r in rows if r["eps_consensus"] is not None and r["eps_actual"] is not None]
     rev_rows = [r for r in rows if r["revenue_consensus"] is not None and r["revenue_actual"] is not None]
+    eps_c = _metric_block([r["eps_consensus"] for r in eps_rows], [r["eps_actual"] for r in eps_rows])
+    eps_w = _metric_block([r["eps_whisper"] for r in eps_rows], [r["eps_actual"] for r in eps_rows])
+    rev_c = _metric_block([r["revenue_consensus"] for r in rev_rows], [r["revenue_actual"] for r in rev_rows])
+    rev_w = _metric_block([r["revenue_whisper"] for r in rev_rows], [r["revenue_actual"] for r in rev_rows])
 
-    eps_cons = [r["eps_consensus"] for r in eps_rows]
-    eps_wh = [r["eps_whisper"] for r in eps_rows]
-    eps_act = [r["eps_actual"] for r in eps_rows]
-    rev_cons = [r["revenue_consensus"] for r in rev_rows]
-    rev_wh = [r["revenue_whisper"] for r in rev_rows]
-    rev_act = [r["revenue_actual"] for r in rev_rows]
-
-    eps_c = _metric_block(eps_cons, eps_act)
-    eps_w = _metric_block(eps_wh, eps_act)
-    rev_c = _metric_block(rev_cons, rev_act)
-    rev_w = _metric_block(rev_wh, rev_act)
-
-    def improvement(base, model):
-        if base is None or model is None or base == 0:
-            return None
-        return (1.0 - model / base) * 100.0
-
-    # Calibration is deliberately not called a probability. It is a historical
-    # stability score based on sample size, error reduction, and dispersion.
     valid_n = max(eps_w["n"], rev_w["n"])
-    eps_improve = improvement(eps_c["mae_pct"], eps_w["mae_pct"])
-    rev_improve = improvement(rev_c["mae_pct"], rev_w["mae_pct"])
-    improvements = [x for x in (eps_improve, rev_improve) if x is not None]
-    mean_improve = float(np.mean(improvements)) if improvements else 0.0
-    dispersion = eps_w.get("rmse_pct") or rev_w.get("rmse_pct") or 20.0
-    sample_score = min(40.0, valid_n * 2.0)
-    stability_score = max(0.0, 30.0 - min(30.0, dispersion))
-    improvement_score = _clamp(30.0 + mean_improve * 0.5, 0.0, 30.0)
-    calibration = int(round(_clamp(sample_score + stability_score + improvement_score, 0.0, 100.0))) if valid_n else None
+    calibration, label = _calibration_from_metrics(eps_c, eps_w, rev_c, rev_w, valid_n)
+    eps_improve = _improvement(eps_c["mae_pct"], eps_w["mae_pct"])
+    rev_improve = _improvement(rev_c["mae_pct"], rev_w["mae_pct"])
+    eps_beat = _beat_metrics(rows, "eps_whisper", "eps_consensus", "eps_actual")
+    rev_beat = _beat_metrics(rows, "revenue_whisper", "revenue_consensus", "revenue_actual")
 
-    # Historical Market-Implied cannot be honestly reconstructed from today's
-    # Yahoo endpoint because historical option IV/skew snapshots are not exposed.
-    # Keep this explicit instead of fabricating a backtest.
-    return {
+    result = {
         "ok": True,
         "symbol": requested,
         "as_of": datetime.now(timezone.utc).isoformat(),
-        "model": "AEL Whisper Backtest v2.6.4",
+        "model": "AEL Whisper Backtest v2.6.5",
         "periods_requested": quarters,
         "periods_returned": len(rows),
         "point_in_time_integrity": {
-            "status": "public-history-replay",
+            "status": "chronological-public-history-replay",
             "future_actual_used_for_current_row": False,
-            "note": "历史估计值必须由公开 earnings-history endpoint 提供；缺失值不回填、不用今天的修订值伪装成过去数据。"
+            "status_detail": "每个历史事件只使用更早事件的误差来构建历史 Bias；当前事件的 Actual 在预测后才进入下一期。",
+            "limitation": "Yahoo earnings-history 是公开历史快照，但并不保证保存所有当时的分析师修订版本，因此这不是完整 sell-side point-in-time 数据库。"
         },
-        "eps": {
-            "consensus": eps_c,
-            "ael_whisper": eps_w,
-            "whisper_edge_pct": eps_improve,
-        },
-        "revenue": {
-            "consensus": rev_c,
-            "ael_whisper": rev_w,
-            "whisper_edge_pct": rev_improve,
-        },
+        "eps": {"consensus": eps_c, "ael_whisper": eps_w, "whisper_edge_pct": eps_improve, "beat_miss_accuracy_pct": eps_beat["accuracy_pct"], "beat_miss_samples": eps_beat["n"]},
+        "revenue": {"consensus": rev_c, "ael_whisper": rev_w, "whisper_edge_pct": rev_improve, "beat_miss_accuracy_pct": rev_beat["accuracy_pct"], "beat_miss_samples": rev_beat["n"]},
         "historical_market_implied": {
             "available": False,
             "reason": "公开 Yahoo 历史接口未提供可验证的逐财报历史期权 IV/skew 快照；AEL 不用今天的期权数据倒填过去。"
         },
         "calibration": {
             "score": calibration,
-            "label": "HIGH" if calibration is not None and calibration >= 75 else ("MEDIUM" if calibration is not None and calibration >= 55 else ("LOW" if calibration is not None else "INSUFFICIENT")),
+            "label": label,
             "valid_samples": valid_n,
-            "mean_whisper_edge_pct": mean_improve if improvements else None,
-            "interpretation": "历史校准分数，不是预测正确概率；用于辅助当前 Model Confidence。"
+            "mean_whisper_edge_pct": float(np.mean([x for x in (eps_improve, rev_improve) if x is not None])) if any(x is not None for x in (eps_improve, rev_improve)) else None,
+            "interpretation": "历史校准分数，不是预测正确概率；只有完成本次回测后才允许反哺当前 Whisper 的 Calibrated Confidence。"
         },
         "rows": rows,
         "source_status": {
@@ -248,3 +283,17 @@ def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
             "excluded_rows": len(rows) - valid_n,
         }
     }
+    # Cache only a completed calibration result. This is the bridge from the
+    # optional Backtest Lab to the live Confidence field; no backtest runs on
+    # the normal Whisper request.
+    _CALIBRATION_CACHE[requested] = {
+        "score": calibration,
+        "label": label,
+        "valid_samples": valid_n,
+        "mean_whisper_edge_pct": result["calibration"]["mean_whisper_edge_pct"],
+        "as_of": result["as_of"],
+        "source": result["source_status"]["source"],
+        "point_in_time_status": result["point_in_time_integrity"]["status"],
+    }
+    return result
+

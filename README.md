@@ -1,3 +1,10 @@
+# AEL V2.6.5 — MARKET-IMPLIED WHISPER
+
+本版在 V2.6.2 Smart Quarter Resolver 基础上加入公司级 Analyst Bias 校准。
+
+三层：SELL-SIDE CONSENSUS → AEL WHISPER → AEL MARKET-IMPLIED。
+
+AEL Whisper 不声称读取私人 Earnings Whispers 数据；它用公开 consensus、近期 revision、guidance、经收缩的历史共识偏差和 fundamental nowcast 模拟 analyst-like expectation。
 # AEL V2.5.19.2｜Pro 宏观 / Fed / 市场预期版
 
 ## 这一版做什么
@@ -51,3 +58,21 @@ ZIP 已按上传便利性排序：
 - Missing token, timeout, empty data, or source failure affects only the ATS evidence card; other Pro/Lite data continues normally.
 
 - V2.5.24: Buy-Side Expectation expanded with free/public earnings-trend, SEC 13F quarterly evidence, optional free-key Alpha Vantage/Finnhub earnings evidence, explicit not-applicable states, and source-status diagnostics. These sources are isolated from Lite and are not used to fabricate private buy-side order books.
+
+## V2.6.4 — Whisper Backtest & Calibration
+
+The Whisper module now has an isolated historical validation layer:
+
+- `GET /api/pro/whisper/backtest/{symbol}?quarters=20`
+- Consensus vs AEL Whisper vs Actual
+- EPS / Revenue MAE, MAPE, RMSE
+- Whisper Edge (error reduction versus consensus)
+- Historical Calibration score (not a probability)
+- Point-in-time replay guard and explicit exclusion of missing historical estimates
+- Historical Market-Implied is not fabricated when verifiable historical option snapshots are unavailable
+
+The backtest is optional and never runs on Lite, SINGLE, or MARKET SCAN requests.
+
+
+## V2.6.5 Confidence
+The Whisper confidence field is now uncalibrated until the user explicitly runs the historical Whisper Backtest Lab. Historical Calibration is a score, not a probability. The completed backtest feeds an isolated calibration cache; the live Whisper endpoint reads that cache without launching a historical backtest, preserving Lite/SINGLE/MARKET SCAN latency.

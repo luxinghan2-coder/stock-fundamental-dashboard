@@ -155,7 +155,8 @@ def pro_whisper_backtest(
     quarters: int = Query(20, ge=8, le=40),
 ):
     # Optional validation layer. It never runs on the normal Whisper request and
-    # never participates in Lite/SINGLE/MARKET SCAN.
+    # never participates in Lite/SINGLE/MARKET SCAN. A completed run updates the
+    # in-process calibration cache consumed by the live Confidence field.
     try:
         return run_whisper_backtest(symbol, quarters)
     except Exception as exc:

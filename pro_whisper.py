@@ -797,12 +797,22 @@ def _market_implied_adjustment(whisper, market, hist, kind):
     return whisper*(1+adj/100),[{"factor":n,"contribution_pct":round(v*w/sum(ww for _,_,ww in parts),3)} for n,v,w in parts]
 
 
-def _confidence(evidence_n,market_available,base_source,exact_ew=False):
+def _data_quality_score(evidence_n,market_available,base_source,exact_ew=False):
+    """Current-input quality only; never presented as prediction confidence."""
     score=42+min(20,evidence_n*4)
     if market_available:score+=12
     if base_source and base_source not in ("AEL fundamental nowcast","AEL historical-quarter model"):score+=14
     if exact_ew:score+=10
     return int(_clamp(score,42,96))
+
+
+def _calibrated_confidence(calibration, data_quality):
+    """Use completed historical calibration; no cache means no numeric confidence."""
+    if not calibration or calibration.get("score") is None:
+        return None
+    cal=float(calibration.get("score"))
+    dq=float(data_quality) if data_quality is not None else 70.0
+    return int(round(_clamp(cal*0.72 + dq*0.28, 35, 95)))
 
 
 def analyze_whisper(symbol):
@@ -843,10 +853,21 @@ def analyze_whisper(symbol):
     rev_pricein=(rev_implied/rev_cons-1)*100 if rev_implied is not None and rev_cons else None
     exact_ew=bool(_env("EW_API_KEY") and any(x.get("source")=="Earnings Whispers Data API" and x.get("available") and x.get("period_validated") for x in cons.get("results",[])))
     ew=next((x for x in cons.get("results",[]) if x.get("source")=="Earnings Whispers Data API" and x.get("available") and x.get("period_validated")),{})
-    confidence=max(_confidence(len(eps_wparts)+len(eps_mparts),market.get("available"),eps_base_source,exact_ew),_confidence(len(rev_wparts)+len(rev_mparts),market.get("available"),rev_base_source,exact_ew))
+    data_quality=max(_data_quality_score(len(eps_wparts)+len(eps_mparts),market.get("available"),eps_base_source,exact_ew),_data_quality_score(len(rev_wparts)+len(rev_mparts),market.get("available"),rev_base_source,exact_ew))
+    # Backtest is opt-in. Only a previously completed calibration is read here;
+    # the live Whisper request never launches historical work.
+    try:
+        from pro_whisper_backtest import get_cached_calibration
+        calibration=get_cached_calibration(requested)
+    except Exception:
+        calibration=None
+    confidence=_calibrated_confidence(calibration,data_quality)
     out={
       "ok":True,"symbol":requested,"as_of":datetime.now(timezone.utc).isoformat(),"next_earnings_date":earnings_date,
-      "model":"AEL Market-Implied Whisper v2.6.3 Calibration","status":"inferred","confidence_pct":confidence,
+      "model":"AEL Market-Implied Whisper v2.6.5 Calibrated Confidence","status":"inferred","confidence_pct":confidence,
+      "confidence_status":"calibrated" if confidence is not None else "not_calibrated",
+      "data_quality_pct":data_quality,
+      "historical_calibration":calibration,
       "target_period":target_period.get("target_end"),"last_actual_period":target_period.get("last_actual_end"),"period_lock":"smart-strict","days_to_earnings":days_to_earnings,
       "data_mode":"observed-consensus→AEL-whisper→market-implied" if (eps_cons is not None or rev_cons is not None) else "fundamental-nowcast→AEL-whisper→market-implied",
       "revenue":{"consensus":rev_cons,"base":rev_base,"whisper":rev_whisper,"implied":rev_implied,"whisper_premium_pct":(rev_whisper/rev_cons-1)*100 if rev_whisper is not None and rev_cons else None,"pricein_pct":rev_pricein,"base_source":rev_base_source,"low":rev_src.get("revenue_low"),"high":rev_src.get("revenue_high"),"whisper_evidence":rev_wparts,"market_evidence":rev_mparts,"status":"inferred","reason":"共识 → 修正 → 指引定位 → 基本面Nowcast → 市场价格/期权Price-in。"},
