@@ -13,8 +13,8 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.1'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.1', version=APP_VERSION)
+APP_VERSION = '2.5.2'
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.2', version=APP_VERSION)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
@@ -90,33 +90,35 @@ def _scan_universe_override(markets: str):
 
 
 def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE_SIZE):
-    """Fetch one Yahoo custom-equity screener page.
+    """Fetch one Yahoo equity-screener page through yfinance's managed session.
 
-    Yahoo's custom screener supports offset pagination. This is used only to
-    discover the market directory; technical history is fetched separately in
-    batches. If Yahoo changes/blocks this endpoint, the scanner reports the
-    discovery failure instead of silently pretending that a tiny universe is
-    the whole market.
+    Do not call query2.finance.yahoo.com directly here. Yahoo binds crumb to
+    the cookie/session that obtained it; yfinance's YfData manages that pair.
+    This is especially important on stateless Railway containers, where a
+    manually assembled crumb/cookie request can return HTTP 401 Invalid Crumb.
     """
-    url='https://query2.finance.yahoo.com/v1/finance/screener'
-    body={
-        'offset': int(offset), 'size': int(size), 'sortField':'ticker', 'sortType':'ASC',
-        'quoteType':'EQUITY',
-        'query': {'operator':'and','operands':[
-            {'operator':'eq','operands':['region', region]},
-            {'operator':'eq','operands':['quoteType','EQUITY']},
-        ]},
-        'userId':'','userIdType':'guid'
-    }
-    r=requests.post(url, params={'corsDomain':'finance.yahoo.com','formatted':'false','lang':'en-US','region':region.upper()},
-                    json=body, headers={'User-Agent':'Mozilla/5.0'}, timeout=20)
-    r.raise_for_status()
-    payload=r.json()
-    result=((payload.get('finance') or {}).get('result') or [])
-    if not result:
-        raise RuntimeError('Yahoo screener returned no result')
-    return result[0]
-
+    if size < 1 or size > 250:
+        raise ValueError('Yahoo screener page size must be between 1 and 250')
+    try:
+        query = yf.EquityQuery('and', [
+            yf.EquityQuery('eq', ['region', region.lower()]),
+            yf.EquityQuery('eq', ['quoteType', 'EQUITY']),
+        ])
+        result = yf.screen(
+            query,
+            offset=int(offset),
+            size=int(size),
+            sortField='ticker',
+            sortAsc=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f'Yahoo screener authentication/query failed: {exc}') from exc
+    if not isinstance(result, dict):
+        raise RuntimeError('Yahoo screener returned an invalid response')
+    quotes = result.get('quotes') or []
+    if not isinstance(quotes, list):
+        raise RuntimeError('Yahoo screener returned invalid quotes')
+    return result
 
 def _discover_market(region: str):
     cache=_UNIVERSE_CACHE.get(region)
@@ -164,7 +166,7 @@ def _scan_universe(markets: str):
         market_rows=_discover_market(regions[mk])
         for r in market_rows:
             r=dict(r); r['market']=mk; rows.append(r)
-    return rows, 'Yahoo Finance screener directory'
+    return rows, 'Yahoo Finance screener directory via yfinance-managed session'
 
 
 def _extract_history(frame, symbol):
