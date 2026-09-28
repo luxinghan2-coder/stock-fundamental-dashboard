@@ -356,7 +356,7 @@ body.ael-force-mobile .ael-pro-option-card{width:100%;min-width:0}
 <script>
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
 const ASSET_INDEX=[
- {symbol:'XAUUSD',provider_symbol:'XAUUSD=X',name:'Gold Spot / USD',cn:'黄金',asset_type:'商品',market:'Spot',currency:'USD',icon:'🥇'},
+ {symbol:'XAUUSD',provider_symbol:'GC=F',provider_fallbacks:['XAUUSD=X'],name:'Gold Futures / USD',cn:'黄金',asset_type:'商品',market:'Spot',currency:'USD',icon:'🥇'},
  {symbol:'XAGUSD',provider_symbol:'SI=F',name:'Silver Spot / USD',cn:'白银',asset_type:'商品',market:'Spot',currency:'USD',icon:'🥈'},
  {symbol:'WTI',provider_symbol:'CL=F',name:'WTI Crude Oil',cn:'WTI原油',asset_type:'商品',market:'NYMEX',currency:'USD',icon:'🛢️'},
  {symbol:'BRENT',provider_symbol:'BZ=F',name:'Brent Crude Oil',cn:'布伦特原油',asset_type:'商品',market:'ICE',currency:'USD',icon:'🛢️'},
