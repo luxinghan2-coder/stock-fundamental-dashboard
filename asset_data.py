@@ -15,11 +15,11 @@ from metrics import technical_analysis, fibonacci_levels, pivot_levels, resonanc
 
 ASSET_INDEX = [
     {"symbol":"XAUUSD","provider_symbol":"XAUUSD=X","name":"Gold Spot / USD","cn":"黄金","asset_type":"商品","market":"Spot","currency":"USD","icon":"🥇"},
-    {"symbol":"SI=F","provider_symbol":"SI=F","name":"Silver Futures","cn":"白银","asset_type":"商品","market":"COMEX","currency":"USD","icon":"🥈"},
+    {"symbol":"XAGUSD","provider_symbol":"SI=F","name":"Silver Spot / USD","cn":"白银","asset_type":"商品","market":"Spot","currency":"USD","icon":"🥈"},
     {"symbol":"WTI","provider_symbol":"CL=F","name":"WTI Crude Oil","cn":"WTI原油","asset_type":"商品","market":"NYMEX","currency":"USD","icon":"🛢️"},
-    {"symbol":"BZ=F","provider_symbol":"BZ=F","name":"Brent Crude Futures","cn":"布伦特原油","asset_type":"商品","market":"ICE","currency":"USD","icon":"🛢️"},
-    {"symbol":"HG=F","provider_symbol":"HG=F","name":"Copper Futures","cn":"铜","asset_type":"商品","market":"COMEX","currency":"USD","icon":"🔶"},
-    {"symbol":"PL=F","provider_symbol":"PL=F","name":"Platinum Futures","cn":"铂金","asset_type":"商品","market":"NYMEX","currency":"USD","icon":"⚪"},
+    {"symbol":"BRENT","provider_symbol":"BZ=F","name":"Brent Crude Oil","cn":"布伦特原油","asset_type":"商品","market":"ICE","currency":"USD","icon":"🛢️"},
+    {"symbol":"COPPER","provider_symbol":"HG=F","name":"Copper Futures","cn":"铜","asset_type":"商品","market":"COMEX","currency":"USD","icon":"🔶"},
+    {"symbol":"PLATINUM","provider_symbol":"PL=F","name":"Platinum Futures","cn":"铂金","asset_type":"商品","market":"NYMEX","currency":"USD","icon":"⚪"},
     {"symbol":"BTCUSD","provider_symbol":"BTC-USD","name":"Bitcoin / USD","cn":"比特币","asset_type":"加密资产","market":"Crypto","currency":"USD","icon":"₿"},
     {"symbol":"ETHUSD","provider_symbol":"ETH-USD","name":"Ethereum / USD","cn":"以太坊","asset_type":"加密资产","market":"Crypto","currency":"USD","icon":"Ξ"},
     {"symbol":"SOLUSD","provider_symbol":"SOL-USD","name":"Solana / USD","cn":"Solana","asset_type":"加密资产","market":"Crypto","currency":"USD","icon":"S"},
@@ -55,8 +55,8 @@ def find_asset(query):
       'btc':'BTCUSD','bitcoin':'BTCUSD','比特币':'BTCUSD','btcusd':'BTCUSD',
       'eth':'ETHUSD','ethereum':'ETHUSD','ethusd':'ETHUSD',
       '原油期货':'WTI','wti':'WTI','oil':'WTI','crude oil':'WTI','石油':'WTI','原油':'WTI',
-      'brent':'BZ=F','布油':'BZ=F','silver':'SI=F','dxy':'DXY','美元指数':'DXY',
-      '白银期货':'SI=F','copper':'HG=F','platinum':'PL=F',
+      'brent':'BRENT','布油':'BRENT','bz=f':'BRENT','silver':'XAGUSD','dxy':'DXY','美元指数':'DXY',
+      '白银期货':'XAGUSD','si=f':'XAGUSD','copper':'COPPER','hg=f':'COPPER','platinum':'PLATINUM','pl=f':'PLATINUM',
     }
     s=aliases.get(q)
     return next((dict(x) for x in ASSET_INDEX if x['symbol']==s),None) if s else None

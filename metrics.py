@@ -902,36 +902,41 @@ def _morningstar_quote_url(symbol: str, exchange: str | None = None):
         # Yahoo exchange values: NMS/NAS/NASDAQ -> XNAS; NYQ/NYSE -> XNYS.
         mic = 'xnys' if ex in {'NYQ','NYSE','XNYS'} else 'xnas'
         ticker = raw.replace('-', '.')
-    return f'https://www.morningstar.com/stocks/{mic}/{ticker.lower()}/quote'
+    return f'https://www.morningstar.com/stocks/{mic}/{ticker.upper()}/quote.html'
 
 
 def _parse_morningstar_rating(html: str):
     """Best-effort parse of an actually exposed Morningstar stock star rating.
 
-    Morningstar's public page is dynamic and may deliberately hide the numeric
-    rating. We only return a value when the page itself exposes an unambiguous
-    1-5 rating; never infer it from price/fair-value or another provider.
+    The public quote page is dynamic. Try visible text first, then JSON/script
+    payloads used by the page. We only accept explicit Morningstar-specific
+    fields (never a generic analyst rating) and never infer from valuation.
     """
-    text = re.sub(r'\s+', ' ', str(html or ''))
+    raw=str(html or '')
+    text = re.sub(r'\s+', ' ', raw)
     patterns = [
         r'Morningstar\s+Rating(?:\s+for\s+Stocks)?[^0-9]{0,120}([1-5])\s*(?:-?star|stars?)',
         r'Morningstar\s+Rating(?:\s+for\s+Stocks)?[^0-9]{0,80}(★{1,5})',
-        r'"(?:morningstarRating|starRating|rating)"\s*:\s*([1-5])(?:\.0)?(?:,|})',
-        r'"(?:morningstarRating|starRating|overallRating)"\s*:\s*"([1-5])"',
+        r'"(?:morningstarRating|morningStarOverallRating|starRating)"\s*:\s*([1-5])(?:\.0)?(?:,|})',
+        r'"(?:morningstarRating|morningStarOverallRating|starRating)"\s*:\s*"([1-5])"',
     ]
     for pat in patterns:
         m=re.search(pat, text, flags=re.I)
-        if not m:
-            continue
+        if not m: continue
         value=m.group(1)
-        if value.startswith('★'):
-            return len(value)
+        if value.startswith('★'): return len(value)
         try:
             n=int(float(value))
-            if 1 <= n <= 5:
-                return n
-        except Exception:
-            pass
+            if 1 <= n <= 5: return n
+        except Exception: pass
+    # Search script payloads for explicit Morningstar keys. This handles Next.js
+    # / hydration JSON where the visible HTML is only a shell.
+    for keypat in ['morningstarRating','morningStarOverallRating','starRating']:
+        for m in re.finditer(r'"'+re.escape(keypat)+r'"\s*:\s*(?:\{\s*"raw"\s*:\s*)?(\d+(?:\.0)?)', raw, flags=re.I):
+            try:
+                n=int(float(m.group(1)))
+                if 1 <= n <= 5: return n
+            except Exception: pass
     return None
 
 
@@ -946,6 +951,34 @@ def _parse_morningstar_uncertainty(html: str):
             return m.group(1).title()
     return None
 
+
+def _extract_nested_field(obj, names):
+    wanted={str(x).lower() for x in names}
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            if str(k).lower() in wanted:
+                if isinstance(v,dict) and 'raw' in v: return v.get('raw')
+                return v
+            found=_extract_nested_field(v,names)
+            if found is not None:return found
+    elif isinstance(obj,list):
+        for v in obj:
+            found=_extract_nested_field(v,names)
+            if found is not None:return found
+    return None
+
+
+def _yahoo_morningstar_fields(symbol: str):
+    """Fast optional Yahoo quoteSummary fallback for Morningstar fields."""
+    try:
+        url=f'https://query2.finance.yahoo.com/v10/finance/quoteSummary/{requests.utils.quote(clean_symbol(symbol))}'
+        r=requests.get(url,params={'modules':'defaultKeyStatistics,summaryDetail'},headers={'User-Agent':'Mozilla/5.0 (AEL; Morningstar fallback)'},timeout=2.5)
+        r.raise_for_status(); data=r.json() or {}
+        overall=_extract_nested_field(data,['morningStarOverallRating','morningstarOverallRating'])
+        risk=_extract_nested_field(data,['morningStarRiskRating','morningstarRiskRating'])
+        return finite(overall),finite(risk)
+    except Exception:
+        return None,None
 
 def morningstar_stock_rating(symbol: str, exchange: str | None = None):
     """Lazy, cached public-page lookup for Morningstar's stock star rating.
@@ -962,6 +995,15 @@ def morningstar_stock_rating(symbol: str, exchange: str | None = None):
     data={'symbol':clean_symbol(symbol),'rating':None,'uncertainty':None,'available':False,'status':'not_exposed',
           'as_of':None,'url':url,'source':'Morningstar公开股票报价页',
           'note':'仅在公开页面实际暴露1–5星时显示；未暴露时不推断、不补值。'}
+    # First: fast Yahoo quoteSummary fallback. It is independent of the Lite core and
+    # occasionally exposes Morningstar fields even when the public Morningstar page
+    # hides the numeric rating behind client-side rendering/subscription controls.
+    yo,yr=_yahoo_morningstar_fields(symbol)
+    if yo is not None or yr is not None:
+        data.update({'rating':yo,'uncertainty':yr,'available':yo is not None,'status':'yahoo_morningstar_fields','source':'Yahoo Finance Morningstar字段'})
+    if data['available']:
+        _MORNINGSTAR_CACHE[key]={'ts':now,'data':data}
+        return data
     try:
         r=requests.get(url,headers={'User-Agent':'Mozilla/5.0 (AEL; stock research)'},timeout=3.5)
         r.raise_for_status()
@@ -971,7 +1013,6 @@ def morningstar_stock_rating(symbol: str, exchange: str | None = None):
         if rating is not None or uncertainty is not None:
             data.update({'rating':rating,'uncertainty':uncertainty,'available':rating is not None,'status':'available' if rating is not None else 'uncertainty_only','as_of':None})
         else:
-            # Keep a useful diagnostic without surfacing the page body.
             data['status']='page_reachable_rating_not_exposed'
     except Exception as exc:
         data['status']='source_unavailable'

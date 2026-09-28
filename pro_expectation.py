@@ -9,6 +9,7 @@ from time import time
 import math
 import threading
 import os
+import re
 import requests
 import yfinance as yf
 import pandas as pd
@@ -446,23 +447,16 @@ def _next_earnings_dark_source(symbol, ats=None):
             add("财报前5D价格动量", max(-1,min(1,out["pre_event_momentum_5d_pct"]/10.0)), 15)
         if out["pre_event_volume_ratio"] is not None:
             # Volume acceleration is attention, not direction; center it at 1x.
-            add("当前成交量异常（距下一财报仍有时间时作为当前定位代理）", max(-1,min(1,(out["pre_event_volume_ratio"]-1)/1.5)), 10)
+            add("财报前成交量异常", max(-1,min(1,(out["pre_event_volume_ratio"]-1)/1.5)), 10)
         if out["ats_share_change_pct"] is not None:
             # ATS share change = attention/off-exchange activity, not direction.
             add("ATS活动变化", max(-1,min(1,out["ats_share_change_pct"]/5.0)), 10)
         if out["implied_vs_history_ratio"] is not None:
             # Magnitude only; never converts high implied move into bullishness.
             parts.append(("财报隐含/历史波动", max(-1,min(1,(out["implied_vs_history_ratio"]-1))), 20))
-        if parts:
-            # Normalize by the actually observed weights so missing sources do not
-            # mechanically drag the score toward 50. The score is still an event
-            # positioning proxy, not a buy/sell forecast.
-            total_w=sum(w for _,_,w in parts)
-            if total_w>0:
-                score=50.0 + sum(v*w for _,v,w in parts) / total_w * 50.0
         out["expectation_score"]=round(max(0,min(100,score)),1) if parts else None
-        bullish=sum(w for n,v,w in parts if v>0.25 and n not in ("财报隐含/历史波动","当前成交量异常（距下一财报仍有时间时作为当前定位代理）"))
-        bearish=sum(w for n,v,w in parts if v<-0.25 and n not in ("财报隐含/历史波动","当前成交量异常（距下一财报仍有时间时作为当前定位代理）"))
+        bullish=sum(w for n,v,w in parts if v>0.25 and n not in ("财报隐含/历史波动","财报前成交量异常"))
+        bearish=sum(w for n,v,w in parts if v<-0.25 and n not in ("财报隐含/历史波动","财报前成交量异常"))
         out["positioning_bias"]="偏正向" if bullish>=bearish+15 else ("偏负向" if bearish>=bullish+15 else "混合/中性")
         out["decomposition"]=[{"factor":n,"normalized":round(v,3),"weight":w} for n,v,w in parts]
         out["available"]=bool(out["next_earnings_date"] and any(out[k] is not None for k in ("event_implied_move_pct","call_put_volume_ratio","otm_skew_proxy_pct","pre_event_momentum_5d_pct")))
@@ -488,15 +482,15 @@ def _xstock_source(symbol):
             out["error"]="该链上美股资产不存在或未公开"
             return out
         r.raise_for_status(); d=r.json() or {}
-        under=d.get("underlying") or d.get("underlyingAsset") or {}
-        if not isinstance(under, dict): under={}
-        out["symbol"]=d.get("symbol") or symbol
-        out["name"]=d.get("name")
-        out["logo"]=d.get("logo")
-        out["underlying_symbol"]=(under.get("symbol") or under.get("ticker") or
-                                   d.get("underlyingSymbol") or d.get("underlyingTicker"))
-        out["trading_halted"]=d.get("isTradingHalted")
-        out["listing_country"] = under.get("listingCountry") or under.get("country")
+        # v2 public assets may return the asset directly or wrap it in data/node.
+        node=d.get("data") if isinstance(d.get("data"),dict) else (d.get("node") if isinstance(d.get("node"),dict) else d)
+        under=node.get("underlying") if isinstance(node.get("underlying"),dict) else {}
+        out["symbol"]=node.get("symbol") or symbol
+        out["name"]=node.get("name")
+        out["logo"]=node.get("logo") or node.get("logoUrl")
+        out["underlying_symbol"]=under.get("symbol") or under.get("ticker") or node.get("underlyingSymbol") or node.get("underlyingTicker")
+        out["trading_halted"]=node.get("isTradingHalted")
+        out["listing_country"] = under.get("listingCountry")
         out["available"]=bool(out["underlying_symbol"])
         return out
     except Exception as exc:
@@ -509,14 +503,16 @@ def analyze_expectation(symbol: str):
         return {"ok": False, "symbol": requested_symbol, "error": "缺少标的"}
     onchain_equity = {"available":False,"symbol":requested_symbol}
     # xStocks uses an x-suffixed token symbol such as AAPLx. If the user
-    # searches the on-chain version, validate it through the public API, then
-    # run the research engine against the real underlying equity ticker.
+    # searches the on-chain version, research the underlying stock. If the user
+    # searches the normal US ticker, the xStock metadata is discovered in
+    # parallel so the extension card can still verify AAPL -> AAPLx without
+    # adding latency to the stock core/Lite chain.
     if requested_symbol.endswith("X") and len(requested_symbol)>1:
         token_symbol = requested_symbol[:-1] + "x"
         base_symbol = requested_symbol[:-1]
-        onchain_equity = _xstock_source(token_symbol)
-        symbol = str(onchain_equity.get("underlying_symbol") or base_symbol).upper()
+        symbol = base_symbol.upper()
     else:
+        token_symbol = (requested_symbol + "x") if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,7}", requested_symbol) and not requested_symbol.endswith((".HK",".SS",".SZ")) else None
         symbol = requested_symbol
     now = time()
     with _LOCK:
@@ -531,10 +527,10 @@ def analyze_expectation(symbol: str):
 
     # Optional sources are parallel and independently fail-safe.
     results = {}
-    # Keep the independent sources parallel, but resolve ATS before the earnings
-    # event model so its optional evidence can actually be included.
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {ex.submit(_analyst_source, symbol): "analyst", ex.submit(_options_source, symbol): "options", ex.submit(_finra_ats_source, symbol): "ats_dark_pool", ex.submit(_crypto_onchain_source, symbol): "onchain_dark"}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs = {ex.submit(_analyst_source, symbol): "analyst", ex.submit(_options_source, symbol): "options", ex.submit(_finra_ats_source, symbol): "ats_dark_pool", ex.submit(_next_earnings_dark_source, symbol): "next_earnings_dark", ex.submit(_crypto_onchain_source, symbol): "onchain_dark"}
+        if token_symbol:
+            futs[ex.submit(_xstock_source, token_symbol)] = "onchain_equity"
         for fut in as_completed(futs):
             k = futs[fut]
             try:
@@ -542,17 +538,14 @@ def analyze_expectation(symbol: str):
             except Exception as exc:
                 results[k] = {"available": False, "error": str(exc)[:180]}
 
-    ats = results.get("ats_dark_pool", {"available": False})
-    try:
-        results["next_earnings_dark"] = _next_earnings_dark_source(symbol, ats=ats)
-    except Exception as exc:
-        results["next_earnings_dark"] = {"available": False, "status": "unavailable", "error": str(exc)[:180]}
-
     price = _price_signal(h)
     analyst = results.get("analyst", {"available": False})
     options = results.get("options", {"available": False})
+    ats = results.get("ats_dark_pool", {"available": False})
     next_earnings = results.get("next_earnings_dark", {"available": False, "status":"unavailable"})
     onchain = results.get("onchain_dark", {"available": False, "status":"unavailable"})
+    if token_symbol:
+        onchain_equity = results.get("onchain_equity", onchain_equity)
     dark = _dark_expectation(ats, options, analyst)
     current = _finite(price.get("price")) if price else None
     target = _finite(analyst.get("target_mean"))
@@ -586,7 +579,7 @@ def analyze_expectation(symbol: str):
             "optional_sources": {k:v.get("status") for k,v in sources.items()},
             "errors": {k:v.get("data",{}).get("error") for k,v in sources.items() if isinstance(v.get("data"), dict) and v.get("data",{}).get("error")},
         },
-        "method_note": "AEL Pro 的“下一份财报买方暗盘预期”不使用卖方目标价、分析师评级或EPS共识修正作为核心输入；只从财报事件期权成交/持仓、IV偏斜代理、财报前价格与成交量、以及可用的FINRA ATS活动痕迹推断市场参与者的事件定位。结果全部标记为inferred，绝不声称拥有私人买方订单簿。链上美股通过xStocks公开Assets API做资产存在性/底层股票映射，失败只影响该扩展卡。",
+        "method_note": "AEL Pro 的“下一份财报买方暗盘预期”不使用卖方目标价、分析师评级或EPS共识修正作为核心输入；只从财报事件期权成交/持仓、IV偏斜代理、财报前价格与成交量、以及可用的FINRA ATS活动痕迹推断市场参与者的事件定位。卖方数据只保留为独立参考，不进入暗盘核心分数。结果全部标记为inferred，绝不声称拥有私人买方订单簿。链上美股通过xStocks公开Assets API做资产存在性/底层股票映射，失败只影响该扩展卡。",
     }
     with _LOCK:
         _CACHE[symbol] = (now, out)
