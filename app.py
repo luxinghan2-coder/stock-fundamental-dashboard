@@ -13,10 +13,13 @@ import requests
 import yfinance as yf
 import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
+from pro_options import router as pro_options_router
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.9'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.9', version=APP_VERSION)
+APP_VERSION = '2.5.10-PRO'
+app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
+# Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
+app.include_router(pro_options_router)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
