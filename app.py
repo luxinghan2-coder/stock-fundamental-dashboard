@@ -20,7 +20,7 @@ from pro_risk import analyze_risk, analyze_portfolio
 from pro_macro import analyze_macro
 from pro_backtest import run_backtest
 from pro_expectation import analyze_expectation
-from pro_whisper import analyze_whisper
+from pro_whisper import analyze_whisper, invalidate_whisper_cache
 from pro_whisper_backtest import run_whisper_backtest
 from asset_data import get_asset, get_asset_index, get_asset_news
 
@@ -158,7 +158,10 @@ def pro_whisper_backtest(
     # never participates in Lite/SINGLE/MARKET SCAN. A completed run updates the
     # in-process calibration cache consumed by the live Confidence field.
     try:
-        return run_whisper_backtest(symbol, quarters)
+        result = run_whisper_backtest(symbol, quarters)
+        if result.get("ok"):
+            invalidate_whisper_cache(symbol)
+        return result
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'AEL Whisper 回测失败：{str(exc)[:220]}')
 

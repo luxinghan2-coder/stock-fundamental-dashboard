@@ -9,6 +9,10 @@ estimate/actual pair are excluded from accuracy metrics and reported separately.
 from __future__ import annotations
 
 import math
+import json
+import os
+import threading
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -16,8 +20,34 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# Per-process calibration cache. Backtest is opt-in and never runs on the main Whisper path.
+# Calibration cache is deliberately separate from the live Whisper path.
+# Persist only completed calibration metadata so a normal page refresh does not
+# turn a valid calibration back into "un-calibrated". No raw market/PII data is
+# stored here. If the runtime filesystem is unavailable, the in-memory cache is
+# still sufficient for the current process.
 _CALIBRATION_CACHE = {}
+_CACHE_LOCK = threading.RLock()
+_CACHE_FILE = Path(os.getenv("AEL_WHISPER_CALIBRATION_CACHE", Path(__file__).with_name(".ael_whisper_calibration.json")))
+
+def _load_cache():
+    try:
+        if _CACHE_FILE.exists():
+            raw=json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw,dict):
+                _CALIBRATION_CACHE.update({str(k).upper():v for k,v in raw.items() if isinstance(v,dict)})
+    except Exception:
+        pass
+
+def _save_cache():
+    try:
+        _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp=_CACHE_FILE.with_suffix(_CACHE_FILE.suffix+".tmp")
+        tmp.write_text(json.dumps(_CALIBRATION_CACHE, ensure_ascii=False, separators=(",",":")), encoding="utf-8")
+        tmp.replace(_CACHE_FILE)
+    except Exception:
+        pass
+
+_load_cache()
 
 
 def _finite(v):
@@ -171,7 +201,9 @@ def _improvement(base, model):
 
 
 def get_cached_calibration(symbol: str):
-    return _CALIBRATION_CACHE.get(str(symbol or "").strip().upper())
+    key=str(symbol or "").strip().upper()
+    with _CACHE_LOCK:
+        return dict(_CALIBRATION_CACHE[key]) if key in _CALIBRATION_CACHE else None
 
 
 def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
@@ -286,7 +318,8 @@ def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
     # Cache only a completed calibration result. This is the bridge from the
     # optional Backtest Lab to the live Confidence field; no backtest runs on
     # the normal Whisper request.
-    _CALIBRATION_CACHE[requested] = {
+    with _CACHE_LOCK:
+        _CALIBRATION_CACHE[requested] = {
         "score": calibration,
         "label": label,
         "valid_samples": valid_n,
@@ -294,6 +327,8 @@ def run_whisper_backtest(symbol: str, quarters: int = 20) -> Dict[str, Any]:
         "as_of": result["as_of"],
         "source": result["source_status"]["source"],
         "point_in_time_status": result["point_in_time_integrity"]["status"],
+        "periods_requested": quarters,
     }
+        _save_cache()
     return result
 

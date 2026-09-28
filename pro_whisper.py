@@ -815,6 +815,19 @@ def _calibrated_confidence(calibration, data_quality):
     return int(round(_clamp(cal*0.72 + dq*0.28, 35, 95)))
 
 
+def invalidate_whisper_cache(symbol=None):
+    """Invalidate only the requested live Whisper cache after calibration.
+    Backtest remains opt-in and this does not touch Lite/SINGLE/MARKET SCAN caches.
+    """
+    if symbol:
+        key=str(symbol).strip().upper()
+        with _LOCK:
+            _CACHE.pop(key, None)
+    else:
+        with _LOCK:
+            _CACHE.clear()
+
+
 def analyze_whisper(symbol):
     requested=str(symbol or "").strip().upper()
     if not requested:return {"ok":False,"error":"缺少标的"}
