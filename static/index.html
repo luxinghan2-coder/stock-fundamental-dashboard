@@ -44,6 +44,10 @@ body.ael-force-mobile .ael-pro-option-card{width:100%;min-width:0}
 .ael-pro-advanced summary{cursor:pointer;color:#91a0af;font-size:10px}
 .ael-pro-fit{color:#9ee6bd;font-weight:800}
 
+
+.ael-factor-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ael-factor-weight-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}.ael-factor-weight{background:#101923;border:1px solid #273545;border-radius:10px;padding:9px}.ael-factor-weight label{display:flex;justify-content:space-between;color:#91a0af;font-size:10px;margin-bottom:5px}.ael-factor-weight input{width:100%;accent-color:#e8edf2}.ael-factor-bars{display:grid;gap:8px}.ael-factor-row{display:grid;grid-template-columns:90px 1fr 45px;gap:8px;align-items:center}.ael-factor-row span{font-size:11px;color:#aeb9c5}.ael-factor-bar{height:9px;background:#243142;border-radius:99px;overflow:hidden}.ael-factor-bar i{display:block;height:100%;background:#dbe4ec;border-radius:99px}.ael-factor-row b{text-align:right;font-size:12px}.ael-factor-metric-table{width:100%;border-collapse:collapse;font-size:11px}.ael-factor-metric-table th,.ael-factor-metric-table td{padding:7px;border-bottom:1px solid #273545;text-align:right}.ael-factor-metric-table th:first-child,.ael-factor-metric-table td:first-child{text-align:left}.ael-factor-method{padding:9px;border:1px solid #273545;border-radius:10px;background:#101923;font-size:10px;line-height:1.7;color:#9aa7b5;margin-top:9px}@media(max-width:760px){.ael-factor-controls{grid-template-columns:1fr}.ael-factor-weight-grid{grid-template-columns:1fr 1fr}.ael-factor-row{grid-template-columns:75px 1fr 42px}}
+
+.ael-universe-list{display:grid;gap:6px;max-height:520px;overflow:auto}.ael-universe-item{display:grid;grid-template-columns:110px 1fr auto;gap:8px;align-items:center;padding:9px 10px;background:#101923;border:1px solid #273545;border-radius:9px;font-size:11px}.ael-universe-item b{font-size:11px}.ael-universe-item span{color:#aeb9c5}.ael-universe-item em{font-style:normal;color:#7f8c9a;font-size:10px}@media(max-width:760px){.ael-universe-item{grid-template-columns:90px 1fr}.ael-universe-item em{grid-column:2}}
 </style>
 </head><body><div class="ael-modebar"><div class="ael-brand">AEL</div><div class="ael-mode-switch"><button id="modeLite" class="active" onclick="setAELMode('lite')">Lite</button><button id="modePro" onclick="setAELMode('pro')">Pro</button></div></div><div id="ael-lite-root"><div class="wrap">
 <h1>AEL｜股票基本面驾驶舱</h1><div class="sub">美股 · 港股 · A股｜AEL设计版权 © 所有</div>
@@ -59,6 +63,7 @@ body.ael-force-mobile .ael-pro-option-card{width:100%;min-width:0}
     </div>
     <div class="ael-pro-tabs">
       <button class="ael-pro-tab active" data-pro-tab="overview" onclick="switchProTab('overview')">Overview</button>
+      <button class="ael-pro-tab" data-pro-tab="universe" onclick="switchProTab('universe')">Universe</button>
       <button class="ael-pro-tab" data-pro-tab="options" onclick="switchProTab('options')">Options</button>
       <button class="ael-pro-tab" data-pro-tab="factor" onclick="switchProTab('factor')">Factor Lab</button>
       <button class="ael-pro-tab" data-pro-tab="risk" onclick="switchProTab('risk')">Risk</button>
@@ -84,6 +89,29 @@ body.ael-force-mobile .ael-pro-option-card{width:100%;min-width:0}
       <div id="proResearchPanel" class="ael-pro-card" style="margin-top:12px"><div class="ael-pro-empty">尚未选择研究对象</div></div>
     </section>
 
+    <section id="pro-tab-universe" class="ael-pro-tabpanel" style="display:none">
+      <div class="ael-pro-grid">
+        <div class="ael-pro-stack">
+          <div class="ael-pro-card">
+            <div class="ael-pro-section">Universe · 量化股票池</div>
+            <div class="ael-pro-note">Pro 的量化研究先从稳定、可复现的核心指数池开始。这里是只读股票池，不会扩大 Lite 的扫描范围，也不会自动启动扫描。</div>
+            <div class="ael-pro-inputs" style="margin-top:10px">
+              <select id="proUniverseMarket"><option value="us">美股</option><option value="hk">港股</option><option value="cn">A股</option></select>
+              <button class="ael-pro-btn" onclick="loadProUniverse()">加载股票池</button>
+            </div>
+          </div>
+          <div class="ael-pro-card">
+            <div class="ael-pro-section">股票池状态</div>
+            <div id="proUniverseSummary" class="ael-pro-metrics"><div class="ael-pro-metric"><span>股票数</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>市场</span><b>美股</b></div></div>
+            <div id="proUniverseStatus" class="ael-pro-note" style="margin-top:9px">尚未加载。</div>
+          </div>
+        </div>
+        <div class="ael-pro-card">
+          <div class="ael-pro-section">研究池</div>
+          <div id="proUniverseRows" class="ael-pro-empty">加载后显示真实成分股。</div>
+        </div>
+      </div>
+    </section>
     <section id="pro-tab-options" class="ael-pro-tabpanel" style="display:none">
       <div class="ael-pro-grid">
         <div class="ael-pro-stack">
@@ -136,7 +164,31 @@ body.ael-force-mobile .ael-pro-option-card{width:100%;min-width:0}
       </div>
     </section>
     <section id="pro-tab-factor" class="ael-pro-tabpanel" style="display:none">
-      <div class="ael-pro-card"><div class="ael-pro-section">Factor Lab · 第一阶段骨架</div><div class="ael-pro-note">后续按 Quality / Value / Growth / Momentum / Risk / Liquidity 建立因子，并加入标准化、去极值、行业/规模中性化。这里先保留独立研究空间，不改 Lite 评分。</div></div>
+      <div class="ael-pro-grid">
+        <div class="ael-pro-stack">
+          <div class="ael-pro-card">
+            <div class="ael-pro-section">Factor Lab · 因子研究</div>
+            <div class="ael-pro-note">输入一个标的，独立计算 Value / Quality / Growth / Momentum / Risk / Liquidity。这里是 Pro 研究分，不改 Lite 的选股分数。</div>
+            <div class="ael-factor-controls" style="margin-top:10px"><input id="factorSymbol" class="ael-pro-inputs" style="background:#0f1720;color:#eef2f6;border:1px solid #334155;border-radius:9px;padding:9px 10px;font-size:12px" value="AAPL" placeholder="股票代码"><button class="ael-pro-btn" onclick="runFactorLab()">运行因子分析</button></div>
+            <div class="ael-pro-section" style="margin-top:14px;margin-bottom:5px">因子权重</div>
+            <div class="ael-factor-weight-grid">
+              <div class="ael-factor-weight"><label>Value <b id="fwValueOut">20%</b></label><input id="fwValue" type="range" min="0" max="50" value="20" oninput="syncFactorWeights()"></div>
+              <div class="ael-factor-weight"><label>Quality <b id="fwQualityOut">25%</b></label><input id="fwQuality" type="range" min="0" max="50" value="25" oninput="syncFactorWeights()"></div>
+              <div class="ael-factor-weight"><label>Growth <b id="fwGrowthOut">15%</b></label><input id="fwGrowth" type="range" min="0" max="50" value="15" oninput="syncFactorWeights()"></div>
+              <div class="ael-factor-weight"><label>Momentum <b id="fwMomentumOut">20%</b></label><input id="fwMomentum" type="range" min="0" max="50" value="20" oninput="syncFactorWeights()"></div>
+              <div class="ael-factor-weight"><label>Risk <b id="fwRiskOut">10%</b></label><input id="fwRisk" type="range" min="0" max="50" value="10" oninput="syncFactorWeights()"></div>
+              <div class="ael-factor-weight"><label>Liquidity <b id="fwLiquidityOut">10%</b></label><input id="fwLiquidity" type="range" min="0" max="50" value="10" oninput="syncFactorWeights()"></div>
+            </div>
+            <div id="factorWeightNote" class="ael-pro-note" style="margin-top:8px">当前权重合计 100%。后端会在缺失因子时按有效因子重新归一化，不补数据。</div>
+          </div>
+          <div class="ael-pro-card"><div class="ael-pro-section">Alpha 研究分</div><div id="factorAlphaScore" class="ael-pro-metric"><span>综合研究分</span><b>暂无数据</b></div><div id="factorBars" class="ael-factor-bars" style="margin-top:12px"></div></div>
+        </div>
+        <div class="ael-pro-stack">
+          <div class="ael-pro-card"><div class="ael-pro-section">数据质量</div><div id="factorStatus" class="ael-pro-note">尚未运行。</div></div>
+          <div class="ael-pro-card"><div class="ael-pro-section">因子原始数据</div><div id="factorMetrics" class="ael-pro-empty">运行分析后显示真实数据。</div></div>
+          <div class="ael-pro-card"><div class="ael-pro-section">方法说明</div><div id="factorMethod" class="ael-factor-method">首版采用透明的有界绝对分：用于研究和比较，不冒充行业横截面 Z-score。Universe 模块完成后再加入去极值、Z-score、行业/规模中性化。</div></div>
+        </div>
+      </div>
     </section>
     <section id="pro-tab-risk" class="ael-pro-tabpanel" style="display:none">
       <div class="ael-pro-card"><div class="ael-pro-section">Risk · 第一阶段骨架</div><div class="ael-pro-note">后续接 Beta、波动率、回撤、行业暴露、因子暴露、Greeks 与组合风险分解。不会反向修改 Lite。</div></div>
@@ -337,6 +389,20 @@ function setAELMode(mode){
   if(isPro) document.title="AEL Pro｜Quant Research";
   else document.title="AEL｜股票基本面驾驶舱";
 }
+function loadProUniverse(){
+  const market=document.getElementById('proUniverseMarket')?.value||'us';
+  const names={us:'美股',hk:'港股',cn:'A股'};
+  const status=document.getElementById('proUniverseStatus');
+  const summary=document.getElementById('proUniverseSummary');
+  const rows=document.getElementById('proUniverseRows');
+  status.textContent='正在读取核心指数成分池……'; rows.innerHTML='<div class="ael-pro-empty">请求中……</div>';
+  fetch(`/api/pro/universe?market=${encodeURIComponent(market)}`).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.detail||'Universe 加载失败');
+    summary.innerHTML=`<div class="ael-pro-metric"><span>股票数</span><b>${Number(d.count||0).toLocaleString('zh-CN')}</b></div><div class="ael-pro-metric"><span>市场</span><b>${esc(names[market])}</b></div><div class="ael-pro-metric"><span>池定义</span><b style="font-size:11px">${esc(d.label||'')}</b></div><div class="ael-pro-metric"><span>缓存</span><b>${Math.round(Number(d.cache_ttl_seconds||0)/3600)}h</b></div>`;
+    const list=d.symbols||[];
+    if(!list.length){rows.innerHTML='<div class="ael-pro-empty">暂无数据；没有用估算值补充。</div>';}else{rows.innerHTML=`<div class="ael-universe-list">${list.map((x,i)=>`<div class="ael-universe-item"><b>${esc(x.symbol)}</b><span>${esc(x.company||'暂无数据')}</span><em>#${i+1}</em></div>`).join('')}</div>`;}
+    const q=d.data_quality||{}; status.innerHTML=`<span class="ael-pro-status-pill ok">${esc(d.label||names[market])}</span> <span class="ael-pro-status-pill">${Number(d.count||0).toLocaleString('zh-CN')} 只</span> <div style="margin-top:7px">来源：${esc(d.source||'')}</div><div style="margin-top:4px">数据状态：${q.empty_universe?'股票池为空':'成分池已读取'} · 公司名缺失 ${Number(q.missing_company_names||0)} 只</div>`;
+  }).catch(e=>{status.textContent=e.message;summary.innerHTML='<div class="ael-pro-metric"><span>状态</span><b>暂无数据</b></div>';rows.innerHTML='<div class="ael-pro-empty">Universe 暂无结果</div>';});
+}
 function switchProTab(tab){
   document.querySelectorAll(".ael-pro-tabpanel").forEach(x=>x.style.display="none");
   document.querySelectorAll(".ael-pro-tab").forEach(x=>x.classList.toggle("active",x.dataset.proTab===tab));
@@ -381,6 +447,12 @@ function restoreDeltaPrefs(){try{const p=JSON.parse(localStorage.getItem('aelPro
 function toggleManualDelta(){document.getElementById('optDeltaAuto')?.classList.remove('active');document.getElementById('optDeltaManual')?.classList.add('active');document.querySelector('.ael-pro-advanced')?.setAttribute('open','');}
 function setDeltaAutoMode(){document.getElementById('optDeltaAuto')?.classList.add('active');document.getElementById('optDeltaManual')?.classList.remove('active');applyPersonalizedDelta(false);}
 
+function factorWeightValues(){return {value:Number(document.getElementById('fwValue')?.value||20),quality:Number(document.getElementById('fwQuality')?.value||25),growth:Number(document.getElementById('fwGrowth')?.value||15),momentum:Number(document.getElementById('fwMomentum')?.value||20),risk:Number(document.getElementById('fwRisk')?.value||10),liquidity:Number(document.getElementById('fwLiquidity')?.value||10)}}
+function syncFactorWeights(){const w=factorWeightValues();const names={value:'Value',quality:'Quality',growth:'Growth',momentum:'Momentum',risk:'Risk',liquidity:'Liquidity'};let total=0;for(const [k,v] of Object.entries(w)){total+=v;const out=document.getElementById('fw'+k[0].toUpperCase()+k.slice(1)+'Out');if(out)out.textContent=v+'%';}const note=document.getElementById('factorWeightNote');if(note)note.textContent=`当前权重合计 ${total}%。${total===100?'权重正常。':'建议调整至 100%；后端仍会按有效因子重新归一化。'}`;}
+function factorVal(v,d=2){if(v===null||v===undefined||v==='')return '暂无数据';const n=Number(v);return Number.isFinite(n)?n.toFixed(d):'暂无数据';}
+function factorPct(v,d=2){if(v===null||v===undefined||v==='')return '暂无数据';const n=Number(v);return Number.isFinite(n)?n.toFixed(d)+'%':'暂无数据';}
+function renderFactorLab(d){const score=d.alpha_research_score;document.getElementById('factorAlphaScore').innerHTML=`<span>综合研究分 · ${esc(d.company||d.symbol)}</span><b>${score==null?'暂无数据':score.toFixed(2)}</b>`;const order=['value','quality','growth','momentum','risk','liquidity'];const labels={value:'Value',quality:'Quality',growth:'Growth',momentum:'Momentum',risk:'Risk',liquidity:'Liquidity'};document.getElementById('factorBars').innerHTML=order.map(k=>{const f=d.factors?.[k]||{};return `<div class="ael-factor-row"><span>${labels[k]}</span><div class="ael-factor-bar"><i style="width:${f.score==null?0:f.score}%"></i></div><b>${f.score==null?'—':Number(f.score).toFixed(1)}</b></div>`}).join('');const missing=(d.data_quality?.missing_factors||[]).map(k=>labels[k]||k);document.getElementById('factorStatus').innerHTML=`<span class="ael-pro-status-pill ok">${esc(d.symbol)}</span> <span class="ael-pro-status-pill">历史 ${d.data_quality?.history_rows||0} 行</span> <span class="ael-pro-status-pill">${missing.length?'缺失：'+esc(missing.join('、')):'六因子数据完整'}</span><div style="margin-top:8px">${esc(d.method_note||'')}</div>`;const rows=[];for(const k of order){const f=d.factors?.[k]||{};for(const [name,val] of Object.entries(f.metrics||{})){rows.push(`<tr><td>${esc(labels[k])}</td><td>${esc(name)}</td><td>${typeof val==='number'?factorVal(val,2):esc(val??'暂无数据')}</td><td>${f.score==null?'暂无数据':f.score.toFixed(2)}</td><td>${f.weight_pct==null?'—':f.weight_pct.toFixed(1)+'%'}</td><td>${f.contribution==null?'—':f.contribution.toFixed(2)}</td></tr>`);}}document.getElementById('factorMetrics').innerHTML=`<table class="ael-factor-metric-table"><thead><tr><th>因子</th><th>原始指标</th><th>真实值</th><th>因子分</th><th>权重</th><th>贡献</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;document.getElementById('factorMethod').textContent=d.method_note||'首版采用透明的有界绝对分。';}
+async function runFactorLab(){const s=(document.getElementById('factorSymbol')?.value||'').trim().toUpperCase();if(!s){document.getElementById('factorStatus').textContent='请输入股票代码。';return;}const w=factorWeightValues();const q=new URLSearchParams({value_weight:w.value,quality_weight:w.quality,growth_weight:w.growth,momentum_weight:w.momentum,risk_weight:w.risk,liquidity_weight:w.liquidity});document.getElementById('factorStatus').textContent='正在获取真实基本面与历史行情……';document.getElementById('factorMetrics').innerHTML='<div class="ael-pro-empty">请求中……</div>';try{const r=await fetch(`/api/pro/factors/analyze/${encodeURIComponent(s)}?${q}`);const d=await r.json();if(!r.ok)throw new Error(d.detail||'Factor Lab 分析失败');renderFactorLab(d);}catch(e){document.getElementById('factorStatus').textContent=e.message;document.getElementById('factorMetrics').innerHTML='<div class="ael-pro-empty">暂无结果</div>';}}
 async function loadProOptions(){
  const s=(document.getElementById('optSymbol')?.value||'').trim().toUpperCase(),strategy=document.getElementById('optStrategy').value;
  const dmin=Number(document.getElementById('optDteMin').value),dmax=Number(document.getElementById('optDteMax').value),amin=Number(document.getElementById('optDeltaMin').value),amax=Number(document.getElementById('optDeltaMax').value),deltaTarget=(amin+amax)/2,feeOpen=Number(document.getElementById('optFeeOpen').value||0),feeClose=Number(document.getElementById('optFeeClose').value||0),marginMode=document.getElementById('optMarginMode').value,marginValue=Number(document.getElementById('optMarginValue').value||0);
