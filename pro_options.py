@@ -217,27 +217,126 @@ def _underlying_price(symbol: str) -> float | None:
     )
 
 
-def _strategy_score(row: dict[str, Any], strategy: str) -> float:
-    # Transparent heuristic score: liquidity + usable premium + target delta.
-    # This is not a claim of expected return and is intentionally decomposable.
-    oi = row.get("open_interest")
-    vol = row.get("volume")
-    spread_pct = row.get("spread_pct")
-    delta = row.get("delta")
-    yld = row.get("premium_yield")
-    score = 0.0
-    if oi is not None:
-        score += min(25.0, math.log10(max(1.0, oi)) * 4.0)
-    if vol is not None:
-        score += min(15.0, math.log10(max(1.0, vol)) * 3.0)
-    if spread_pct is not None:
-        score += max(0.0, 25.0 - min(25.0, spread_pct * 2.0))
-    if yld is not None:
-        score += min(25.0, max(0.0, yld * 8.0))
+def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, float(v)))
+
+
+def _money(v: Any) -> float | None:
+    x = _finite(v)
+    return x if x is not None and x >= 0 else None
+
+
+def _strategy_score(row: dict[str, Any], strategy: str) -> tuple[float, dict[str, Any]]:
+    """Transparent research score; DTE is a filter, not a reward.
+
+    Priority follows the original cockpit: capital-return quality + IV first,
+    then Delta, liquidity and spread. Missing factors are excluded from the
+    denominator instead of being silently converted to zero.
+    """
+    target_delta = -0.25 if strategy == "CSP" else 0.25
+    components: list[tuple[str, float, float | None]] = []
+
+    net_ann = _finite(row.get("net_annualized_yield"))
+    iv = _finite(row.get("iv"))
+    delta = _finite(row.get("delta"))
+    oi = _finite(row.get("open_interest"))
+    volume = _finite(row.get("volume"))
+    spread_pct = _finite(row.get("spread_pct"))
+
+    annual_target = max(1.0, float(os.getenv("AEL_OPTIONS_SCORE_ANNUAL_TARGET", "30")))
+    iv_target = max(1.0, float(os.getenv("AEL_OPTIONS_SCORE_IV_TARGET", "40")))
+
+    if net_ann is not None:
+        components.append(("资金回报", 30.0, _clamp(net_ann / annual_target * 100)))
+    if iv is not None:
+        components.append(("IV", 25.0, _clamp(iv / iv_target * 100)))
     if delta is not None:
-        target = -0.25 if strategy == "CSP" else 0.25
-        score += max(0.0, 10.0 - abs(abs(delta) - target) * 40.0)
-    return round(min(100.0, score), 1)
+        components.append(("Delta", 15.0, _clamp(100 - abs(abs(delta) - abs(target_delta)) * 400)))
+    if oi is not None or volume is not None:
+        liq = 0.0
+        if oi is not None:
+            liq += min(70.0, math.log10(max(1.0, oi)) / 4.0 * 70.0)
+        if volume is not None:
+            liq += min(30.0, math.log10(max(1.0, volume)) / 3.0 * 30.0)
+        components.append(("流动性", 15.0, _clamp(liq)))
+    if spread_pct is not None:
+        components.append(("买卖价差", 15.0, _clamp(100 - spread_pct / 8.0 * 100)))
+
+    weight_total = sum(w for _, w, _ in components)
+    score = sum(w * (v or 0) / 100.0 for _, w, v in components) / weight_total * 100 if weight_total else None
+    breakdown = {
+        "weights": {k: w for k, w, _ in components},
+        "normalized": {k: round(v, 1) for k, _, v in components if v is not None},
+        "formula": "资金回报30% + IV25% + Delta15% + 流动性15% + 买卖价差15%；缺失因子按剩余权重归一化。DTE仅作筛选条件。",
+        "weight_coverage": round(weight_total, 1),
+    }
+    return (round(score, 1) if score is not None else None), breakdown
+
+
+def _derive_strategy_metrics(
+    row: dict[str, Any],
+    strategy: str,
+    fee_open: float,
+    fee_close: float,
+    margin_mode: str,
+    margin_value: float,
+) -> dict[str, Any]:
+    gross = _finite(row.get("premium"))
+    nominal = _finite(row.get("nominal_value")) or _finite(row.get("capital_required"))
+    dte = _finite(row.get("dte"))
+    fees = max(0.0, fee_open) + max(0.0, fee_close)
+    net = gross - fees if gross is not None else None
+    if margin_mode == "fixed":
+        occupied = min(nominal, max(0.0, margin_value)) if nominal is not None else None
+    elif margin_mode == "cash":
+        occupied = nominal
+    else:
+        ratio = max(0.0, min(1.0, margin_value / 100.0))
+        occupied = nominal * ratio if nominal is not None else None
+    gross_yield = gross / nominal * 100 if gross is not None and nominal and nominal > 0 else None
+    net_yield = net / nominal * 100 if net is not None and nominal and nominal > 0 else None
+    capital_yield = net / occupied * 100 if net is not None and occupied and occupied > 0 else None
+    monthly = capital_yield * 30.4375 / dte if capital_yield is not None and dte and dte > 0 else None
+    annual = capital_yield * 365 / dte if capital_yield is not None and dte and dte > 0 else None
+    fee_burden = fees / gross * 100 if gross and gross > 0 else None
+    row.update({
+        "strategy": strategy,
+        "fee_open": round(fee_open, 4),
+        "fee_close": round(fee_close, 4),
+        "fees_total": round(fees, 4),
+        "gross_premium": gross,
+        "nominal_value": nominal,
+        "simulated_capital": occupied,
+        "margin_mode": margin_mode,
+        "margin_value": margin_value,
+        "gross_yield": gross_yield,
+        "net_profit": net,
+        "net_yield": net_yield,
+        "capital_yield": capital_yield,
+        "monthly_simple_yield": monthly,
+        "net_annualized_yield": annual,
+        "fee_burden_pct": fee_burden,
+    })
+    return row
+
+
+def _opening_status(row: dict[str, Any], strategy: str) -> tuple[str, list[str]]:
+    reasons = []
+    annual_min = float(os.getenv("AEL_OPTIONS_OPEN_MIN_ANNUAL", "10"))
+    oi_min = float(os.getenv("AEL_OPTIONS_OPEN_MIN_OI", "100"))
+    vol_min = float(os.getenv("AEL_OPTIONS_OPEN_MIN_VOLUME", "5"))
+    spread_max = float(os.getenv("AEL_OPTIONS_OPEN_MAX_SPREAD_PCT", "8"))
+    fee_max = float(os.getenv("AEL_OPTIONS_OPEN_MAX_FEE_BURDEN", "8"))
+    annual = _finite(row.get("net_annualized_yield")); oi = _finite(row.get("open_interest")); vol = _finite(row.get("volume")); spread = _finite(row.get("spread_pct")); fee = _finite(row.get("fee_burden_pct"))
+    if annual is None or annual < annual_min: reasons.append(f"净年化收益低于{annual_min:g}%")
+    if oi is None or oi < oi_min: reasons.append(f"未平仓量低于{oi_min:g}")
+    if vol is None or vol < vol_min: reasons.append(f"今日成交量低于{vol_min:g}")
+    if spread is None or spread > spread_max: reasons.append(f"买卖价差超过{spread_max:g}%")
+    if fee is not None and fee > fee_max: reasons.append(f"手续费磨损超过{fee_max:g}%")
+    if row.get("delta") is None: reasons.append("Delta缺失")
+    if not reasons:
+        return "OPEN", ["满足当前研究规则"]
+    return "WAIT", reasons
 
 
 @router.get("/health")
@@ -323,11 +422,20 @@ def pro_options_scanner(
     dte_max: int = Query(45, ge=1, le=730),
     delta_abs_min: float = Query(0.15, ge=0, le=1),
     delta_abs_max: float = Query(0.35, ge=0, le=1),
+    fee_open: float = Query(0.0, ge=0, le=1000),
+    fee_close: float = Query(0.0, ge=0, le=1000),
+    margin_mode: str = Query("ratio"),
+    margin_value: float = Query(25.0, ge=0, le=100),
     limit: int = Query(20, ge=1, le=100),
 ):
     strategy = strategy.upper()
     if strategy not in {"CSP", "CC"}:
         raise HTTPException(status_code=400, detail="strategy 只能是 CSP / CC")
+    margin_mode = margin_mode.lower()
+    if margin_mode not in {"ratio", "fixed", "cash"}:
+        raise HTTPException(status_code=400, detail="margin_mode 只能是 ratio / fixed / cash")
+    if margin_mode == "fixed" and margin_value <= 0:
+        raise HTTPException(status_code=400, detail="固定金额模式需要大于0的资金占用金额")
     typ = "put" if strategy == "CSP" else "call"
     delta_lo = -delta_abs_max if strategy == "CSP" else delta_abs_min
     delta_hi = -delta_abs_min if strategy == "CSP" else delta_abs_max
@@ -337,14 +445,45 @@ def pro_options_scanner(
     )
     rows = data["results"]
     for row in rows:
-        row["strategy"] = strategy
-        row["strategy_score"] = _strategy_score(row, strategy)
+        # For CSP the nominal capital is strike*100. For CC it is the
+        # underlying value of 100 shares; this is a simulation, not broker
+        # margin requirement.
+        row["nominal_value"] = row.get("strike", 0) * 100 if strategy == "CSP" else (row.get("underlying_price") or row.get("strike", 0)) * 100
+        _derive_strategy_metrics(row, strategy, fee_open, fee_close, margin_mode, margin_value)
+        status, reasons = _opening_status(row, strategy)
+        row["opening_status"] = status
+        row["opening_reasons"] = reasons
+        score, breakdown = _strategy_score(row, strategy)
+        row["strategy_score"] = score
+        row["score_breakdown"] = breakdown
+
     rows.sort(key=lambda x: (
         -(x.get("strategy_score") if x.get("strategy_score") is not None else -1),
-        -(x.get("premium_yield") if x.get("premium_yield") is not None else -1),
+        -(x.get("capital_yield") if x.get("capital_yield") is not None else -1),
         x["dte"],
     ))
     data["results"] = rows[:limit]
     data["strategy"] = strategy
-    data["strategy_formula"] = "流动性 + 买卖价差 + 权利金收益率 + Delta目标接近度；仅用于候选排序，不代表预期收益。"
+    data["strategy_formula"] = "资金回报30% + IV25% + Delta15% + 流动性15% + 买卖价差15%；缺失因子按剩余权重归一化。DTE仅作筛选条件。"
+    data["fee_model"] = {"fee_open": fee_open, "fee_close": fee_close, "fees_total": fee_open + fee_close}
+    data["capital_model"] = {
+        "mode": margin_mode,
+        "value": margin_value,
+        "note": "模拟资金占用，仅用于收益率研究，不代表券商实际保证金要求。",
+    }
+    data["opening_rules"] = {
+        "min_net_annualized_yield": float(os.getenv("AEL_OPTIONS_OPEN_MIN_ANNUAL", "10")),
+        "min_open_interest": float(os.getenv("AEL_OPTIONS_OPEN_MIN_OI", "100")),
+        "min_volume": float(os.getenv("AEL_OPTIONS_OPEN_MIN_VOLUME", "5")),
+        "max_spread_pct": float(os.getenv("AEL_OPTIONS_OPEN_MAX_SPREAD_PCT", "8")),
+        "max_fee_burden_pct": float(os.getenv("AEL_OPTIONS_OPEN_MAX_FEE_BURDEN", "8")),
+    }
+    data["diagnostics"] = {
+        "contracts_returned": len(rows),
+        "iv_available": sum(1 for r in rows if r.get("iv") is not None),
+        "delta_available": sum(1 for r in rows if r.get("delta") is not None),
+        "quotes_available": sum(1 for r in rows if r.get("bid") is not None and r.get("ask") is not None),
+        "greeks_available": sum(1 for r in rows if any(r.get(k) is not None for k in ("delta","gamma","theta","vega","rho"))),
+    }
     return data
+
