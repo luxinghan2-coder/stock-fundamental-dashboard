@@ -14,8 +14,8 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.5'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.5', version=APP_VERSION)
+APP_VERSION = '2.5.6'
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.6', version=APP_VERSION)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
