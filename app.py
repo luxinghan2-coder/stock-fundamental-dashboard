@@ -14,8 +14,8 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.6'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.6', version=APP_VERSION)
+APP_VERSION = '2.5.8'
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.8', version=APP_VERSION)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
@@ -64,6 +64,9 @@ _SCAN_CACHE = {}
 _UNIVERSE_CACHE = {}
 _FUNDAMENTAL_CACHE = {}
 _FUNDAMENTAL_CACHE_TTL = int(os.getenv('AEL_FUNDAMENTAL_CACHE_TTL', '21600'))
+ROE_MIN_PCT = float(os.getenv('AEL_ROE_MIN_PCT', '10'))
+FUNDAMENTAL_WORKERS = max(1, min(8, int(os.getenv('AEL_FUNDAMENTAL_WORKERS', '8'))))
+FUNDAMENTAL_CANDIDATES = max(50, min(200, int(os.getenv('AEL_FUNDAMENTAL_CANDIDATES', '120'))))
 _SCAN_JOBS = {}
 _SCAN_LOCK = threading.Lock()
 
@@ -242,44 +245,28 @@ def _scan_universe(markets: str, group: str = 'all'):
 
 
 def _fundamental_gate(symbol):
-    """V2.4.20-compatible fundamental eligibility gate. Missing data is not estimated."""
+    """Fast Lite fundamental gate: real Yahoo ROE only, with a hard threshold.
+    No financial statements are downloaded during MARKET SCAN. Full fundamentals
+    remain available in SINGLE. Missing/invalid ROE never passes by estimation.
+    """
     cached=_FUNDAMENTAL_CACHE.get(symbol)
     if cached and time()-cached['ts'] < _FUNDAMENTAL_CACHE_TTL:
         return cached['ok'], cached['data']
     try:
         t=yf.Ticker(symbol)
-        inc=t.financials; bs=t.balance_sheet; cf=t.cashflow; info=t.info or {}
-        def latest(df, names):
-            if df is None or getattr(df, 'empty', True): return None
-            for name in names:
-                if name in df.index:
-                    ser=df.loc[name].dropna()
-                    if len(ser):
-                        try: return float(ser.iloc[0])
-                        except Exception: pass
-            return None
-        revenue=latest(inc, ['Total Revenue','Operating Revenue'])
-        net_income=latest(inc, ['Net Income','Net Income Common Stockholders'])
-        ocf=latest(cf, ['Operating Cash Flow','Total Cash From Operating Activities'])
-        capex=latest(cf, ['Capital Expenditure','Capital Expenditures'])
-        fcf=ocf + capex if ocf is not None and capex is not None else None
+        info=t.info or {}
         roe=None
         try:
-            r=info.get('returnOnEquity')
-            roe=float(r)*100 if r is not None else None
-        except Exception: pass
-        if roe is None and bs is not None and not getattr(bs,'empty',True) and net_income is not None:
-            equity=None
-            for n in ['Stockholders Equity','Common Stock Equity','Stockholders Equity Including Minority Interest']:
-                equity=latest(bs,[n])
-                if equity is not None: break
-            if equity not in (None,0): roe=net_income/equity*100
-        complete=all(x is not None for x in [roe,revenue,net_income,fcf])
-        data={'roe':roe,'revenue':revenue,'net_income':net_income,'free_cash_flow':fcf}
-        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':complete,'data':data}
-        return complete, data
+            raw=info.get('returnOnEquity')
+            roe=float(raw)*100 if raw is not None else None
+        except Exception:
+            roe=None
+        ok=roe is not None and roe >= ROE_MIN_PCT
+        data={'roe':roe,'roe_min_pct':ROE_MIN_PCT}
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':ok,'data':data}
+        return ok, data
     except Exception as exc:
-        data={'error':str(exc)[:180]}
+        data={'roe':None,'roe_min_pct':ROE_MIN_PCT,'error':str(exc)[:180]}
         _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data}
         return False, data
 
@@ -345,19 +332,15 @@ def _scan_batch(rows):
             tech=technical_analysis(history, fib, pivots)
             if tech.get('composite_score') is None:
                 continue
-            fundamental_ok, fundamental=_fundamental_gate(symbol)
-            if not fundamental_ok:
-                errors[symbol]='基本面资格过滤未通过：ROE、营收、净利润、自由现金流需全部有真实数据'
-                continue
             out.append({
                 'symbol':symbol,'company':row.get('company') or symbol,
                 'exchange':row.get('exchange') or '','currency':row.get('currency') or '',
                 'market':row.get('market') or market_of(symbol),
                 'sector':row.get('sector') or '未分类','industry':row.get('industry') or '未分类',
                 'market_cap':row.get('market_cap'),
-                'fundamental_ok':True,
-                'fundamental_status':'ROE / 营收 / 净利润 / 自由现金流均有真实数据',
-                'roe':fundamental.get('roe'),'revenue':fundamental.get('revenue'),'net_income':fundamental.get('net_income'),'fcf':fundamental.get('free_cash_flow'),
+                'fundamental_ok':None,
+                'fundamental_status':'待候选池验证',
+                'roe':None,'revenue':None,'net_income':None,'fcf':None,
                 'strength':tech.get('score'),'value_score':tech.get('value_score'),
                 'pullback_score':tech.get('pullback_score'),'composite_score':tech.get('composite_score'),
                 'state':tech.get('state') or '暂无数据','value_state':tech.get('value_state') or '暂无数据',
@@ -372,6 +355,41 @@ def _scan_batch(rows):
             continue
     return out, errors, daily_moves
 
+
+
+def _apply_fundamental_gate(rows, errors):
+    """Second-stage fundamental verification. Only the best technical candidates
+    per market are queried, preserving the original hard fundamental gate without
+    making the entire market wait on hundreds/thousands of financial statements."""
+    groups={'us':[],'hk':[],'cn':[]}
+    for row in rows:
+        mk=row.get('market') or market_of(row.get('symbol',''))
+        groups.setdefault(mk,[]).append(row)
+    candidates=[]
+    for mk,items in groups.items():
+        items.sort(key=lambda x:(float(x.get('composite_score',-1)), float(x.get('strength',-1)), float(x.get('value_score',-1)), str(x.get('symbol',''))), reverse=True)
+        candidates.extend(items[:FUNDAMENTAL_CANDIDATES])
+    def check(row):
+        ok,data=_fundamental_gate(row.get('symbol',''))
+        return row,ok,data
+    passed=[]
+    with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS, thread_name_prefix='ael-fund') as pool:
+        futures=[pool.submit(check,row) for row in candidates]
+        for future in as_completed(futures):
+            row,ok,data=future.result()
+            symbol=row.get('symbol','')
+            if not ok:
+                errors[symbol]=f'基本面资格过滤未通过：ROE必须达到{ROE_MIN_PCT:g}%'
+                continue
+            row=dict(row)
+            row.update({
+                'fundamental_ok':True,
+                'fundamental_status':f'ROE ≥ {ROE_MIN_PCT:g}%',
+                'roe':data.get('roe'),'revenue':None,'net_income':None,'fcf':None
+            })
+            passed.append(row)
+    passed.sort(key=lambda x:(str(x.get('market','')), -float(x.get('composite_score',-1)), -float(x.get('strength',-1)), -float(x.get('value_score',-1)), str(x.get('symbol',''))))
+    return passed, len(candidates), len(passed)
 
 def _daily_sector_performance(moves, selected_markets, scan_group='all', group_label='全市场'):
     """Latest trading-day breadth/performance from all market-cap-eligible names.
@@ -461,7 +479,8 @@ def _job_snapshot(job):
             'current_market':job.get('current_market'),'current_sector':job.get('current_sector'),
             'current_sector_completed':job.get('current_sector_completed',0),'current_sector_total':job.get('current_sector_total',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{}),
-            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':'ROE + revenue + net income + FCF must all be real data'},
+            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% (hard gate)'},
+            'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],
             'universe_source':job.get('universe_source'),
             'results_by_market':_rank_results(partial,20),
@@ -523,7 +542,23 @@ def _run_scan_job(job):
             if cancelled:
                 job['status']='cancelled'; job['cancelled']=True
             else:
+                job['status']='fundamental'
+                job['current_market']='all'
+                job['current_sector']='基本面候选验证'
+                job['updated_at']=time()
+        if not cancelled:
+            passed, fund_candidates, fund_passed = _apply_fundamental_gate(job['rows'], job['scan_errors'])
+            with _SCAN_LOCK:
+                job['rows']=passed
+                job['fundamental_candidates']=fund_candidates
+                job['fundamental_passed']=fund_passed
                 job['status']='completed'
+                job['current_sector']=None
+                job['updated_at']=time()
+        with _SCAN_LOCK:
+            cancelled=job['cancel_event'].is_set()
+            if cancelled:
+                job['status']='cancelled'; job['cancelled']=True
             job['updated_at']=time()
             ranked=_rank_results(job['rows'],20)
             cache_key=job['cache_key']
@@ -532,8 +567,9 @@ def _run_scan_job(job):
             if not cancelled:
                 _SCAN_CACHE[cache_key]={'ts':time(),'data':{
                     'ok':True,'scan':{'markets':job['selected_markets'],'universe_size':job['total'],'matched':sum(len(v) for v in ranked.values()),
-                                     'top_n':20,'rules':'全市场目录→板块分批→批量历史行情→技术/回踩评分→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
-                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':'ROE + revenue + net income + FCF must all be real data'},
+                                     'top_n':20,'rules':'市值/OTC过滤→批量历史行情→高性价比50%+动能50%→ROE硬门槛→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
+                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% (hard gate)'},
+            'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
                     'results_by_market':ranked,'sector_rotation':{mk:_sector_rank([x for x in job['rows'] if x.get('market')==mk],10) for mk in job['selected_markets']},
                     'daily_sector_performance':_daily_sector_performance(job.get('daily_moves',[]), job['selected_markets'], job.get('scan_group','all'), SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label']),
@@ -573,7 +609,7 @@ def market_scan_start(markets: str = Query('us,hk,cn'), group: str = Query('all'
              'started_at':datetime.now(timezone.utc).isoformat(),'updated_at':time(),'total':0,'completed':0,'rows':[],
              'current_market':None,'current_sector':None,'current_sector_completed':0,'current_sector_total':0,
              'otc_counts':{'us':0,'hk':0,'cn':0},'cap_rejected':{'us':0,'hk':0,'cn':0},
-             'scan_errors':{},'daily_moves':[],
+             'scan_errors':{},'daily_moves':[],'fundamental_candidates':0,'fundamental_passed':0,
              'cancel_event':threading.Event(),'cache_key':cache_key,'error':None}
         _SCAN_JOBS[job['id']]=job
     threading.Thread(target=_run_scan_job,args=(job,),daemon=True,name=f'ael-scan-{job["id"]}').start()

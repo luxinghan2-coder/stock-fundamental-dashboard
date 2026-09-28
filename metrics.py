@@ -841,14 +841,14 @@ def technical_analysis(history, fib=None, pivots=None):
                         "回踩质量较低" if pullback_score is not None else "暂无数据")
 
         # ---------------- Composite score (100) ----------------
-        # The original strength/value dimensions remain visible and intact.
-        # Composite now adds an explicit pullback-quality dimension so that
-        # high/overheated stocks cannot dominate solely because of 52-week
-        # position and momentum strength.
+        # V2.5.8 Lite selection formula: value-for-money + momentum.
+        # Pullback quality remains an independent diagnostic factor.
         composite_score = None
         composite_state = "暂无数据"
-        if score is not None and value_score is not None and pullback_score is not None:
-            composite_score = round(score * 0.30 + value_score * 0.30 + pullback_score * 0.40)
+        if score is not None and value_score is not None:
+            # Lite selection model: value-for-money + momentum. Pullback is
+            # displayed separately and does not distort the core ranking.
+            composite_score = round(value_score * 0.50 + score * 0.50)
             composite_score = max(0, min(100, composite_score))
             composite_state = (
                 "强" if composite_score >= 75 else
@@ -872,7 +872,7 @@ def technical_analysis(history, fib=None, pivots=None):
             "score_breakdown":{"weights":{"均线结构":25,"MACD动能":20,"RSI动能":15,"20日动量":15,"52周位置":15,"量能":10},"components":[{"name":name,"score":round(v,1),"weight":w} for v,w,name in components],"formula":"技术强势分 = 均线结构×25% + MACD动能×20% + RSI动能×15% + 20日动量×15% + 52周位置×15% + 量能×10%"},
             "value_breakdown":value_meta,
             "pullback_breakdown":pullback_meta,
-            "composite_breakdown":{"weights":{"技术强势分":30,"技术价值分":30,"回踩质量分":40},"formula":"综合评分 = 技术强势分×30% + 技术价值分×30% + 回踩质量分×40%"},
+            "composite_breakdown":{"weights":{"高性价比分":50,"动能分":50},"formula":"综合评分 = 高性价比分×50% + 动能分×50%；回踩质量分独立展示；ROE门槛在排名前硬过滤"},
             "signals":signals,
             "indicator_errors":out.get("indicator_errors",{}),
             "indicators":{"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"macd_hist":hist_val,"macd_hist_delta":hist_delta,"kdj_k":k_val,"kdj_d":d_val,"kdj_j":j_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52,"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250]},
