@@ -4,6 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 from time import time
 from datetime import datetime, timezone
@@ -13,8 +14,8 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.2'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.2', version=APP_VERSION)
+APP_VERSION = '2.5.4'
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.4', version=APP_VERSION)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
@@ -25,13 +26,26 @@ DEFAULT_SCAN_UNIVERSE = [
     '600519.SS','601318.SS','600036.SS','600900.SS','601888.SS','600276.SS','000858.SZ','000333.SZ','002594.SZ','300750.SZ','601398.SS','601288.SS'
 ]
 
-SCAN_BATCH_SIZE = max(25, min(250, int(os.getenv('AEL_SCAN_BATCH_SIZE', '120'))))
+# V2.5.4: filter the universe before history download, then scan history in
+# bounded parallel batches. Four workers avoids the latency of serial scanning
+# without turning the Yahoo session into an uncontrolled request fan-out.
+SCAN_BATCH_SIZE = max(50, min(250, int(os.getenv('AEL_SCAN_BATCH_SIZE', '250'))))
+SCAN_WORKERS = max(1, min(6, int(os.getenv('AEL_SCAN_WORKERS', '4'))))
 SCAN_CACHE_TTL = int(os.getenv('AEL_SCAN_CACHE_TTL', '900'))
 UNIVERSE_CACHE_TTL = int(os.getenv('AEL_UNIVERSE_CACHE_TTL', '3600'))
 SCREENER_PAGE_SIZE = 250
 # 0 = follow Yahoo's reported total dynamically; no artificial 12,000-symbol cap.
 # A positive value remains available as an emergency operator override.
 SCREENER_MAX_SYMBOLS = int(os.getenv('AEL_SCAN_MAX_SYMBOLS', '0'))
+
+# Primary MARKET SCAN market-cap gates. Yahoo's screener values are scoped
+# to the selected regional market, so the thresholds below are expressed in
+# that market's local currency: USD / HKD / CNY respectively.
+MARKET_CAP_MIN = {'us': 20_000_000_000, 'hk': 30_000_000_000, 'cn': 30_000_000_000}
+MARKET_CAP_CURRENCY = {'us': 'USD', 'hk': 'HKD', 'cn': 'CNY'}
+# Yahoo exchange codes used for OTC/Pink Sheet listings. These are isolated
+# from the primary US scan and therefore cannot consume TOP20 or scan time.
+US_OTC_EXCHANGES = {'PNK', 'OQB', 'OQX', 'OTC'}
 
 _SCAN_CACHE = {}
 _UNIVERSE_CACHE = {}
@@ -156,19 +170,54 @@ def _discover_market(region: str):
     return rows
 
 
+def _is_us_otc(row):
+    return str(row.get('exchange') or '').upper().strip() in US_OTC_EXCHANGES
+
+
+def _passes_market_cap(row, market):
+    value=row.get('market_cap')
+    try:
+        cap=float(value)
+    except (TypeError, ValueError):
+        return False
+    return cap >= MARKET_CAP_MIN[market]
+
+
+def _filter_primary_universe(rows, market):
+    primary=[]
+    otc=[]
+    rejected_cap=0
+    for raw in rows:
+        row=dict(raw)
+        if market == 'us' and _is_us_otc(row):
+            otc.append(row)
+            continue
+        if not _passes_market_cap(row, market):
+            rejected_cap += 1
+            continue
+        row['market']=market
+        primary.append(row)
+    return primary, otc, rejected_cap
+
+
 def _scan_universe(markets: str):
     override=_scan_universe_override(markets)
     if override is not None:
-        return override, 'environment override'
+        return override, 'environment override', {'us':0,'hk':0,'cn':0}, {'us':0,'hk':0,'cn':0}
     selected=[m.strip().lower() for m in markets.split(',') if m.strip() in {'us','hk','cn'}]
     if not selected: selected=['us','hk','cn']
     regions={'us':'us','hk':'hk','cn':'cn'}
     rows=[]
+    otc_counts={'us':0,'hk':0,'cn':0}
+    cap_rejected={'us':0,'hk':0,'cn':0}
     for mk in selected:
         market_rows=_discover_market(regions[mk])
-        for r in market_rows:
+        primary, otc, rejected_cap = _filter_primary_universe(market_rows, mk)
+        otc_counts[mk]=len(otc)
+        cap_rejected[mk]=rejected_cap
+        for r in primary:
             r=dict(r); r['market']=mk; rows.append(r)
-    return rows, 'Yahoo Finance screener directory via yfinance-managed session'
+    return rows, 'Yahoo Finance screener directory → market-cap filter → OTC isolation', otc_counts, cap_rejected
 
 
 def _extract_history(frame, symbol):
@@ -292,6 +341,8 @@ def _job_snapshot(job):
             'total':job.get('total',0),'completed':job.get('completed',0),
             'current_market':job.get('current_market'),'current_sector':job.get('current_sector'),
             'current_sector_completed':job.get('current_sector_completed',0),'current_sector_total':job.get('current_sector_total',0),
+            'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{}),
+            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN},
             'universe_source':job.get('universe_source'),
             'results_by_market':_rank_results(partial,20),
             'sector_rotation':{mk:_sector_rank([x for x in partial if x.get('market')==mk],10) for mk in selected},
@@ -302,11 +353,13 @@ def _job_snapshot(job):
 
 def _run_scan_job(job):
     try:
-        rows,source=_scan_universe(job['markets'])
+        rows,source,otc_counts,cap_rejected=_scan_universe(job['markets'])
         selected=job['selected_markets']
         rows=[r for r in rows if r.get('market') in selected]
         with _SCAN_LOCK:
-            job['total']=len(rows); job['universe_source']=source; job['updated_at']=time()
+            job['total']=len(rows); job['universe_source']=source
+            job['otc_counts']=otc_counts; job['cap_rejected']=cap_rejected
+            job['updated_at']=time()
         # Process market -> sector -> bounded batches. This makes sector
         # progress visible and limits peak data-source pressure.
         for mk in selected:
@@ -319,16 +372,30 @@ def _run_scan_job(job):
                 with _SCAN_LOCK:
                     job['current_market']=mk; job['current_sector']=sector
                     job['current_sector_completed']=0; job['current_sector_total']=len(sector_rows); job['updated_at']=time()
-                for start in range(0,len(sector_rows),SCAN_BATCH_SIZE):
-                    if job['cancel_event'].is_set(): break
-                    batch=sector_rows[start:start+SCAN_BATCH_SIZE]
-                    batch_results,batch_errors=_scan_batch(batch)
-                    with _SCAN_LOCK:
-                        job['rows'].extend(batch_results)
-                        job['scan_errors'].update(batch_errors)
-                        job['completed'] += len(batch)
-                        job['current_sector_completed'] += len(batch)
-                        job['updated_at']=time()
+                batches=[sector_rows[start:start+SCAN_BATCH_SIZE] for start in range(0,len(sector_rows),SCAN_BATCH_SIZE)]
+                # Run a bounded number of history batches concurrently. Each
+                # batch itself keeps yfinance threads disabled, preventing
+                # nested fan-out. Results are merged as soon as a batch ends.
+                with ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix='ael-batch') as pool:
+                    futures={}
+                    for batch in batches:
+                        if job['cancel_event'].is_set(): break
+                        futures[pool.submit(_scan_batch, batch)]=(len(batch), batch)
+                    for future in as_completed(futures):
+                        batch_size,batch_rows=futures[future]
+                        if job['cancel_event'].is_set():
+                            continue
+                        try:
+                            batch_results,batch_errors=future.result()
+                        except Exception as exc:
+                            batch_results=[]
+                            batch_errors={r['symbol']:f'批次扫描失败：{str(exc)[:180]}' for r in batch_rows}
+                        with _SCAN_LOCK:
+                            job['rows'].extend(batch_results)
+                            job['scan_errors'].update(batch_errors)
+                            job['completed'] += batch_size
+                            job['current_sector_completed'] += batch_size
+                            job['updated_at']=time()
         with _SCAN_LOCK:
             cancelled=job['cancel_event'].is_set()
             if cancelled:
@@ -344,7 +411,7 @@ def _run_scan_job(job):
                 _SCAN_CACHE[cache_key]={'ts':time(),'data':{
                     'ok':True,'scan':{'markets':job['selected_markets'],'universe_size':job['total'],'matched':sum(len(v) for v in ranked.values()),
                                      'top_n':20,'rules':'全市场目录→板块分批→批量历史行情→技术/回踩评分→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
-                                     'scanner':'background batched scan'},
+                                     'scanner':'background filtered + parallel batched scan','scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN},'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
                     'results_by_market':ranked,'sector_rotation':{mk:_sector_rank([x for x in job['rows'] if x.get('market')==mk],10) for mk in job['selected_markets']},
                     'results':[row for mk in job['selected_markets'] for row in ranked.get(mk,[])], 'cached':False}}
     except Exception as exc:
@@ -380,6 +447,7 @@ def market_scan_start(markets: str = Query('us,hk,cn'), force: bool = Query(Fals
         job={'id':uuid.uuid4().hex[:12],'markets':cache_key,'selected_markets':selected,'status':'running','cancelled':False,
              'started_at':datetime.now(timezone.utc).isoformat(),'updated_at':time(),'total':0,'completed':0,'rows':[],
              'current_market':None,'current_sector':None,'current_sector_completed':0,'current_sector_total':0,
+             'otc_counts':{'us':0,'hk':0,'cn':0},'cap_rejected':{'us':0,'hk':0,'cn':0},
              'scan_errors':{},
              'cancel_event':threading.Event(),'cache_key':cache_key,'error':None}
         _SCAN_JOBS[job['id']]=job
