@@ -748,7 +748,7 @@ async function runWhisper(){
    const cr=document.getElementById('whisperConsensusRevenue'),ce=document.getElementById('whisperConsensusEps'),wr=document.getElementById('whisperWhisperRevenue'),we=document.getElementById('whisperWhisperEps'),ir=document.getElementById('whisperImpliedRevenue'),ie=document.getElementById('whisperImpliedEps'),gap=document.getElementById('whisperGap');
    if(cr)cr.textContent=money(rev.consensus); if(ce)ce.textContent=money(eps.consensus,3); if(wr)wr.textContent=money(rev.whisper); if(we)we.textContent=money(eps.whisper,3); if(ir)ir.textContent=money(rev.implied); if(ie)ie.textContent=money(eps.implied,3);
    if(gap){
-     gap.innerHTML=`<b>三层结果：</b> Revenue ${money(rev.consensus)} → Whisper ${money(rev.whisper)} → Market-Implied ${money(rev.implied)} · 市场相对卖方 Price-in ${pct(rev.pricein_pct)}<br>EPS ${money(eps.consensus,3)} → Whisper ${money(eps.whisper,3)} → Market-Implied ${money(eps.implied,3)} · 市场相对卖方 Price-in ${pct(eps.pricein_pct)}`;
+     gap.innerHTML=`<b>目标财季：</b> ${esc(d.target_period||'待确认')} · 严格 Quarter Lock${d.last_actual_period?` · 上一实际财季 ${esc(d.last_actual_period)}`:''}<br><b>三层结果：</b> Revenue ${money(rev.consensus)} → Whisper ${money(rev.whisper)} → Market-Implied ${money(rev.implied)} · 市场相对卖方 Price-in ${pct(rev.pricein_pct)}<br>EPS ${money(eps.consensus,3)} → Whisper ${money(eps.whisper,3)} → Market-Implied ${money(eps.implied,3)} · 市场相对卖方 Price-in ${pct(eps.pricein_pct)}`;
    }
    if(sum)sum.innerHTML=[['营收 Price-in 门槛',money(rev.implied)],['EPS Price-in 门槛',money(eps.implied,3)],['AEL Whisper vs Consensus',`${pct(rev.whisper_premium_pct)} / ${pct(eps.whisper_premium_pct)}`],['可信度',d.confidence_pct==null?'—':Number(d.confidence_pct).toFixed(0)+'%']].map(x=>`<div class="ael-pro-metric"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
    const lines=[];
@@ -761,7 +761,7 @@ async function runWhisper(){
    const providers=Array.isArray(d.provider_status)?d.provider_status.filter(x=>x.available).map(x=>x.source):[];lines.push('<b>有效数据源：</b>'+esc(providers.length?providers.join(' · '):'AEL基本面Nowcast + 行情/期权'));
    if(d.guidance?.available)lines.push(`<b>公司指引：</b>EPS ${money(d.guidance.eps_low,3)}–${money(d.guidance.eps_high,3)} · Revenue ${money(d.guidance.revenue_low)}–${money(d.guidance.revenue_high)}`);
    if(d.licensed_reference?.available)lines.push(`<b>EW参考：</b>已取得合法 Earnings Whispers API；官方 Whisper EPS ${money(d.licensed_reference.whisper_eps,3)}，仅作独立校准，不冒充 AEL 数值。`);
-   lines.push('<b>下一份财报：</b>'+esc(date)); lines.push('<b>定义：</b>'+esc(d.method_note||''));if(ev)ev.innerHTML=lines.join('<br>');
+   lines.push('<b>目标财季：</b>'+esc(d.target_period||'待确认')+' · <b>下一份财报：</b>'+esc(date)); lines.push('<b>定义：</b>'+esc(d.method_note||''));if(ev)ev.innerHTML=lines.join('<br>');
  }catch(e){if(sum)sum.innerHTML='<div class="ael-pro-empty" style="grid-column:1/-1">AEL 三层数据链暂时异常，请稍后重试。</div>';if(ev)ev.textContent='AEL 多源数据链异常：'+e.message+' · 不影响 Lite。';}
 }
 
