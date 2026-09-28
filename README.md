@@ -1,4 +1,4 @@
-# AEL V2.6.5 — MARKET-IMPLIED WHISPER
+# AEL V2.6.6 — MARKET-IMPLIED WHISPER
 
 本版在 V2.6.2 Smart Quarter Resolver 基础上加入公司级 Analyst Bias 校准。
 
@@ -74,5 +74,5 @@ The Whisper module now has an isolated historical validation layer:
 The backtest is optional and never runs on Lite, SINGLE, or MARKET SCAN requests.
 
 
-## V2.6.5 Confidence
+## V2.6.6 Confidence
 The Whisper confidence field is now uncalibrated until the user explicitly runs the historical Whisper Backtest Lab. Historical Calibration is a score, not a probability. The completed backtest feeds an isolated calibration cache; the live Whisper endpoint reads that cache without launching a historical backtest, preserving Lite/SINGLE/MARKET SCAN latency.
