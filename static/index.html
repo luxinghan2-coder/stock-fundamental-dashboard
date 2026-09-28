@@ -250,7 +250,7 @@ body.ael-force-mobile .ael-pro-option-card{width:100%;min-width:0}
         </div>
       </div>
     </section>
-    <section id="pro-tab-expectation" class="ael-pro-tabpanel" style="display:none"><div class="ael-pro-grid"><div class="ael-pro-stack"><div class="ael-pro-card"><div class="ael-pro-section">Buy-Side Expectation · 买方预期引擎</div><div class="ael-pro-note">只在你主动点击时加载。主链不参与 Lite。免费源优先：Yahoo / SEC / CFTC / xStocks；可选免费 Key 可增强 Alpha Vantage / Finnhub / FINRA。所有来源分层显示 observed / inferred / unavailable / not applicable，绝不拿代理变量冒充暗池。</div><div class="ael-pro-inputs" style="margin-top:10px"><div class="ael-factor-search" style="position:relative;flex:1;min-width:180px"><input id="expectationSymbol" value="AAPL" placeholder="搜索代码 / 中文名 / 英文名" autocomplete="off" style="width:100%"><div id="expectationCandidateBox" class="ael-factor-candidates"></div></div><button class="ael-pro-btn" onclick="runExpectation()">读取买方预期</button><button class="ael-pro-btn" onclick="runWhisper()" style="margin-left:6px">读取 AEL 暗盘数值</button></div><div id="expectationStatus" class="ael-pro-note" style="margin-top:8px">尚未请求。</div><div id="expectationFreeSourceStatus" class="ael-pro-note" style="margin-top:7px"></div><div id="onchainEquityCard" class="ael-pro-note" style="margin-top:8px"></div></div><div class="ael-pro-card"><div class="ael-pro-section">预期差观察</div><div id="expectationSummary" class="ael-pro-metrics"><div class="ael-pro-metric"><span>现价</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>分析师目标价差</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>期权隐含波动</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>观测源数量</span><b>暂无数据</b></div></div></div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">AEL MARKET-IMPLIED WHISPER™</div><div class="ael-pro-note"><b>Mr.chen's original Earnings Whisper Method</b><br>市场隐含暗盘预期｜估算市场在财报公布前真正已经 Price-in 的营收、EPS 与指引门槛。AEL 只使用公开可验证数据推断，不冒充 Earnings Whispers 私有 Whisper 或私人买方模型；每一项都有证据拆解，缺失就显示暂无数据。</div><div id="whisperSummary" class="ael-pro-metrics" style="margin-top:8px"><div class="ael-pro-metric"><span>AEL 隐含营收</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>AEL 隐含 EPS</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>市场 Beat 门槛</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>置信度</span><b>暂无数据</b></div></div><div id="whisperEvidence" class="ael-pro-note" style="margin-top:8px">点击「读取 AEL 暗盘数值」后显示历史惊喜、预测修正、价格与期权信号贡献。</div></div></div><div class="ael-pro-stack"><div class="ael-pro-card"><div class="ael-pro-section">证据矩阵</div><div id="expectationMatrix" class="ael-pro-empty">运行后显示 observed / inferred / unavailable。</div></div><div class="ael-pro-card"><div class="ael-pro-section">方法与边界</div><div id="expectationMethod" class="ael-pro-note">AEL 不声称能看到真正的私人买方订单簿。下一份财报模块只从事件期权、价格/成交量与可用ATS活动推断买方定位；卖方目标价、评级与EPS共识仅作为独立参考，不进入买方暗盘预期核心。</div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">① 链上暗盘｜Crypto On-Chain Dark Flow</div><div id="onchainDarkCard" class="ael-pro-empty">仅对支持的加密资产加载。运行后显示交易所净流入、储备变化、Top10 大额流入占比等可验证链上痕迹；没有链上数据源时只影响本卡。</div></div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">② 下一份财报｜买方暗盘预期</div><div id="nextEarningsDarkCard" class="ael-pro-empty">只研究财报事件前可观测的买方/市场定位：事件期权成交与持仓、IV偏斜、财报前价格/成交量、可用ATS活动；不把卖方目标价、分析师评级或EPS共识修正当作暗盘预期。</div></div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">传统场外暗盘证据｜ATS</div><div id="darkExpectationCard" class="ael-pro-empty">运行后显示 FINRA ATS 证据；无授权或无数据时保持暂无数据，不影响其他模块。</div></div></div></div></div></section>
+    <section id="pro-tab-expectation" class="ael-pro-tabpanel" style="display:none"><div class="ael-pro-grid"><div class="ael-pro-stack"><div class="ael-pro-card"><div class="ael-pro-section">Buy-Side Expectation · 买方预期引擎</div><div class="ael-pro-note">只在你主动点击时加载。主链不参与 Lite。免费源优先：Yahoo / SEC / CFTC / xStocks；可选免费 Key 可增强 Alpha Vantage / Finnhub / FINRA。所有来源分层显示 observed / inferred / unavailable / not applicable，绝不拿代理变量冒充暗池。</div><div class="ael-pro-inputs" style="margin-top:10px"><div class="ael-factor-search" style="position:relative;flex:1;min-width:180px"><input id="expectationSymbol" value="AAPL" placeholder="搜索代码 / 中文名 / 英文名" autocomplete="off" style="width:100%"><div id="expectationCandidateBox" class="ael-factor-candidates"></div></div><button class="ael-pro-btn" onclick="runExpectation()">读取买方预期</button><button class="ael-pro-btn" onclick="runWhisper()" style="margin-left:6px">读取 AEL 暗盘数值</button></div><div id="expectationStatus" class="ael-pro-note" style="margin-top:8px">尚未请求。</div><div id="expectationFreeSourceStatus" class="ael-pro-note" style="margin-top:7px"></div><div id="onchainEquityCard" class="ael-pro-note" style="margin-top:8px"></div></div><div class="ael-pro-card"><div class="ael-pro-section">预期差观察</div><div id="expectationSummary" class="ael-pro-metrics"><div class="ael-pro-metric"><span>现价</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>分析师目标价差</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>期权隐含波动</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>观测源数量</span><b>暂无数据</b></div></div></div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">AEL MARKET-IMPLIED WHISPER™</div><div style="font-size:14px;font-weight:700;margin-top:3px">Mr.chen's original Earnings Whisper Method</div><div class="ael-pro-note" style="margin-top:6px">市场真正期待它交出什么成绩？AEL 只用公开可验证数据推断市场已经 Price-in 的下一季营收、EPS 与最低超预期门槛；不是 Earnings Whispers 私有 Whisper，也不冒充私人买方模型。</div><div id="whisperSummary" class="ael-pro-metrics" style="margin-top:10px"><div class="ael-pro-metric"><span>市场隐含营收</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>市场隐含 EPS</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>营收最低超预期</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>EPS 最低超预期</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>可信度</span><b>暂无数据</b></div><div class="ael-pro-metric"><span>下一份财报</span><b>暂无数据</b></div></div><div id="whisperEvidence" class="ael-pro-note" style="margin-top:10px">点击「读取 AEL 暗盘数值」后显示：一致预期 → AEL 市场隐含预期 → 最低门槛，以及历史财报惊喜、预测修正、价格与期权信号。</div></div></div><div class="ael-pro-stack"><div class="ael-pro-card"><div class="ael-pro-section">证据矩阵</div><div id="expectationMatrix" class="ael-pro-empty">运行后显示 observed / inferred / unavailable。</div></div><div class="ael-pro-card"><div class="ael-pro-section">方法与边界</div><div id="expectationMethod" class="ael-pro-note">AEL 不声称能看到真正的私人买方订单簿。下一份财报模块只从事件期权、价格/成交量与可用ATS活动推断买方定位；卖方目标价、评级与EPS共识仅作为独立参考，不进入买方暗盘预期核心。</div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">① 链上暗盘｜Crypto On-Chain Dark Flow</div><div id="onchainDarkCard" class="ael-pro-empty">仅对支持的加密资产加载。运行后显示交易所净流入、储备变化、Top10 大额流入占比等可验证链上痕迹；没有链上数据源时只影响本卡。</div></div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">② 下一份财报｜买方暗盘预期</div><div id="nextEarningsDarkCard" class="ael-pro-empty">只研究财报事件前可观测的买方/市场定位：事件期权成交与持仓、IV偏斜、财报前价格/成交量、可用ATS活动；不把卖方目标价、分析师评级或EPS共识修正当作暗盘预期。</div></div><div class="ael-pro-card" style="margin-top:10px"><div class="ael-pro-section">传统场外暗盘证据｜ATS</div><div id="darkExpectationCard" class="ael-pro-empty">运行后显示 FINRA ATS 证据；无授权或无数据时保持暂无数据，不影响其他模块。</div></div></div></div></div></section>
 <section id="pro-tab-macro" class="ael-pro-tabpanel" style="display:none">
       <div class="ael-macro-top">
         <div class="ael-pro-card ael-macro-overview-card">
@@ -740,24 +740,37 @@ async function runWhisper(){
  const s=(resolveSearchItem(raw)?.symbol||raw).toUpperCase();
  const sum=document.getElementById('whisperSummary'), ev=document.getElementById('whisperEvidence');
  if(!s){if(ev)ev.textContent='请输入股票代码。';return;}
- if(sum)sum.innerHTML='<div class="ael-pro-empty" style="grid-column:1/-1">正在计算 AEL MARKET-IMPLIED WHISPER™……</div>';
+ if(sum)sum.innerHTML='<div class="ael-pro-empty" style="grid-column:1/-1">正在读取公开数据并计算 AEL MARKET-IMPLIED WHISPER™……</div>';
  try{
    const r=await fetch(`/api/pro/whisper/${encodeURIComponent(s)}`); const d=await r.json(); if(!r.ok)throw new Error(d.detail||d.error||'AEL暗盘读取失败');
-   const rev=d.revenue||{},eps=d.eps||{},thr=d.market_beat_threshold||{};
+   const rev=d.revenue||{},eps=d.eps||{};
+   const money=(v,dg=2)=>whisperMoney(v,dg);
+   const pct=(v,dg=2)=>whisperPct(v,dg);
+   const date=d.next_earnings_date?String(d.next_earnings_date).slice(0,10):'暂无数据';
    if(sum)sum.innerHTML=[
-    ['市场隐含营收',whisperMoney(rev.implied)],
-    ['市场隐含 EPS',whisperMoney(eps.implied,3)],
-    ['营收最低门槛',whisperPct(rev.implied_surprise_pct,2)],
-    ['EPS 最低门槛',whisperPct(eps.implied_surprise_pct,2)],
-    ['模型置信度',d.confidence_pct==null?'暂无数据':Number(d.confidence_pct).toFixed(0)+'%'],
-    ['下一份财报',d.next_earnings_date?esc(String(d.next_earnings_date).slice(0,10)):'暂无数据']
+    ['市场隐含营收',money(rev.implied)],
+    ['市场隐含 EPS',money(eps.implied,3)],
+    ['营收最低超预期',pct(rev.implied_surprise_pct,2)],
+    ['EPS 最低超预期',pct(eps.implied_surprise_pct,2)],
+    ['可信度',d.confidence_pct==null?'暂无数据':Number(d.confidence_pct).toFixed(0)+'%'],
+    ['下一份财报',date]
    ].map(x=>`<div class="ael-pro-metric"><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
    const lines=[];
-   [['EPS',eps.evidence],['Revenue',rev.evidence]].forEach(([name,parts])=>{if(Array.isArray(parts)&&parts.length)lines.push('<b>'+name+'：</b>'+parts.map(x=>`${esc(x.factor)} ${x.contribution_pct>=0?'+':''}${Number(x.contribution_pct).toFixed(2)}ppt`).join(' · '));else lines.push('<b>'+name+'：</b>暂无足够可验证输入');});
+   const explain=(name,obj)=>{
+     if(obj?.implied!=null){
+       const c=obj.consensus!=null?`一致预期 ${money(obj.consensus,obj===eps?3:2)} → AEL 市场隐含 ${money(obj.implied,obj===eps?3:2)}`:'AEL 市场隐含值已生成';
+       return `<b>${name}：</b>${c} · 最低超预期 ${pct(obj.implied_surprise_pct,2)}`;
+     }
+     return `<b>${name}：</b>暂无可验证基准 · ${esc(obj?.reason||'缺少足够公开数据，暂不生成数值。')}`;
+   };
+   lines.push(explain('营收',rev));
+   lines.push(explain('EPS',eps));
+   if(Array.isArray(eps.evidence)&&eps.evidence.length) lines.push('<b>EPS 证据：</b>'+eps.evidence.map(x=>`${esc(x.factor)} ${x.contribution_pct>=0?'+':''}${Number(x.contribution_pct).toFixed(2)}ppt`).join(' · '));
+   if(Array.isArray(rev.evidence)&&rev.evidence.length) lines.push('<b>营收证据：</b>'+rev.evidence.map(x=>`${esc(x.factor)} ${x.contribution_pct>=0?'+':''}${Number(x.contribution_pct).toFixed(2)}ppt`).join(' · '));
    lines.push('<b>Guidance：</b>'+esc(d.guidance?.reason||'暂无数据'));
    lines.push('<b>定义：</b>'+esc(d.method_note||''));
    if(ev)ev.innerHTML=lines.join('<br>');
- }catch(e){if(sum)sum.innerHTML='<div class="ael-pro-empty" style="grid-column:1/-1">暂无数据</div>';if(ev)ev.textContent='AEL 暗盘模块失败：'+e.message+' · 不影响 Lite。';}
+ }catch(e){if(sum)sum.innerHTML='<div class="ael-pro-empty" style="grid-column:1/-1">暂无数据</div>';if(ev)ev.textContent='AEL 暗盘模块暂时无法读取公开源：'+e.message+' · 不影响 Lite。';}
 }
 
 function setAELMode(mode){
