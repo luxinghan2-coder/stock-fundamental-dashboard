@@ -15,6 +15,7 @@ already demanded. External providers are optional; every provider is isolated.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 import math, os, re, threading
+from io import StringIO
 import requests
 import pandas as pd
 import yfinance as yf
@@ -171,21 +172,35 @@ def _quarterly_fallback(symbol):
 
 
 def _target_period_from_history(qtr):
-    """Infer the next fiscal period from the latest reported fiscal period.
+    """Resolve the next *fiscal* quarter without assuming a 3-calendar-month clock.
 
-    This is deliberately a *guard rail*, not an estimate.  If a provider does
-    not expose fiscalDateEnding, its estimate may only be admitted when its
-    earnings-report date also lines up with the same upcoming report window.
+    Most issuers are close to 13-week quarters, but 52/53-week calendars can
+    drift by several days.  We therefore extrapolate the next period from the
+    median spacing of the last reported fiscal period-ends and retain a broad
+    tolerance for provider labels such as "Sep 2026".
     """
-    last = qtr.get("last_quarter") if isinstance(qtr, dict) else None
+    rows = (qtr or {}).get("rows") or []
+    last = (qtr or {}).get("last_quarter")
     if not last:
-        return {"target_end": None, "last_actual_end": None}
+        return {"target_end": None, "last_actual_end": None, "target_month": None, "target_year": None}
     try:
+        dates = []
+        for r in rows[-6:]:
+            d = pd.Timestamp(r.get("date")).normalize()
+            if not dates or d != dates[-1]:
+                dates.append(d)
         last_dt = pd.Timestamp(last).normalize()
-        target = (last_dt + pd.DateOffset(months=3)).normalize()
-        return {"target_end": target.date().isoformat(), "last_actual_end": last_dt.date().isoformat()}
+        if len(dates) >= 3:
+            gaps = [(dates[i] - dates[i-1]).days for i in range(1, len(dates))]
+            step = int(round(float(pd.Series(gaps[-4:]).median())))
+        else:
+            step = 91
+        step = int(_clamp(step, 80, 100))
+        target = last_dt + pd.Timedelta(days=step)
+        return {"target_end": target.date().isoformat(), "last_actual_end": last_dt.date().isoformat(),
+                "target_month": int(target.month), "target_year": int(target.year), "step_days": step}
     except Exception:
-        return {"target_end": None, "last_actual_end": last}
+        return {"target_end": last, "last_actual_end": last, "target_month": None, "target_year": None}
 
 
 def _date_distance_days(a, b):
@@ -195,13 +210,38 @@ def _date_distance_days(a, b):
         return None
 
 
-def _period_matches(row, target_period, target_earnings_date=None):
-    """Hard fiscal-quarter gate for consensus rows.
+def _period_label_matches(row, target_period):
+    """Validate human labels such as Current Qtr. (Sep 2026)."""
+    label = str(row.get("period_label") or row.get("period") or "")
+    if not label or not target_period:
+        return False
+    y = target_period.get("target_year")
+    m = target_period.get("target_month")
+    if not y or not m:
+        return False
+    # English month names and numeric month/year labels.
+    months = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    lm = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*(20\d{2})", label, re.I)
+    if lm:
+        return months[lm.group(1)[:3].lower()] == m and int(lm.group(2)) == y
+    lm = re.search(r"(\d{1,2})[/-](20\d{2})", label)
+    if lm:
+        return int(lm.group(1)) == m and int(lm.group(2)) == y
+    return False
 
-    1. Prefer an explicit fiscalDateEnding/period_ending.
-    2. If absent, require the provider's earnings date to be close to the
-       target earnings date (when one is known).
-    3. If neither exists, reject the row rather than mixing quarters.
+
+def _period_matches(row, target_period, target_earnings_date=None):
+    """Smart fiscal-quarter gate.
+
+    Evidence priority:
+      1) explicit fiscal period end
+      2) provider period label (e.g. Current Qtr. Sep 2026)
+      3) common earnings-event date
+      4) no evidence => reject
+
+    This fixes both failure modes: stale SNDK EPS 33.28 is rejected, while a
+    legitimate AAPL current-quarter table that has no explicit fiscalDateEnding
+    is admitted from its period label / earnings date.
     """
     if not row or not target_period:
         return False
@@ -209,57 +249,198 @@ def _period_matches(row, target_period, target_earnings_date=None):
     explicit = row.get("fiscal_date_ending") or row.get("period_ending")
     if explicit and target_end:
         d = _date_distance_days(explicit, target_end)
-        return d is not None and d <= 35
+        if d is not None and d <= 45:
+            return True
+    if _period_label_matches(row, target_period):
+        return True
     ed = row.get("earnings_date")
     if ed and target_earnings_date:
         d = _date_distance_days(ed, target_earnings_date)
-        return d is not None and d <= 7
-    # No period evidence = unsafe.  This is what prevents a stale historical
-    # EPS (e.g. SNDK's old 33.28) from contaminating the current quarter.
+        if d is not None and d <= 10:
+            return True
     return False
 
 
-def _public_web_estimates(symbol):
-    """Keyless public estimate fallback.
+def _flatten_table(df):
+    """Convert pandas read_html output to simple row dictionaries."""
+    try:
+        d = df.copy()
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = [" | ".join(str(x) for x in c if str(x) != "nan") for c in d.columns]
+        else:
+            d.columns = [str(c) for c in d.columns]
+        d = d.fillna("")
+        return [{str(k): v for k, v in r.items()} for r in d.to_dict("records")]
+    except Exception:
+        return []
 
-    GNG Research exposes current-quarter consensus, revision history and
-    revenue consensus in server-rendered HTML. This is intentionally a fallback
-    behind licensed APIs, not the primary source. MarketBeat is a second public
-    fallback for basic consensus/date data.
+
+def _extract_yahoo_analysis_tables(text, symbol):
+    """Parse Yahoo's public /analysis tables without relying on yfinance internals."""
+    out={"available":False,"source":"Yahoo Finance public analysis page","error":None,
+         "eps":None,"revenue":None,"eps_low":None,"eps_high":None,
+         "revenue_low":None,"revenue_high":None,"analysts_eps":None,"analysts_revenue":None,
+         "revision_7d_pct":None,"revision_30d_pct":None,"revision_90d_pct":None,
+         "earnings_date":None,"period_label":None}
+    try:
+        tables=pd.read_html(StringIO(text))
+    except Exception as e:
+        out["error"]=str(e)[:180]; return out
+    def clean(x):
+        return re.sub(r"\s+"," ",str(x)).strip()
+    for df in tables:
+        rows=_flatten_table(df)
+        if not rows: continue
+        headers=[clean(x) for x in df.columns]
+        # Determine the first column/row label and current-quarter column.
+        qcol=None
+        for h in headers:
+            if re.search(r"Current Qtr\.?\s*\(|Current qtr\.?\s*\(|Current Qtr", h, re.I):
+                qcol=h; break
+        if qcol is None:
+            # Some parsers put the quarter label into the first data row.
+            for r in rows[:2]:
+                for k,v in r.items():
+                    if re.search(r"Current Qtr.*20\d{2}", clean(v), re.I):
+                        qcol=k; break
+                if qcol: break
+        if qcol is None: continue
+        qlabel=clean(qcol)
+        # Normalize common first-column names.
+        label_col=headers[0]
+        def find_row(*labels):
+            for r in rows:
+                lv=clean(r.get(label_col,""))
+                if any(lv.lower()==x.lower() for x in labels): return r
+            return None
+        if any("Avg. Estimate" in clean(r.get(label_col,"")) for r in rows):
+            r=find_row("Avg. Estimate")
+            if r:
+                raw=clean(r.get(qcol,""))
+                val=_money_token(raw)
+                # Revenue estimates are normally expressed in K/M/B/T and are
+                # orders of magnitude larger than EPS. Only admit this table
+                # as Revenue when the parsed number is >= $100M or carries a
+                # magnitude suffix; otherwise it is the EPS table.
+                if val is not None and (re.search(r"[KMBT]", raw, re.I) or val >= 1e8):
+                    out["revenue"]=val; out["period_label"]=qlabel
+                    rlo=find_row("Low Estimate"); rhi=find_row("High Estimate"); ra=find_row("No. of Analysts")
+                    if rlo: out["revenue_low"]=_money_token(clean(rlo.get(qcol,"")))
+                    if rhi: out["revenue_high"]=_money_token(clean(rhi.get(qcol,"")))
+                    if ra: out["analysts_revenue"]=_finite(ra.get(qcol))
+        # EPS table has the same Avg. Estimate row; its current-quarter value
+        # is small (normally < 1000), while Revenue is >= $100M.
+        r=find_row("Avg. Estimate")
+        if r:
+            val=_finite(r.get(qcol))
+            if val is not None and abs(val) < 1000:
+                out["eps"]=val; out["period_label"]=qlabel
+                rlo=find_row("Low Estimate"); rhi=find_row("High Estimate"); ra=find_row("No. of Analysts")
+                if rlo: out["eps_low"]=_finite(rlo.get(qcol))
+                if rhi: out["eps_high"]=_finite(rhi.get(qcol))
+                if ra: out["analysts_eps"]=_finite(ra.get(qcol))
+        if any("EPS Trend" in clean(v) for r in rows[:2] for v in r.values()):
+            rc=find_row("Current Estimate"); r7=find_row("7 Days Ago"); r30=find_row("30 Days Ago"); r90=find_row("90 Days Ago")
+            cur=_finite(rc.get(qcol)) if rc else None
+            for days,rr in ((7,r7),(30,r30),(90,r90)):
+                old=_finite(rr.get(qcol)) if rr else None
+                if cur is not None and old not in (None,0): out[f"revision_{days}d_pct"]=(cur/old-1)*100
+    out["available"]=out["eps"] is not None or out["revenue"] is not None
+    return out
+
+
+def _yahoo_analysis_web(symbol):
+    url=f"https://finance.yahoo.com/quote/{symbol}/analysis/"
+    text,err=_safe_text(url,headers={"User-Agent":"Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/126 Safari/537.36","Accept-Language":"en-US,en;q=0.9"},timeout=8)
+    if not text:
+        return {"available":False,"source":"Yahoo Finance public analysis page","error":err}
+    return _extract_yahoo_analysis_tables(text,symbol)
+
+
+def _zacks_public(symbol):
+    """Keyless Zacks public detailed-estimates fallback."""
+    out={"available":False,"source":"Zacks public earnings estimates","error":None,
+         "eps":None,"revenue":None,"revision_30d_pct":None,"period_label":None}
+    url=f"https://www.zacks.com/stock/quote/{symbol.lower()}/detailed-earning-estimates"
+    text,err=_safe_text(url,headers={"User-Agent":"Mozilla/5.0","Accept-Language":"en-US,en;q=0.9"},timeout=8)
+    if not text:
+        # Alternate public report endpoint used by Zacks mirrors.
+        text,err2=_safe_text(f"https://ica.zacks.com/report.php?t={symbol.lower()}&type=detailed",headers={"User-Agent":"Mozilla/5.0"},timeout=8)
+        if not text: out["error"]=err2 or err; return out
+    try:
+        tables=pd.read_html(StringIO(text))
+    except Exception as e:
+        out["error"]=str(e)[:180]; return out
+    for df in tables:
+        rows=_flatten_table(df)
+        if not rows: continue
+        headers=[str(c) for c in df.columns]
+        qcol=next((h for h in headers if re.search(r"This Quarter.*20\d{2}|Current.*20\d{2}",h,re.I)),None)
+        if not qcol: continue
+        label_col=headers[0]
+        for r in rows:
+            lv=str(r.get(label_col,""))
+            if lv.lower().startswith("average estimate") or lv.lower()=="current":
+                v=_finite(r.get(qcol))
+                if v is not None and abs(v)<1000: out["eps"]=v; out["period_label"]=qcol
+    out["available"]=out["eps"] is not None or out["revenue"] is not None
+    return out
+
+
+def _public_web_estimates(symbol):
+    """Keyless public multi-source estimate fallback.
+
+    Yahoo's public analysis page is the primary keyless source because it
+    exposes current-quarter Revenue/EPS, ranges, analyst count and EPS trend.
+    GNG / MarketBeat / Zacks remain additional fallbacks. All are still subject
+    to the smart fiscal-quarter gate before entering the model.
     """
+    funcs=[_yahoo_analysis_web,_public_gng_estimates,_zacks_public]
+    results=[]
+    for fn in funcs:
+        try:
+            r=fn(symbol); results.append(r)
+            if r.get("available") and (r.get("eps") is not None or r.get("revenue") is not None):
+                # Keep going: cross-validation is useful when multiple public sources work.
+                pass
+        except Exception as e:
+            results.append({"available":False,"source":fn.__name__,"error":str(e)[:180]})
+    rank={"Yahoo Finance public analysis page":0,"Public estimate pages":1,"Zacks public earnings estimates":2}
+    results.sort(key=lambda x:rank.get(x.get("source"),99))
+    for r in results:
+        if r.get("available"):
+            return r
+    return results[0] if results else {"available":False,"source":"Public estimate pages"}
+
+
+def _public_gng_estimates(symbol):
+    """Server-rendered GNG/MarketBeat fallback retained as a separate adapter."""
     out={"available":False,"source":"Public estimate pages","error":None,
          "eps":None,"revenue":None,"revision_7d_pct":None,"revision_30d_pct":None,"revision_90d_pct":None,
          "analysts_eps":None,"analysts_revenue":None,"earnings_date":None,
          "eps_low":None,"eps_high":None,"revenue_low":None,"revenue_high":None}
-    text,err=_safe_text(f"https://www.gngresearch.com/stock/{symbol}/")
+    text,err=_safe_text(f"https://www.gngresearch.com/stock/{symbol}/",timeout=8)
     if text:
-        # Upcoming estimate block: current period is the first one before the
-        # next period. Regexes are deliberately narrow to avoid annual values.
-        m=re.search(r"Period ending[^<]{0,100}.*?EPS Consensus\s*\$?([\d,.]+).*?Range\s*\$?([\d,.]+)\s*-\s*\$?([\d,.]+).*?(\d+)\s*analysts.*?Revenue Consensus\s*\$?([\d,.]+)\s*([KMBT])?", text, re.I|re.S)
+        # Accept flexible whitespace/markup and derive the first consensus block.
+        plain=re.sub(r"<[^>]+>"," ",text); plain=re.sub(r"\s+"," ",plain)
+        m=re.search(r"EPS Consensus\s*\$?([\d,.]+).*?Revenue Consensus\s*\$?([\d,.]+)\s*([KMBT])?",plain,re.I)
         if m:
-            out["eps"]=_finite(m.group(1)); out["eps_low"]=_finite(m.group(2)); out["eps_high"]=_finite(m.group(3)); out["analysts_eps"]=_finite(m.group(4));
-            out["revenue"]=_money_token(m.group(5)+(m.group(6) or "")); out["analysts_revenue"]=out["analysts_eps"]; out["available"]=out["eps"] is not None or out["revenue"] is not None
-        # Revision history commonly appears as 90d/60d/30d/7d/current.
+            out["eps"]=_finite(m.group(1)); out["revenue"]=_money_token(m.group(2)+(m.group(3) or "")); out["available"]=out["eps"] is not None or out["revenue"] is not None
         for days in (90,60,30,7):
-            mm=re.search(rf"{days}d ago\s*\$?([\d,.]+)",text,re.I)
+            mm=re.search(rf"{days}d ago\s*\$?([\d,.]+)",plain,re.I)
             if mm and out["eps"]:
                 old=_finite(mm.group(1));
                 if old not in (None,0): out[f"revision_{days}d_pct"]=(out["eps"]/old-1)*100
-        md=re.search(r"Period ending\s*([A-Za-z0-9 ,/-]+?)\s*EPS Consensus",text,re.I)
-        if md:
-            try: out["period_ending"]=str(pd.Timestamp(md.group(1)).date())
-            except Exception: pass
     if not out["available"]:
-        text2,err2=_safe_text(f"https://www.marketbeat.com/stocks/NASDAQ/{symbol}/earnings/")
+        text2,err2=_safe_text(f"https://www.marketbeat.com/stocks/NASDAQ/{symbol}/earnings/",timeout=8)
         if text2:
-            me=re.search(r"Consensus EPS.*?\$([\d,.]+)",text2,re.I|re.S)
-            mr=re.search(r"Consensus Revenue.*?\$([\d,.]+)([KMBT])?",text2,re.I|re.S)
+            plain=re.sub(r"<[^>]+>"," ",text2); plain=re.sub(r"\s+"," ",plain)
+            me=re.search(r"Consensus EPS.*?\$([\d,.]+)",plain,re.I|re.S); mr=re.search(r"Consensus Revenue.*?\$([\d,.]+)\s*([KMBT])?",plain,re.I|re.S)
             if me: out["eps"]=_finite(me.group(1))
             if mr: out["revenue"]=_money_token(mr.group(1)+(mr.group(2) or ""))
-            if out["eps"] is not None or out["revenue"] is not None: out["available"]=True
-    if not out["available"] and (err or err2 if 'err2' in locals() else err): out["error"]=(err2 if 'err2' in locals() and err2 else err)
+            out["available"]=out["eps"] is not None or out["revenue"] is not None
+        if not out["available"]: out["error"]=err2 if 'err2' in locals() else err
     return out
-
 
 def _consensus_earnings_whispers(symbol):
     key=_env("EW_API_KEY"); out={"available":False,"source":"Earnings Whispers Data API","error":None}
@@ -354,11 +535,12 @@ def _consensus_bundle(symbol, target_period=None):
         for f in as_completed(fs):
             try: results.append(f.result())
             except Exception as e: results.append({"available":False,"error":str(e)[:180],"source":fs[f]})
-    rank={"Earnings Whispers Data API":0,"Financial Modeling Prep":1,"Alpha Vantage Earnings Estimates":2,"Finnhub earnings calendar":3,"Yahoo Finance earningsTrend":4,"Public estimate pages":5}
+    rank={"Earnings Whispers Data API":0,"Financial Modeling Prep":1,"Alpha Vantage Earnings Estimates":2,"Finnhub earnings calendar":3,"Yahoo Finance earningsTrend":4,"Yahoo Finance public analysis page":5,"Public estimate pages":6,"Zacks public earnings estimates":7}
     results.sort(key=lambda x:rank.get(x.get("source"),99))
 
     # Determine the most credible upcoming report date from rows that survived
-    # the fiscal-period gate.  First pass uses explicit fiscal period metadata.
+    # the fiscal-period gate. First pass uses explicit fiscal period metadata or
+    # a human period label such as Current Qtr. (Sep 2026).
     period_rows=[x for x in results if x.get("available") and _period_matches(x,target_period, None)] if target_period else []
     target_earnings_date=next((x.get("earnings_date") for x in period_rows if x.get("earnings_date")),None)
 
