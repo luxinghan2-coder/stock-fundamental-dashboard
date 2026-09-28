@@ -20,10 +20,11 @@ from pro_risk import analyze_risk, analyze_portfolio
 from pro_macro import analyze_macro
 from pro_backtest import run_backtest
 from pro_expectation import analyze_expectation
+from pro_whisper import analyze_whisper
 from asset_data import get_asset, get_asset_index, get_asset_news
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.24-PRO-BUY-SIDE-FREE-SOURCES'
+APP_VERSION = '2.5.26-AEL-MARKET-IMPLIED-WHISPER'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -146,6 +147,14 @@ def pro_expectation(symbol: str):
         return analyze_expectation(symbol)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'买方预期研究失败：{str(exc)[:180]}')
+
+@app.get('/api/pro/whisper/{symbol}')
+def pro_whisper(symbol: str):
+    # Explicit numerical Market-Implied Whisper layer. Independent from Lite.
+    try:
+        return analyze_whisper(symbol)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'AEL暗盘预期研究失败：{str(exc)[:180]}')
 
 
 @app.get('/api/stock/core/{symbol}')
