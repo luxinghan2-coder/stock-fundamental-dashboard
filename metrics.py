@@ -577,8 +577,143 @@ def _technical_value_score(rsi, kdj_j, macd_hist, macd_hist_delta, fib_s3, bb_lo
     }
 
 
+
+def _technical_pullback_score(close, rsi_series, hist, hist_delta, mas, bb_lower, fib_s3, pivots):
+    """Transparent 0-100 score for healthy pullbacks inside intact trends.
+
+    The score is deliberately different from Technical Strength: it rewards
+    intact trend + reasonable retracement + nearby support + momentum repair,
+    while penalising overheated/high-chase conditions.
+    """
+    try:
+        latest = finite(close.iloc[-1])
+        if latest is None:
+            return None, {}
+        components = []
+
+        # 1) Trend integrity: prefer a pullback while the medium-term structure
+        # remains intact. This is not a prediction; it only describes current
+        # price/MA structure.
+        m20, m60, m120 = mas.get(20), mas.get(60), mas.get(120)
+        trend_bits = []
+        if m20 is not None: trend_bits.append(100.0 if latest >= m20 else 35.0)
+        if m60 is not None: trend_bits.append(100.0 if latest >= m60 else 10.0)
+        if m120 is not None: trend_bits.append(100.0 if latest >= m120 else 10.0)
+        if m20 is not None and m60 is not None:
+            trend_bits.append(100.0 if m20 >= m60 else 20.0)
+        if m60 is not None and m120 is not None:
+            trend_bits.append(100.0 if m60 >= m120 else 20.0)
+        if trend_bits:
+            components.append({"name":"趋势完整度","score":sum(trend_bits)/len(trend_bits),"weight":25})
+
+        # 2) Healthy retracement depth from the recent 60-session high.
+        if len(close) >= 20:
+            high60 = finite(close.tail(60).max())
+            dd = (latest / high60 - 1.0) * 100.0 if high60 else None
+            if dd is not None:
+                drop = max(0.0, -dd)
+                if 4.0 <= drop <= 10.0:
+                    retrace = 100.0
+                elif drop < 4.0:
+                    # No meaningful pullback should not receive a full bonus.
+                    retrace = 20.0 + drop * 20.0
+                elif drop <= 15.0:
+                    retrace = 100.0 - (drop-10.0)*12.0
+                else:
+                    retrace = max(0.0, 40.0 - (drop-15.0)*8.0)
+                components.append({"name":"回撤幅度","score":max(0.0,min(100.0,retrace)),"weight":20})
+
+        # 3) Support confluence: closeness to several independent levels.
+        support_scores=[]
+        for name, level, full_pct in [
+            ("MA20", m20, 5.0), ("MA60", m60, 7.0),
+            ("BOLL下轨", bb_lower, 5.0), ("Fib S3", fib_s3, 5.0)
+        ]:
+            lv=finite(level)
+            # A level above current price is resistance, not support. Do not
+            # let proximity to a resistance inflate the pullback score.
+            if lv is not None and lv <= latest:
+                b=_distance_bonus(latest, lv, full_pct=full_pct)
+                if b is not None: support_scores.append(b)
+        pivot_levels_map=(pivots or {}).get("classic", {}) if isinstance(pivots, dict) else {}
+        if pivot_levels_map:
+            for key in ("S1","S2","S3"):
+                lv=finite(pivot_levels_map.get(key))
+                if lv is not None and lv <= latest:
+                    b=_distance_bonus(latest, lv, full_pct=4.0)
+                    if b is not None: support_scores.append(b)
+        if support_scores:
+            # Reward confluence rather than a single accidental nearby level.
+            support_scores.sort(reverse=True)
+            top=support_scores[:3]
+            support = sum(top)/len(top)
+            if len(support_scores) >= 2:
+                support = min(100.0, support + 8.0)
+            components.append({"name":"支撑共振","score":support,"weight":25})
+
+        # 4) Momentum repair: improving MACD/RSI/KDJ is preferred to simply
+        # being oversold. This is the key anti-value-trap component.
+        repair=[]
+        if hist_delta is not None:
+            scale=max(abs(latest)*0.01,1e-9)
+            repair.append(max(0.0,min(100.0,50.0 + 50.0*math.tanh(hist_delta/scale*8.0))))
+        if rsi_series is not None and len(rsi_series.dropna()) >= 6:
+            rsi_now=finite(rsi_series.iloc[-1]); rsi_prev=finite(rsi_series.iloc[-6])
+            if rsi_now is not None and rsi_prev is not None:
+                repair.append(max(0.0,min(100.0,50.0 + (rsi_now-rsi_prev)*5.0)))
+        if repair:
+            components.append({"name":"动能修复","score":sum(repair)/len(repair),"weight":20})
+
+        # 5) Anti-chase / heat penalty. A stock near a 52-week high is not
+        # automatically a bad stock; it simply should not receive a pullback
+        # bonus unless price has actually returned to a reasonable zone.
+        heat=[]
+        if len(close) >= 60:
+            h252=finite(close.tail(252).max())
+            pos52=(latest-(finite(close.tail(252).min()) or latest))/(h252-(finite(close.tail(252).min()) or latest))*100 if h252 and h252 != (finite(close.tail(252).min()) or latest) else None
+            if pos52 is not None:
+                if pos52 >= 97: heat.append(0.0)
+                elif pos52 >= 93: heat.append(25.0)
+                elif pos52 >= 90: heat.append(55.0)
+                else: heat.append(100.0)
+        if m20:
+            dist20=(latest/m20-1.0)*100.0
+            if dist20 >= 10: heat.append(0.0)
+            elif dist20 >= 6: heat.append(35.0)
+            elif dist20 >= 3: heat.append(70.0)
+            else: heat.append(100.0)
+        if rsi_series is not None:
+            r=finite(rsi_series.iloc[-1])
+            if r is not None:
+                heat.append(0.0 if r >= 80 else 25.0 if r >= 75 else 65.0 if r >= 70 else 100.0)
+        if heat:
+            components.append({"name":"反追高修正","score":sum(heat)/len(heat),"weight":10})
+
+        if not components:
+            return None, {}
+        total=sum(x["score"]*x["weight"] for x in components)/sum(x["weight"] for x in components)
+        # This scanner is explicitly a pullback finder, not a breakout-chaser.
+        # If price has barely pulled back from the recent high, cap the
+        # pullback score even when the trend itself is excellent.
+        try:
+            high60=finite(close.tail(60).max())
+            drop60=(latest/high60-1.0)*100.0 if high60 else None
+            if drop60 is not None and drop60 > -2.0:
+                total=min(total,55.0)
+        except Exception:
+            pass
+        meta={
+            "weights": {x["name"]:x["weight"] for x in components},
+            "components":[{"name":x["name"],"score":round(x["score"],1),"weight":x["weight"]} for x in components],
+            "formula":"回踩质量分 = 趋势完整度×25% + 回撤幅度×20% + 支撑共振×25% + 动能修复×20% + 反追高修正×10%",
+            "purpose":"优先识别强趋势中的合理回踩；高位追涨不会因52周位置高而获得额外回踩分。"
+        }
+        return round(max(0,min(100,total))), meta
+    except Exception:
+        return None, {}
+
 def technical_analysis(history, fib=None, pivots=None):
-    out = {"score": None, "state": "暂无数据", "value_score": None, "value_state":"暂无数据", "score_breakdown":{}, "value_breakdown":{}, "signals": [], "indicators": {}, "history": []}
+    out = {"score": None, "state": "暂无数据", "value_score": None, "value_state":"暂无数据", "pullback_score": None, "pullback_state":"暂无数据", "score_breakdown":{}, "value_breakdown":{}, "pullback_breakdown":{}, "signals": [], "indicators": {}, "history": [], "indicator_errors": {}}
     if history is None or getattr(history, "empty", True) or "Close" not in history:
         return out
     try:
@@ -586,46 +721,81 @@ def technical_analysis(history, fib=None, pivots=None):
         if len(close) < 30: return out
         volume = history["Volume"].dropna().astype(float) if "Volume" in history else None
         latest = float(close.iloc[-1])
-        delta = close.diff()
-        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi_series = 100 - 100/(1+rs)
-        rsi = finite(rsi_series.iloc[-1])
-        ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
-        macd, signal = ema12-ema26, (ema12-ema26).ewm(span=9, adjust=False).mean()
-        hist = macd-signal
-        macd_val, signal_val, hist_val = float(macd.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
-        hist_prev=finite(hist.iloc[-2]) if len(hist)>1 else None
-        hist_delta=hist_val-hist_prev if hist_prev is not None else None
+        # Each indicator family is isolated: one bad series must not blank the
+        # other indicators. Errors are exposed for diagnostics instead of swallowed.
+        rsi_series = None; rsi = None
+        try:
+            delta = close.diff()
+            gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+            loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+            rs = gain / loss.replace(0, np.nan)
+            rsi_series = 100 - 100/(1+rs)
+            rsi = finite(rsi_series.iloc[-1])
+        except Exception as exc:
+            out["indicator_errors"]["RSI"] = str(exc)[:180]
 
-        # KDJ(9,3,3): RSV -> K/D -> J. J<0 is an explicit short-term
-        # oversold bonus for the technical value score.
-        hh=history["High"].astype(float).rolling(9).max() if "High" in history else close.rolling(9).max()
-        ll=history["Low"].astype(float).rolling(9).min() if "Low" in history else close.rolling(9).min()
-        denom=(hh-ll).replace(0,np.nan)
-        rsv=(close-ll)/denom*100
-        k=rsv.ewm(alpha=1/3, adjust=False).mean()
-        d=k.ewm(alpha=1/3, adjust=False).mean()
-        j=3*k-2*d
-        k_val,d_val,j_val=finite(k.iloc[-1]),finite(d.iloc[-1]),finite(j.iloc[-1])
+        hist = None; hist_delta = None; macd_val = None; signal_val = None; hist_val = None
+        try:
+            ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
+            macd, signal = ema12-ema26, (ema12-ema26).ewm(span=9, adjust=False).mean()
+            hist = macd-signal
+            macd_val, signal_val, hist_val = float(macd.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
+            hist_prev=finite(hist.iloc[-2]) if len(hist)>1 else None
+            hist_delta=hist_val-hist_prev if hist_prev is not None else None
+        except Exception as exc:
+            out["indicator_errors"]["MACD"] = str(exc)[:180]
+
+        k_val=d_val=j_val=None
+        try:
+            # KDJ(9,3,3): RSV -> K/D -> J. J<0 is an explicit short-term
+            # oversold bonus for the technical value score.
+            hh=history["High"].astype(float).rolling(9).max() if "High" in history else close.rolling(9).max()
+            ll=history["Low"].astype(float).rolling(9).min() if "Low" in history else close.rolling(9).min()
+            denom=(hh-ll).replace(0,np.nan)
+            rsv=(close-ll)/denom*100
+            k=rsv.ewm(alpha=1/3, adjust=False).mean()
+            d=k.ewm(alpha=1/3, adjust=False).mean()
+            j=3*k-2*d
+            k_val,d_val,j_val=finite(k.iloc[-1]),finite(d.iloc[-1]),finite(j.iloc[-1])
+        except Exception as exc:
+            out["indicator_errors"]["KDJ"] = str(exc)[:180]
 
         # MA cards: calculated for display/strength scoring, but deliberately
         # never plotted on the K-line.
         ma_periods=(20,60,120,250)
-        mas={n:finite(close.rolling(n).mean().iloc[-1]) for n in ma_periods}
-        ma_slopes={n:(finite(close.rolling(n).mean().iloc[-1])-finite(close.rolling(n).mean().iloc[-6])) if len(close)>=n+5 else None for n in ma_periods}
+        mas={n:None for n in ma_periods}; ma_slopes={n:None for n in ma_periods}
+        try:
+            mas={n:finite(close.rolling(n).mean().iloc[-1]) for n in ma_periods}
+            ma_slopes={n:(finite(close.rolling(n).mean().iloc[-1])-finite(close.rolling(n).mean().iloc[-6])) if len(close)>=n+5 else None for n in ma_periods}
+        except Exception as exc:
+            out["indicator_errors"]["MA"] = str(exc)[:180]
 
-        mid, sd = close.rolling(20).mean(), close.rolling(20).std()
-        upper, lower = mid+2*sd, mid-2*sd
-        bb_mid = finite(mid.iloc[-1]); bb_upper = finite(upper.iloc[-1]); bb_lower = finite(lower.iloc[-1])
-        bb_pos = safe_ratio(latest-bb_lower, bb_upper-bb_lower) if bb_upper is not None and bb_lower is not None else None
-        bb_width = safe_ratio(bb_upper-bb_lower, bb_mid) * 100 if bb_mid not in (None, 0) and bb_upper is not None and bb_lower is not None else None
-        ret20 = (latest/float(close.iloc[-21])-1)*100 if len(close)>21 else None
+        bb_mid=bb_upper=bb_lower=bb_pos=bb_width=None
+        try:
+            mid, sd = close.rolling(20).mean(), close.rolling(20).std()
+            upper, lower = mid+2*sd, mid-2*sd
+            bb_mid = finite(mid.iloc[-1]); bb_upper = finite(upper.iloc[-1]); bb_lower = finite(lower.iloc[-1])
+            bb_pos = safe_ratio(latest-bb_lower, bb_upper-bb_lower) if bb_upper is not None and bb_lower is not None else None
+            bb_width = safe_ratio(bb_upper-bb_lower, bb_mid) * 100 if bb_mid not in (None, 0) and bb_upper is not None and bb_lower is not None else None
+        except Exception as exc:
+            out["indicator_errors"]["BOLL"] = str(exc)[:180]
+
+        ret20 = None
+        try:
+            ret20 = (latest/float(close.iloc[-21])-1)*100 if len(close)>21 else None
+        except Exception as exc:
+            out["indicator_errors"]["20日动量"] = str(exc)[:180]
         vol_ratio = None
-        if volume is not None and len(volume)>=20:
-            av=float(volume.rolling(20).mean().iloc[-1]); vol_ratio=float(volume.iloc[-1]/av) if av else None
-        high52, low52 = float(close.tail(252).max()), float(close.tail(252).min()); pos52 = (latest-low52)/(high52-low52)*100 if high52 != low52 else None
+        try:
+            if volume is not None and len(volume)>=20:
+                av=float(volume.rolling(20).mean().iloc[-1]); vol_ratio=float(volume.iloc[-1]/av) if av else None
+        except Exception as exc:
+            out["indicator_errors"]["成交量"] = str(exc)[:180]
+        high52=low52=pos52=None
+        try:
+            high52, low52 = float(close.tail(252).max()), float(close.tail(252).min()); pos52 = (latest-low52)/(high52-low52)*100 if high52 != low52 else None
+        except Exception as exc:
+            out["indicator_errors"]["52周位置"] = str(exc)[:180]
 
         # ---------------- Strong-strength score (100) ----------------
         # Fixed weights, each component normalized to 0-100.
@@ -660,15 +830,25 @@ def technical_analysis(history, fib=None, pivots=None):
         value_score,value_meta=_technical_value_score(rsi,j_val,hist_val,hist_delta,fib_s3,bb_lower,latest)
         value_state=("高性价比" if value_score is not None and value_score>=75 else ("较有性价比" if value_score is not None and value_score>=60 else ("中性" if value_score is not None and value_score>=45 else ("性价比较低" if value_score is not None else "暂无数据"))))
 
+        # ---------------- Bullish-pullback score (100) ----------------
+        pullback_score, pullback_meta = _technical_pullback_score(
+            close, rsi_series, hist, hist_delta, mas, bb_lower, fib_s3,
+            (pivots or {})
+        )
+        pullback_state=("高质量回踩" if pullback_score is not None and pullback_score>=75 else
+                        "较好回踩" if pullback_score is not None and pullback_score>=60 else
+                        "中性" if pullback_score is not None and pullback_score>=45 else
+                        "回踩质量较低" if pullback_score is not None else "暂无数据")
+
         # ---------------- Composite score (100) ----------------
-        # Keep the two dimensions independent, then combine them transparently.
-        # Never reference an uninitialised value: the previous build could
-        # throw here, causing the entire technical block to fall back to
-        # "暂无数据" even when RSI/MACD/BOLL/MA had already been calculated.
+        # The original strength/value dimensions remain visible and intact.
+        # Composite now adds an explicit pullback-quality dimension so that
+        # high/overheated stocks cannot dominate solely because of 52-week
+        # position and momentum strength.
         composite_score = None
         composite_state = "暂无数据"
-        if score is not None and value_score is not None:
-            composite_score = round(score * 0.50 + value_score * 0.50)
+        if score is not None and value_score is not None and pullback_score is not None:
+            composite_score = round(score * 0.30 + value_score * 0.30 + pullback_score * 0.40)
             composite_score = max(0, min(100, composite_score))
             composite_state = (
                 "强" if composite_score >= 75 else
@@ -678,8 +858,8 @@ def technical_analysis(history, fib=None, pivots=None):
             )
 
         signals=[]
-        if macd_val>signal_val: signals.append("MACD强于信号线")
-        else: signals.append("MACD弱于信号线")
+        if macd_val is not None and signal_val is not None:
+            signals.append("MACD强于信号线" if macd_val>signal_val else "MACD弱于信号线")
         if j_val is not None and j_val<0: signals.append("KDJ J<0：短线超卖")
         if rsi is not None and rsi<30: signals.append("RSI<30：超卖")
         if fib_s3 is not None and _distance_bonus(latest,fib_s3,5) is not None and _distance_bonus(latest,fib_s3,5)>=80: signals.append("接近斐波纳契S3")
@@ -687,15 +867,18 @@ def technical_analysis(history, fib=None, pivots=None):
 
         out.update({
             "score":score,"state":state,"value_score":value_score,"value_state":value_state,
+            "pullback_score":pullback_score,"pullback_state":pullback_state,
             "composite_score":composite_score,"composite_state":composite_state,
             "score_breakdown":{"weights":{"均线结构":25,"MACD动能":20,"RSI动能":15,"20日动量":15,"52周位置":15,"量能":10},"components":[{"name":name,"score":round(v,1),"weight":w} for v,w,name in components],"formula":"技术强势分 = 均线结构×25% + MACD动能×20% + RSI动能×15% + 20日动量×15% + 52周位置×15% + 量能×10%"},
             "value_breakdown":value_meta,
-            "composite_breakdown":{"weights":{"技术强势分":50,"技术价值分":50},"formula":"综合评分 = 技术强势分×50% + 技术价值分×50%"},
+            "pullback_breakdown":pullback_meta,
+            "composite_breakdown":{"weights":{"技术强势分":30,"技术价值分":30,"回踩质量分":40},"formula":"综合评分 = 技术强势分×30% + 技术价值分×30% + 回踩质量分×40%"},
             "signals":signals,
+            "indicator_errors":out.get("indicator_errors",{}),
             "indicators":{"rsi14":rsi,"macd":macd_val,"macd_signal":signal_val,"macd_hist":hist_val,"macd_hist_delta":hist_delta,"kdj_k":k_val,"kdj_d":d_val,"kdj_j":j_val,"bollinger_position":bb_pos,"bb_mid":bb_mid,"bb_upper":bb_upper,"bb_lower":bb_lower,"bb_width_pct":bb_width,"momentum_20d":ret20,"volume_ratio_20d":vol_ratio,"52w_high":high52,"52w_low":low52,"52w_position":pos52,"ma20":mas[20],"ma60":mas[60],"ma120":mas[120],"ma250":mas[250]},
             "history":[{"date":str(i.date()),"close":float(v)} for i,v in close.tail(180).items()]})
-    except Exception:
-        pass
+    except Exception as exc:
+        out["error"] = str(exc)[:240]
     return out
 
 def analyst_view(ticker):
