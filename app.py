@@ -14,8 +14,8 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.4'
-app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.4', version=APP_VERSION)
+APP_VERSION = '2.5.5'
+app = FastAPI(title='AEL 股票基本面驾驶舱 V2.5.5', version=APP_VERSION)
 
 # MARKET SCAN is deliberately separated from SINGLE. The scanner only pulls
 # lightweight market-directory metadata plus batched daily history; it never
@@ -47,8 +47,23 @@ MARKET_CAP_CURRENCY = {'us': 'USD', 'hk': 'HKD', 'cn': 'CNY'}
 # from the primary US scan and therefore cannot consume TOP20 or scan time.
 US_OTC_EXCHANGES = {'PNK', 'OQB', 'OQX', 'OTC'}
 
+# V2.5.5: independent sector/industry scan presets. Values are Yahoo Finance
+# screener industry names; one preset may map to multiple industries.
+SCAN_GROUPS = {
+    'all': {'label': '全市场', 'industries': []},
+    'semiconductors': {'label': '半导体', 'industries': ['Semiconductors']},
+    'semiconductor_equipment': {'label': '半导体设备', 'industries': ['Semiconductor Equipment & Materials']},
+    'software': {'label': '软件', 'industries': ['Software—Application', 'Software—Infrastructure']},
+    'banks': {'label': '银行', 'industries': ['Banks—Diversified', 'Banks—Regional']},
+    'insurance': {'label': '保险', 'industries': ['Insurance—Life', 'Insurance—Diversified', 'Insurance—Property & Casualty', 'Insurance—Specialty']},
+    'biotechnology': {'label': '生物科技', 'industries': ['Biotechnology']},
+    'pharmaceuticals': {'label': '制药', 'industries': ['Drug Manufacturers—General', 'Drug Manufacturers—Specialty & Generic']},
+}
+
 _SCAN_CACHE = {}
 _UNIVERSE_CACHE = {}
+_FUNDAMENTAL_CACHE = {}
+_FUNDAMENTAL_CACHE_TTL = int(os.getenv('AEL_FUNDAMENTAL_CACHE_TTL', '21600'))
 _SCAN_JOBS = {}
 _SCAN_LOCK = threading.Lock()
 
@@ -103,7 +118,7 @@ def _scan_universe_override(markets: str):
     return rows
 
 
-def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE_SIZE):
+def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE_SIZE, industry: str | None = None):
     """Fetch one Yahoo equity-screener page through yfinance's managed session.
 
     Do not call query2.finance.yahoo.com directly here. Yahoo binds crumb to
@@ -119,7 +134,10 @@ def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE
         # fail before the request is sent. Region is sufficient to scope the
         # equity universe, while the screener endpoint itself returns equity
         # quotes.
-        query = yf.EquityQuery('eq', ['region', region.lower()])
+        conditions=[yf.EquityQuery('eq', ['region', region.lower()])]
+        if industry:
+            conditions.append(yf.EquityQuery('eq', ['industry', industry]))
+        query = conditions[0] if len(conditions) == 1 else yf.EquityQuery('and', conditions)
         result = yf.screen(
             query,
             offset=int(offset),
@@ -136,37 +154,40 @@ def _yahoo_screener_page(region: str, offset: int = 0, size: int = SCREENER_PAGE
         raise RuntimeError('Yahoo screener returned invalid quotes')
     return result
 
-def _discover_market(region: str):
-    cache=_UNIVERSE_CACHE.get(region)
+def _discover_market(region: str, industries=None):
+    industries=tuple(industries or ())
+    cache_key=(region, industries)
+    cache=_UNIVERSE_CACHE.get(cache_key)
     if cache and time()-cache['ts'] < UNIVERSE_CACHE_TTL:
         return cache['rows']
-    rows=[]; offset=0; total=None
-    while True:
-        result=_yahoo_screener_page(region, offset, SCREENER_PAGE_SIZE)
-        quotes=result.get('quotes') or []
-        total=int(result.get('total') or 0)
-        if not quotes: break
-        for q in quotes:
-            symbol=str(q.get('symbol') or '').strip().upper()
-            if not symbol: continue
-            rows.append({
-                'symbol':symbol,
-                'company':q.get('longName') or q.get('shortName') or symbol,
-                'sector':q.get('sector') or '未分类',
-                'industry':q.get('industry') or '未分类',
-                'exchange':q.get('exchange') or '',
-                'currency':q.get('currency') or '',
-                'market_cap':q.get('marketCap'),
-            })
-        offset += len(quotes)
-        if len(quotes) < SCREENER_PAGE_SIZE or (total and offset >= total): break
-        if SCREENER_MAX_SYMBOLS > 0 and offset >= SCREENER_MAX_SYMBOLS: break
-    # De-duplicate while preserving directory order.
+    rows=[]
+    query_industries=industries or (None,)
+    for industry in query_industries:
+        offset=0; total=None
+        while True:
+            result=_yahoo_screener_page(region, offset, SCREENER_PAGE_SIZE, industry=industry)
+            quotes=result.get('quotes') or []
+            total=int(result.get('total') or 0)
+            if not quotes: break
+            for q in quotes:
+                symbol=str(q.get('symbol') or '').strip().upper()
+                if not symbol: continue
+                rows.append({
+                    'symbol':symbol,
+                    'company':q.get('longName') or q.get('shortName') or symbol,
+                    'sector':q.get('sector') or '未分类',
+                    'industry':q.get('industry') or '未分类',
+                    'exchange':q.get('exchange') or '',
+                    'currency':q.get('currency') or '',
+                    'market_cap':q.get('marketCap'),
+                })
+            offset += len(quotes)
+            if len(quotes) < SCREENER_PAGE_SIZE or (total and offset >= total): break
+            if SCREENER_MAX_SYMBOLS > 0 and offset >= SCREENER_MAX_SYMBOLS: break
     dedup={r['symbol']:r for r in rows}
     rows=list(dedup.values())
-    if SCREENER_MAX_SYMBOLS > 0:
-        rows=rows[:SCREENER_MAX_SYMBOLS]
-    _UNIVERSE_CACHE[region]={'ts':time(),'rows':rows}
+    if SCREENER_MAX_SYMBOLS > 0: rows=rows[:SCREENER_MAX_SYMBOLS]
+    _UNIVERSE_CACHE[cache_key]={'ts':time(),'rows':rows}
     return rows
 
 
@@ -200,24 +221,67 @@ def _filter_primary_universe(rows, market):
     return primary, otc, rejected_cap
 
 
-def _scan_universe(markets: str):
+def _scan_universe(markets: str, group: str = 'all'):
     override=_scan_universe_override(markets)
-    if override is not None:
+    if override is not None and group == 'all':
         return override, 'environment override', {'us':0,'hk':0,'cn':0}, {'us':0,'hk':0,'cn':0}
     selected=[m.strip().lower() for m in markets.split(',') if m.strip() in {'us','hk','cn'}]
     if not selected: selected=['us','hk','cn']
-    regions={'us':'us','hk':'hk','cn':'cn'}
-    rows=[]
-    otc_counts={'us':0,'hk':0,'cn':0}
-    cap_rejected={'us':0,'hk':0,'cn':0}
+    group_cfg=SCAN_GROUPS.get(group, SCAN_GROUPS['all'])
+    industries=group_cfg['industries']
+    rows=[]; otc_counts={'us':0,'hk':0,'cn':0}; cap_rejected={'us':0,'hk':0,'cn':0}
     for mk in selected:
-        market_rows=_discover_market(regions[mk])
+        market_rows=_discover_market(mk, industries=industries)
         primary, otc, rejected_cap = _filter_primary_universe(market_rows, mk)
-        otc_counts[mk]=len(otc)
-        cap_rejected[mk]=rejected_cap
+        otc_counts[mk]=len(otc); cap_rejected[mk]=rejected_cap
         for r in primary:
             r=dict(r); r['market']=mk; rows.append(r)
-    return rows, 'Yahoo Finance screener directory → market-cap filter → OTC isolation', otc_counts, cap_rejected
+    source='Yahoo Finance screener directory → market-cap filter → OTC isolation'
+    if industries: source='Yahoo Finance industry screener → market-cap filter → OTC isolation'
+    return rows, source, otc_counts, cap_rejected
+
+
+def _fundamental_gate(symbol):
+    """V2.4.20-compatible fundamental eligibility gate. Missing data is not estimated."""
+    cached=_FUNDAMENTAL_CACHE.get(symbol)
+    if cached and time()-cached['ts'] < _FUNDAMENTAL_CACHE_TTL:
+        return cached['ok'], cached['data']
+    try:
+        t=yf.Ticker(symbol)
+        inc=t.financials; bs=t.balance_sheet; cf=t.cashflow; info=t.info or {}
+        def latest(df, names):
+            if df is None or getattr(df, 'empty', True): return None
+            for name in names:
+                if name in df.index:
+                    ser=df.loc[name].dropna()
+                    if len(ser):
+                        try: return float(ser.iloc[0])
+                        except Exception: pass
+            return None
+        revenue=latest(inc, ['Total Revenue','Operating Revenue'])
+        net_income=latest(inc, ['Net Income','Net Income Common Stockholders'])
+        ocf=latest(cf, ['Operating Cash Flow','Total Cash From Operating Activities'])
+        capex=latest(cf, ['Capital Expenditure','Capital Expenditures'])
+        fcf=ocf + capex if ocf is not None and capex is not None else None
+        roe=None
+        try:
+            r=info.get('returnOnEquity')
+            roe=float(r)*100 if r is not None else None
+        except Exception: pass
+        if roe is None and bs is not None and not getattr(bs,'empty',True) and net_income is not None:
+            equity=None
+            for n in ['Stockholders Equity','Common Stock Equity','Stockholders Equity Including Minority Interest']:
+                equity=latest(bs,[n])
+                if equity is not None: break
+            if equity not in (None,0): roe=net_income/equity*100
+        complete=all(x is not None for x in [roe,revenue,net_income,fcf])
+        data={'roe':roe,'revenue':revenue,'net_income':net_income,'free_cash_flow':fcf}
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':complete,'data':data}
+        return complete, data
+    except Exception as exc:
+        data={'error':str(exc)[:180]}
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data}
+        return False, data
 
 
 def _extract_history(frame, symbol):
@@ -264,14 +328,19 @@ def _scan_batch(rows):
             tech=technical_analysis(history, fib, pivots)
             if tech.get('composite_score') is None:
                 continue
+            fundamental_ok, fundamental=_fundamental_gate(symbol)
+            if not fundamental_ok:
+                errors[symbol]='基本面资格过滤未通过：ROE、营收、净利润、自由现金流需全部有真实数据'
+                continue
             out.append({
                 'symbol':symbol,'company':row.get('company') or symbol,
                 'exchange':row.get('exchange') or '','currency':row.get('currency') or '',
                 'market':row.get('market') or market_of(symbol),
                 'sector':row.get('sector') or '未分类','industry':row.get('industry') or '未分类',
                 'market_cap':row.get('market_cap'),
-                'fundamental_ok':None,
-                'fundamental_status':'扫描阶段未拉取完整财报',
+                'fundamental_ok':True,
+                'fundamental_status':'ROE / 营收 / 净利润 / 自由现金流均有真实数据',
+                'roe':fundamental.get('roe'),'revenue':fundamental.get('revenue'),'net_income':fundamental.get('net_income'),'fcf':fundamental.get('free_cash_flow'),
                 'strength':tech.get('score'),'value_score':tech.get('value_score'),
                 'pullback_score':tech.get('pullback_score'),'composite_score':tech.get('composite_score'),
                 'state':tech.get('state') or '暂无数据','value_state':tech.get('value_state') or '暂无数据',
@@ -342,7 +411,8 @@ def _job_snapshot(job):
             'current_market':job.get('current_market'),'current_sector':job.get('current_sector'),
             'current_sector_completed':job.get('current_sector_completed',0),'current_sector_total':job.get('current_sector_total',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{}),
-            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN},
+            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':'ROE + revenue + net income + FCF must all be real data'},
+            'scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],
             'universe_source':job.get('universe_source'),
             'results_by_market':_rank_results(partial,20),
             'sector_rotation':{mk:_sector_rank([x for x in partial if x.get('market')==mk],10) for mk in selected},
@@ -353,7 +423,7 @@ def _job_snapshot(job):
 
 def _run_scan_job(job):
     try:
-        rows,source,otc_counts,cap_rejected=_scan_universe(job['markets'])
+        rows,source,otc_counts,cap_rejected=_scan_universe(job['markets'], job.get('scan_group','all'))
         selected=job['selected_markets']
         rows=[r for r in rows if r.get('market') in selected]
         with _SCAN_LOCK:
@@ -411,7 +481,8 @@ def _run_scan_job(job):
                 _SCAN_CACHE[cache_key]={'ts':time(),'data':{
                     'ok':True,'scan':{'markets':job['selected_markets'],'universe_size':job['total'],'matched':sum(len(v) for v in ranked.values()),
                                      'top_n':20,'rules':'全市场目录→板块分批→批量历史行情→技术/回踩评分→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
-                                     'scanner':'background filtered + parallel batched scan','scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN},'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
+                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':'ROE + revenue + net income + FCF must all be real data'},
+            'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
                     'results_by_market':ranked,'sector_rotation':{mk:_sector_rank([x for x in job['rows'] if x.get('market')==mk],10) for mk in job['selected_markets']},
                     'results':[row for mk in job['selected_markets'] for row in ranked.get(mk,[])], 'cached':False}}
     except Exception as exc:
@@ -429,10 +500,11 @@ def _cleanup_scan_jobs_locked(max_age_seconds=3600):
 
 
 @app.post('/api/market-scan/start')
-def market_scan_start(markets: str = Query('us,hk,cn'), force: bool = Query(False)):
+def market_scan_start(markets: str = Query('us,hk,cn'), group: str = Query('all'), force: bool = Query(False)):
     selected=[m.strip().lower() for m in markets.split(',') if m.strip() in {'us','hk','cn'}]
+    group=group if group in SCAN_GROUPS else 'all'
     if not selected: raise HTTPException(status_code=400, detail='至少选择一个市场')
-    cache_key=','.join(selected)
+    cache_key=f"{','.join(selected)}|{group}"
     now=time()
     with _SCAN_LOCK:
         _cleanup_scan_jobs_locked()
@@ -444,7 +516,7 @@ def market_scan_start(markets: str = Query('us,hk,cn'), force: bool = Query(Fals
         for job in _SCAN_JOBS.values():
             if job['status']=='running' and job['cache_key']==cache_key:
                 return {'ok':True,'job_id':job['id'],'status':'running'}
-        job={'id':uuid.uuid4().hex[:12],'markets':cache_key,'selected_markets':selected,'status':'running','cancelled':False,
+        job={'id':uuid.uuid4().hex[:12],'markets':','.join(selected),'selected_markets':selected,'scan_group':group,'status':'running','cancelled':False,
              'started_at':datetime.now(timezone.utc).isoformat(),'updated_at':time(),'total':0,'completed':0,'rows':[],
              'current_market':None,'current_sector':None,'current_sector_completed':0,'current_sector_total':0,
              'otc_counts':{'us':0,'hk':0,'cn':0},'cap_rejected':{'us':0,'hk':0,'cn':0},
@@ -473,15 +545,16 @@ def market_scan_cancel(job_id: str):
 
 
 @app.get('/api/market-scan')
-def market_scan_legacy(markets: str = Query('us,hk,cn'), limit: int = Query(20, ge=1, le=50), force: bool = Query(False)):
+def market_scan_legacy(markets: str = Query('us,hk,cn'), limit: int = Query(20, ge=1, le=50), group: str = Query('all'), force: bool = Query(False)):
     """Compatibility endpoint. New UI uses start/status so scanning never blocks HTTP."""
     selected=[m.strip().lower() for m in markets.split(',') if m.strip() in {'us','hk','cn'}]
-    cache_key=','.join(selected)
+    group=group if group in SCAN_GROUPS else 'all'
+    cache_key=f"{','.join(selected)}|{group}"
     with _SCAN_LOCK:
         cached=_SCAN_CACHE.get(cache_key)
     if cached and not force and time()-cached['ts']<SCAN_CACHE_TTL:
         data=dict(cached['data']); data['results_by_market']={m:(data.get('results_by_market') or {}).get(m,[])[:limit] for m in selected}; return data
-    started=market_scan_start(markets=markets,force=force)
+    started=market_scan_start(markets=markets,group=group,force=force)
     if started.get('done'): return started['data']
     return JSONResponse(status_code=202,content={'ok':True,'status':'running','job_id':started['job_id'],'message':'扫描已在后台启动，请查询 status；不会阻塞单股查询'})
 
