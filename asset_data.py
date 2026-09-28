@@ -10,6 +10,7 @@ import threading
 import requests
 import yfinance as yf
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 
 from metrics import technical_analysis, fibonacci_levels, pivot_levels, resonance_levels, technical_price_chart
 
@@ -48,53 +49,20 @@ def get_asset_index():
 def find_asset(query):
     q=str(query or '').strip().lower()
     if not q: return None
-    exact=next((x for x in ASSET_INDEX if x['symbol'].lower()==q or x['cn'].lower()==q or x['name'].lower()==q),None)
+    exact=next((x for x in ASSET_INDEX if x['symbol'].lower()==q or x['provider_symbol'].lower()==q or x['cn'].lower()==q or x['name'].lower()==q),None)
     if exact:return dict(exact)
     aliases={
-      'gold':'XAUUSD','黄金期货':'XAUUSD','黄金现货':'XAUUSD','xau':'XAUUSD','xauusd':'XAUUSD',
-      'btc':'BTCUSD','bitcoin':'BTCUSD','比特币':'BTCUSD','btcusd':'BTCUSD',
-      'eth':'ETHUSD','ethereum':'ETHUSD','ethusd':'ETHUSD',
-      '原油期货':'WTI','wti':'WTI','oil':'WTI','crude oil':'WTI','石油':'WTI','原油':'WTI',
-      'brent':'BRENT','布油':'BRENT','bz=f':'BRENT','silver':'XAGUSD','dxy':'DXY','美元指数':'DXY',
-      '白银期货':'XAGUSD','si=f':'XAGUSD','copper':'COPPER','hg=f':'COPPER','platinum':'PLATINUM','pl=f':'PLATINUM',
+      'gold':'XAUUSD','黄金期货':'XAUUSD','黄金现货':'XAUUSD','xau':'XAUUSD','xauusd':'XAUUSD','xauusd=x':'XAUUSD','gc=f':'XAUUSD',
+      'btc':'BTCUSD','bitcoin':'BTCUSD','比特币':'BTCUSD','btcusd':'BTCUSD','btc-usd':'BTCUSD',
+      'eth':'ETHUSD','ethereum':'ETHUSD','ethusd':'ETHUSD','eth-usd':'ETHUSD',
+      'sol':'SOLUSD','solana':'SOLUSD','solusd':'SOLUSD','sol-usd':'SOLUSD',
+      '原油期货':'WTI','wti':'WTI','oil':'WTI','crude oil':'WTI','石油':'WTI','原油':'WTI','cl=f':'WTI',
+      'brent':'BRENT','布油':'BRENT','bz=f':'BRENT','silver':'XAGUSD','白银':'XAGUSD','si=f':'XAGUSD',
+      'copper':'COPPER','铜':'COPPER','hg=f':'COPPER','platinum':'PLATINUM','铂金':'PLATINUM','pl=f':'PLATINUM',
+      'dxy':'DXY','dx-y.nyb':'DXY','美元指数':'DXY',
     }
     s=aliases.get(q)
     return next((dict(x) for x in ASSET_INDEX if x['symbol']==s),None) if s else None
-
-
-def _calc(symbol, meta, h):
-    close=pd.to_numeric(h['Close'],errors='coerce').dropna()
-    if len(close)<30:return None
-    px=float(close.iloc[-1]); prev=float(close.iloc[-2]) if len(close)>=2 else None
-    ret1=(px/prev-1)*100 if prev else None
-    ret20=(px/float(close.iloc[-21])-1)*100 if len(close)>=21 else None
-    ret60=(px/float(close.iloc[-61])-1)*100 if len(close)>=61 else None
-    lo=float(close.tail(min(252,len(close))).min()); hi=float(close.tail(min(252,len(close))).max())
-    pos=((px-lo)/(hi-lo)*100) if hi>lo else None
-    daily=close.pct_change().dropna()
-    vol20=float(daily.tail(min(20,len(daily))).std()*math.sqrt(252)*100) if len(daily)>=10 else None
-    dd=(px/float(close.cummax().iloc[-1])-1)*100
-
-    # Same technical engine as stocks. No ROE/PE/fundamental gate is applied.
-    fib=fibonacci_levels(h)
-    pivots=pivot_levels(h)
-    tech=technical_analysis(h, fib, pivots)
-    resonance=resonance_levels(px, pivots, tech.get('indicators', {}))
-    price_chart=technical_price_chart(h, fib)
-    tech['fibonacci']=fib
-    tech['pivots']=pivots
-    tech['resonance']=resonance
-    tech['price_chart']=price_chart
-
-    return {
-      **meta,'available':True,'price':px,'change_1d_pct':ret1,'momentum_20d_pct':ret20,
-      'momentum_60d_pct':ret60,'position_52w_pct':pos,'volatility_20d_annualized_pct':vol20,
-      'max_drawdown_from_history_pct':dd,'history_rows':int(len(close)),
-      'latest_trade_date':str(close.index[-1].date()) if hasattr(close.index[-1],'date') else str(close.index[-1]),
-      'technical':tech,
-      'data_quality':{'history':True,'fundamentals':'not_applicable','reason':'商品/加密资产沿用股票技术分析引擎，但不套用股票ROE/PE/现金流硬门槛'},
-    }
-
 
 def get_asset(symbol):
     symbol=str(symbol or '').strip().upper()
@@ -104,17 +72,29 @@ def get_asset(symbol):
     with _LOCK:
         c=_CACHE.get(symbol)
         if c and now-c[0]<TTL:return c[1]
+    provider_symbol=meta.get('provider_symbol') or symbol
+    h=None; errors=[]
     try:
-        provider_symbol=meta.get('provider_symbol') or symbol
-        # 2y is still one request and ensures MA250 can be calculated.
         h=yf.Ticker(provider_symbol).history(period='2y',interval='1d',auto_adjust=False)
-        if h is None or h.empty:return {'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':'暂无足够行情数据'}
-        out=_calc(symbol,meta,h)
-        if not out:return {'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':'暂无足够历史数据'}
-        out['ok']=True;out['provider_symbol']=meta.get('provider_symbol') or symbol
-        out['method_note']='多资产复用股票技术分析引擎：MA20/60/120/250、MACD、RSI、KDJ、BOLL、Pivot、Fibonacci、20D动量、52周位置、技术强势/高性价比/回踩质量全部保持；股票基本面字段对商品/加密资产标记为不适用。'
     except Exception as exc:
-        out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':str(exc)[:180]}
+        errors.append('yfinance: '+str(exc)[:100])
+    if h is None or h.empty:
+        try:
+            h=_yahoo_chart_history(provider_symbol,730)
+        except Exception as exc:
+            errors.append('Yahoo Chart: '+str(exc)[:100])
+            h=None
+    if h is None or h.empty:
+        out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':'暂无足够行情数据'}
+    else:
+        try:
+            out=_calc(symbol,meta,h)
+            if not out: out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':'暂无足够历史数据'}
+            else:
+                out['ok']=True;out['provider_symbol']=provider_symbol
+                out['method_note']='多资产复用股票技术分析引擎；行情优先使用 Yahoo Finance，yfinance 不可用时自动回退 Yahoo Chart；MA20/60/120/250、MACD、RSI、KDJ、BOLL、Pivot、Fibonacci、20D动量、52周位置、技术强势/高性价比/回踩质量全部保持；股票基本面字段对商品/加密资产标记为不适用。'
+        except Exception as exc:
+            out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':str(exc)[:180]}
     with _LOCK:_CACHE[symbol]=(now,out)
     return out
 
