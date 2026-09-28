@@ -355,7 +355,7 @@ def run_backtest(symbols: List[str], benchmark: str = "SPY", strategy: str = "mo
     m = sim["metrics"]
     m_price = sim_price["metrics"]
     strict = validation == "strict"
-    wf = _walk_forward(prices, benchmark, strategy, top_k, rebalance, cost_bps) if strict else {"available": False, "reason": "标准模式不运行样本外参数选择。"}
+    wf = _walk_forward(raw_prices, benchmark, strategy, top_k, rebalance, cost_bps) if strict else {"available": False, "reason": "标准模式不运行样本外参数选择。"}
     sensitivity = _sensitivity(raw_prices, benchmark, strategy, top_k, rebalance, cost_bps)
     # Quality flags are descriptive, not a strategy score.
     checks = [

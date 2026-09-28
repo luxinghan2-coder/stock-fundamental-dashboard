@@ -20,7 +20,7 @@ from pro_macro import analyze_macro
 from pro_backtest import run_backtest
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.20.1-PRO-BACKTEST-TR'
+APP_VERSION = '2.5.20.2-PRO-BACKTEST-FIX'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
