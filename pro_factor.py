@@ -224,6 +224,8 @@ def analyze_factor(symbol: str, weights: dict[str, float] | None = None) -> dict
         'company': info.get('longName') or info.get('shortName') or symbol,
         'exchange': info.get('exchange'),
         'currency': info.get('currency'),
+        'logo_url': info.get('logo_url') or info.get('logoUrl') or info.get('companyLogoUrl'),
+        'logo_domain': str(info.get('website') or '').replace('https://','').replace('http://','').split('/')[0] or None,
         'as_of': datetime.now(timezone.utc).isoformat(),
         'method': 'bounded_absolute_v1',
         'method_note': '首版 Factor Lab 使用透明的有界绝对分；不冒充横截面 Z-score/行业中性化。后续 Universe 模块接入后再提供真实横截面标准化。',

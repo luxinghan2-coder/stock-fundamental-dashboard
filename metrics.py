@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import time
 from typing import Any
 
 import numpy as np
@@ -882,6 +883,102 @@ def technical_analysis(history, fib=None, pivots=None):
         out["error"] = str(exc)[:240]
     return out
 
+
+_MORNINGSTAR_CACHE = {}
+_MORNINGSTAR_CACHE_TTL = 6 * 60 * 60
+
+
+def _morningstar_quote_url(symbol: str, exchange: str | None = None):
+    """Build a public Morningstar stock quote URL without an extra lookup."""
+    raw = clean_symbol(symbol)
+    ex = str(exchange or '').upper()
+    if raw.endswith('.HK'):
+        mic = 'xhkg'; ticker = raw[:-3].zfill(5)
+    elif raw.endswith('.SS'):
+        mic = 'xshg'; ticker = raw[:-3]
+    elif raw.endswith('.SZ'):
+        mic = 'xshe'; ticker = raw[:-3]
+    else:
+        # Yahoo exchange values: NMS/NAS/NASDAQ -> XNAS; NYQ/NYSE -> XNYS.
+        mic = 'xnys' if ex in {'NYQ','NYSE','XNYS'} else 'xnas'
+        ticker = raw.replace('-', '.')
+    return f'https://www.morningstar.com/stocks/{mic}/{ticker.lower()}/quote'
+
+
+def _parse_morningstar_rating(html: str):
+    """Best-effort parse of an actually exposed Morningstar stock star rating.
+
+    Morningstar's public page is dynamic and may deliberately hide the numeric
+    rating. We only return a value when the page itself exposes an unambiguous
+    1-5 rating; never infer it from price/fair-value or another provider.
+    """
+    text = re.sub(r'\s+', ' ', str(html or ''))
+    patterns = [
+        r'Morningstar\s+Rating(?:\s+for\s+Stocks)?[^0-9]{0,120}([1-5])\s*(?:-?star|stars?)',
+        r'Morningstar\s+Rating(?:\s+for\s+Stocks)?[^0-9]{0,80}(★{1,5})',
+        r'"(?:morningstarRating|starRating|rating)"\s*:\s*([1-5])(?:\.0)?(?:,|})',
+        r'"(?:morningstarRating|starRating|overallRating)"\s*:\s*"([1-5])"',
+    ]
+    for pat in patterns:
+        m=re.search(pat, text, flags=re.I)
+        if not m:
+            continue
+        value=m.group(1)
+        if value.startswith('★'):
+            return len(value)
+        try:
+            n=int(float(value))
+            if 1 <= n <= 5:
+                return n
+        except Exception:
+            pass
+    return None
+
+
+def _parse_morningstar_uncertainty(html: str):
+    text = re.sub(r'\s+', ' ', str(html or ''))
+    for pat in [
+        r'Morningstar\s+Uncertainty\s+Rating[^A-Za-z]{0,80}(Very\s+High|High|Medium|Low)',
+        r'"uncertainty(?:Rating)?"\s*:\s*"(Very\s+High|High|Medium|Low)"',
+    ]:
+        m=re.search(pat,text,flags=re.I)
+        if m:
+            return m.group(1).title()
+    return None
+
+
+def morningstar_stock_rating(symbol: str, exchange: str | None = None):
+    """Lazy, cached public-page lookup for Morningstar's stock star rating.
+
+    This is intentionally separate from build_dashboard(): a slow/blocked
+    Morningstar page must never make Lite core/detail data become unavailable.
+    """
+    key=(clean_symbol(symbol), str(exchange or '').upper())
+    now=time.time() if 'time' in globals() else pd.Timestamp.utcnow().timestamp()
+    cached=_MORNINGSTAR_CACHE.get(key)
+    if cached and now-cached.get('ts',0) < _MORNINGSTAR_CACHE_TTL:
+        return cached['data']
+    url=_morningstar_quote_url(symbol, exchange)
+    data={'symbol':clean_symbol(symbol),'rating':None,'uncertainty':None,'available':False,'status':'not_exposed',
+          'as_of':None,'url':url,'source':'Morningstar公开股票报价页',
+          'note':'仅在公开页面实际暴露1–5星时显示；未暴露时不推断、不补值。'}
+    try:
+        r=requests.get(url,headers={'User-Agent':'Mozilla/5.0 (AEL; stock research)'},timeout=3.5)
+        r.raise_for_status()
+        html=r.text
+        rating=_parse_morningstar_rating(html)
+        uncertainty=_parse_morningstar_uncertainty(html)
+        if rating is not None or uncertainty is not None:
+            data.update({'rating':rating,'uncertainty':uncertainty,'available':rating is not None,'status':'available' if rating is not None else 'uncertainty_only','as_of':None})
+        else:
+            # Keep a useful diagnostic without surfacing the page body.
+            data['status']='page_reachable_rating_not_exposed'
+    except Exception as exc:
+        data['status']='source_unavailable'
+        data['note']=f'公开页面暂不可访问：{str(exc)[:160]}'
+    _MORNINGSTAR_CACHE[key]={'ts':now,'data':data}
+    return data
+
 def analyst_view(ticker, info=None):
     """Analyst consensus plus optional Morningstar fields exposed by Yahoo.
 
@@ -1380,7 +1477,8 @@ def build_dashboard(raw_symbol: str, include_slow: bool = True) -> dict[str, Any
         news=[]
         slow_analysts={"available": False, "rating": {}, "targets": {}, "earnings": {}, "revenue": {}, "note": "核心数据已先返回；分析师数据异步加载。"}
     source_status={"history":bool(history is not None and not getattr(history,"empty",True)),"financials":bool(inc is not None and not getattr(inc,"empty",True)),"balance_sheet":bool(bs is not None and not getattr(bs,"empty",True)),"cashflow":bool(cf is not None and not getattr(cf,"empty",True)),"dividends": dividends["status"],"analysts":slow_analysts["available"],"roe_long_history": len(roe15) >= 10,"news":bool(news)}
-    return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":company_description_zh,"company_description_en":company_description_en,"exchange":exchange,"currency":currency,"market":info.get("market"),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
+    logo_url = info.get("logo_url") or info.get("logoUrl") or info.get("companyLogoUrl") or None
+    return {"query":raw_symbol,"symbol":symbol,"company":company,"company_description":company_description_zh,"company_description_en":company_description_en,"exchange":exchange,"currency":currency,"market":info.get("market"),"logo_url":logo_url,"logo_domain":(re.sub(r"^https?://(?:www\.)?([^/]+).*$", r"\1", str(info.get("website"))).lower() if info.get("website") else None),"market_data":{"price":price,"market_cap":finite(info.get("marketCap"))},
             "valuation":{"pe":pe,"pb":pb,"roe":current_roe,"roe_pb":safe_ratio(current_roe,pb),"pe_roe":safe_ratio(pe,current_roe)},
             "fundamentals":{"revenue":revenue,"net_income":net_income,"gross_margin":gross_margin,"free_cash_flow":fcf,"debt_ratio":debt_ratio,"debt_to_equity":finite(info.get("debtToEquity"))},
             "dividends":dividends,"roe_15y":{"years":roe15,"stats":stats([r["roe"] for r in roe15]),"definition":"ROE = 年度净利润 / ((期初股东权益 + 期末股东权益) / 2)","source":roe_source},

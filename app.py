@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 import requests
 import yfinance as yf
 import pandas as pd
-from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
+from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels, morningstar_stock_rating
 from pro_options import router as pro_options_router
 from pro_factor import analyze_factor
 from pro_risk import analyze_risk, analyze_portfolio
@@ -20,7 +21,7 @@ from pro_macro import analyze_macro
 from pro_backtest import run_backtest
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.20.5-LITE-DATA-UX'
+APP_VERSION = '2.5.20.6-LITE-LOGO-MORNINGSTAR'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -224,6 +225,19 @@ def pro_universe(
         raise HTTPException(status_code=502, detail=f'Universe 数据获取失败：{exc}')
 
 
+@app.get('/api/stock/morningstar/{symbol}')
+def stock_morningstar(symbol: str, exchange: str = Query('')):
+    symbol = symbol.strip()
+    if not symbol:
+        raise HTTPException(status_code=400, detail='请输入股票代码')
+    try:
+        return morningstar_stock_rating(symbol, exchange)
+    except Exception as exc:
+        # This route is optional/lazy; never turn a stock page into an error.
+        return {'symbol': symbol.upper(), 'rating': None, 'available': False, 'status': 'source_error',
+                'source': 'Morningstar公开股票报价页', 'note': str(exc)[:180]}
+
+
 @app.get('/api/stock/details/{symbol}')
 def stock_details(symbol: str):
     symbol = symbol.strip()
@@ -240,6 +254,13 @@ def market_of(symbol: str):
     if u.endswith('.HK'): return 'hk'
     if u.endswith('.SS') or u.endswith('.SZ'): return 'cn'
     return 'us'
+
+
+def _logo_domain_from_info(info):
+    raw=str((info or {}).get('website') or '').strip()
+    if not raw: return None
+    m=re.search(r'https?://(?:www\.)?([^/]+)', raw, flags=re.I)
+    return m.group(1).lower() if m else None
 
 
 def _scan_universe_override(markets: str):
@@ -543,6 +564,7 @@ def _fundamental_gate(symbol, market=None, market_cap_hint=None, sector=None, in
         ok=roe_ok and cap_ok and revenue_ok and earnings_ok and equity_ok and cash_ok and margin_ok and not hard_heat
         data={'roe':roe,'roe_min_pct':ROE_MIN_PCT,'market_cap':market_cap,
               'market_cap_min':MARKET_CAP_MIN.get(market),'market_cap_currency':MARKET_CAP_CURRENCY.get(market),
+              'logo_url':info.get('logo_url') or info.get('logoUrl') or info.get('companyLogoUrl'), 'logo_domain':_logo_domain_from_info(info),
               'roe_ok':roe_ok,'market_cap_ok':cap_ok,'revenue':revenue,'net_income':net_income,
               'profit_margin':profit_margin,'operating_margin':op_margin,'free_cashflow':fcf,
               'operating_cashflow':ocf,'debt_to_equity':debt_to_equity,'trailing_eps':trailing_eps,
@@ -556,6 +578,7 @@ def _fundamental_gate(symbol, market=None, market_cap_hint=None, sector=None, in
     except Exception as exc:
         data={'roe':None,'roe_min_pct':ROE_MIN_PCT,'market_cap':None,
               'market_cap_min':MARKET_CAP_MIN.get(market),'market_cap_currency':MARKET_CAP_CURRENCY.get(market),
+              'logo_url':None, 'logo_domain':None,
               'roe_ok':False,'market_cap_ok':False,'revenue_ok':False,'earnings_ok':False,
               'cash_ok':False,'margin_ok':False,'speculation_ok':False,'quality_score':None,'error':str(exc)[:180]}
         _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data,'market':market,'market_cap_hint':market_cap_hint,'sector':sector}
@@ -710,6 +733,7 @@ def _apply_fundamental_gate(rows, errors):
                 row.update({'fundamental_ok':True,'fundamental_status':'基本面合格','roe':data.get('roe'),
                             'revenue':data.get('revenue'),'net_income':data.get('net_income'),'fcf':data.get('free_cashflow'),
                             'market_cap':data.get('market_cap'),'quality_score':data.get('quality_score'),
+                            'logo_url':data.get('logo_url'),
                             'speculation_risk':data.get('speculation_risk') or 0,'quality_breakdown':data})
                 passed.append(row)
 
