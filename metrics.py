@@ -214,7 +214,8 @@ def dividend_metrics(divs, cf, price, fcf, net_income, dividend_error=None):
             annual = divs.groupby(divs.index.year).sum().sort_index()
             out["status"] = "has_dividend"
 
-            now = pd.Timestamp.now()
+            idx_tz = getattr(divs.index, "tz", None)
+            now = pd.Timestamp.now(tz=idx_tz) if idx_tz is not None else pd.Timestamp.now()
             current_year = int(now.year)
             complete_years = [int(y) for y in annual.index if int(y) < current_year]
             latest_complete = max(complete_years) if complete_years else None
@@ -881,8 +882,20 @@ def technical_analysis(history, fib=None, pivots=None):
         out["error"] = str(exc)[:240]
     return out
 
-def analyst_view(ticker):
-    out={"available":False,"rating":{},"targets":{},"earnings":{},"revenue":{},"changes":[]}
+def analyst_view(ticker, info=None):
+    """Analyst consensus plus optional Morningstar fields exposed by Yahoo.
+
+    Morningstar data is not guaranteed for individual equities. Never infer or
+    substitute another rating; when the source does not provide it, return None.
+    """
+    out={"available":False,"rating":{},"targets":{},"earnings":{},"revenue":{},"changes":[],
+         "morningstar":{"overall":None,"risk":None,"available":False,"source":"Yahoo Finance quoteSummary / Morningstar字段"}}
+    info = info or {}
+    try:
+        overall=finite(info.get("morningStarOverallRating")); risk=finite(info.get("morningStarRiskRating"))
+        if overall is not None or risk is not None:
+            out["morningstar"]={"overall":overall,"risk":risk,"available":True,"source":"Yahoo Finance / Morningstar"}
+    except Exception: pass
     try:
         rec=ticker.get_recommendations()
         if rec is not None and not rec.empty:
@@ -1282,10 +1295,24 @@ def build_dashboard(raw_symbol: str, include_slow: bool = True) -> dict[str, Any
     if pb is None and price is not None and equity is not None and shares not in (None,0): pb=safe_ratio(price,equity/shares)
 
     dividend_error=None
-    try: divs=t.get_dividends(period="max")
-    except Exception as exc: divs=None; dividend_error=str(exc)[:240]; errors["dividends"] = dividend_error
+    divs=None
+    # yfinance supports get_dividends(period="max"), but some Yahoo responses
+    # return timezone-aware indices while others return naive indices. Normalize
+    # here so TTM filtering never silently falls back to 0.
+    try:
+        divs=t.get_dividends(period="max")
+    except Exception as exc:
+        dividend_error=str(exc)[:240]
+        errors["dividends"] = dividend_error
+        try:
+            divs=getattr(t, "dividends", None)
+            if divs is not None and not getattr(divs, "empty", True):
+                dividend_error=None
+                errors.pop("dividends", None)
+        except Exception as exc2:
+            errors["dividends_fallback"] = str(exc2)[:240]
     dividends=dividend_metrics(divs,cf,price,fcf,net_income,dividend_error)
-    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history, fib, pivots); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, pivots, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t)
+    fib=fibonacci_levels(history); pivots=pivot_levels(history); tech=technical_analysis(history, fib, pivots); tech["fibonacci"]=fib; tech["pivots"]=pivots; tech["resonance"]=resonance_levels(price, pivots, tech.get("indicators", {})); tech["price_chart"]=technical_price_chart(history,fib); analysts=analyst_view(t, info)
 
     # US: SEC/EDGAR is authoritative for long-history ROE; fallback to Yahoo only if SEC unavailable.
     sec_roe=sec_annual_roe(symbol,errors) if is_us_symbol(symbol) else None
