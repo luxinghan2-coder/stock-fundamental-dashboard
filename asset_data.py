@@ -138,17 +138,53 @@ def get_asset(symbol):
     with _LOCK:
         c=_CACHE.get(symbol)
         if c and now-c[0]<TTL:return c[1]
+    provider_symbol=meta.get('provider_symbol') or symbol
+    h=None
+    source=None
+    first_error=None
+    # Primary source: yfinance. Keep this isolated to the multi-asset route.
     try:
-        provider_symbol=meta.get('provider_symbol') or symbol
         # 2y is still one request and ensures MA250 can be calculated.
         h=yf.Ticker(provider_symbol).history(period='2y',interval='1d',auto_adjust=False)
-        if h is None or h.empty:return {'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':'暂无足够行情数据'}
-        out=_calc(symbol,meta,h)
-        if not out:return {'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':'暂无足够历史数据'}
-        out['ok']=True;out['provider_symbol']=meta.get('provider_symbol') or symbol
-        out['method_note']='多资产复用股票技术分析引擎：MA20/60/120/250、MACD、RSI、KDJ、BOLL、Pivot、Fibonacci、20D动量、52周位置、技术强势/高性价比/回踩质量全部保持；股票基本面字段对商品/加密资产标记为不适用。'
+        if h is not None and not h.empty:
+            source='yfinance'
     except Exception as exc:
-        out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],'error':str(exc)[:180]}
+        first_error=str(exc)[:180]
+
+    # Real-data fallback: Yahoo Chart API. This must run when yfinance is empty
+    # OR throws, rather than returning early. Never fabricate/estimate prices.
+    if h is None or h.empty:
+        try:
+            h=_yahoo_chart_history(provider_symbol, days=730)
+            if h is not None and not h.empty:
+                source='Yahoo Chart API'
+        except Exception as exc:
+            fallback_error=str(exc)[:180]
+            if not first_error:
+                first_error=fallback_error
+
+    try:
+        if h is None or h.empty:
+            out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],
+                 'provider_symbol':provider_symbol,'data_source':None,
+                 'error':'暂无足够行情数据'}
+        else:
+            out=_calc(symbol,meta,h)
+            if not out:
+                out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],
+                     'provider_symbol':provider_symbol,'data_source':source,
+                     'error':'暂无足够历史数据'}
+            else:
+                out['ok']=True
+                out['provider_symbol']=provider_symbol
+                out['data_source']=source
+                out['method_note']='多资产复用股票技术分析引擎：MA20/60/120/250、MACD、RSI、KDJ、BOLL、Pivot、Fibonacci、20D动量、52周位置、技术强势/高性价比/回踩质量全部保持；股票基本面字段对商品/加密资产标记为不适用。'
+    except Exception as exc:
+        out={'ok':False,'symbol':symbol,'asset_type':meta['asset_type'],
+             'provider_symbol':provider_symbol,'data_source':source,
+             'error':str(exc)[:180]}
+    if first_error and not out.get('ok'):
+        out['data_source_error']=first_error
     with _LOCK:_CACHE[symbol]=(now,out)
     return out
 
