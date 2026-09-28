@@ -48,6 +48,79 @@ def _metric(row, *paths):
     return None
 
 
+def _unwrap_quote_value(v):
+    if isinstance(v, dict):
+        if 'raw' in v: return _finite(v.get('raw'))
+        if 'fmt' in v: return v.get('fmt')
+    return v
+
+
+def _yahoo_quote_summary(symbol):
+    """Lightweight fallback for earningsTrend when yfinance parsing is unavailable.
+    Returns only public Yahoo quoteSummary fields; failures remain unavailable.
+    """
+    out={"trend":[],"earnings_dates":[],"error":None}
+    url=f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{requests.utils.quote(symbol)}"
+    params={"modules":"earningsTrend,calendarEvents"}
+    try:
+        r=requests.get(url,params=params,headers={"User-Agent":"Mozilla/5.0"},timeout=8)
+        r.raise_for_status()
+        js=r.json()
+        result=((js.get('quoteSummary') or {}).get('result') or [])
+        if not result: return out
+        obj=result[0] or {}
+        et=obj.get('earningsTrend') or {}
+        out['trend']=et.get('trend') or []
+        ce=obj.get('calendarEvents') or {}
+        for k in ('earnings','earningsDate'):
+            vals=ce.get(k) or []
+            if isinstance(vals,list):
+                out['earnings_dates'].extend(vals)
+            elif vals: out['earnings_dates'].append(vals)
+    except Exception as e:
+        out['error']=str(e)[:180]
+    return out
+
+
+def _trend_from_yahoo_summary(symbol):
+    raw=_yahoo_quote_summary(symbol)
+    out={"available":False,"source":"Yahoo Finance quoteSummary / earningsTrend",
+         "next_earnings_date":None,"eps":{},"revenue":{},"error":raw.get('error')}
+    trend=raw.get('trend') or []
+    for row in trend:
+        period=str(row.get('period') or '').strip()
+        if period not in ('0q','+0q','0y','+0y'): continue
+        ee=row.get('earningsEstimate') or {}; re_=row.get('revenueEstimate') or {}; et=row.get('epsTrend') or {}
+        eps_cur=_unwrap_quote_value(et.get('current'))
+        eps_7=_unwrap_quote_value(et.get('7daysAgo')); eps_30=_unwrap_quote_value(et.get('30daysAgo')); eps_90=_unwrap_quote_value(et.get('90daysAgo'))
+        eps_avg=_unwrap_quote_value(ee.get('avg') or ee.get('average') or ee.get('current'))
+        eps_low=_unwrap_quote_value(ee.get('low')); eps_high=_unwrap_quote_value(ee.get('high'))
+        rev_avg=_unwrap_quote_value(re_.get('avg') or re_.get('average') or re_.get('current'))
+        rev_low=_unwrap_quote_value(re_.get('low')); rev_high=_unwrap_quote_value(re_.get('high'))
+        n=_unwrap_quote_value(ee.get('numberOfAnalysts') or ee.get('numberOfAnalystsCurrent'))
+        if eps_avg is not None or eps_cur is not None:
+            out['eps']={"consensus":eps_avg if eps_avg is not None else eps_cur,"low":eps_low,"high":eps_high,
+              "revision_7d_pct":((float(eps_cur)/float(eps_7)-1)*100 if eps_cur is not None and eps_7 not in (None,0) else None),
+              "revision_30d_pct":((float(eps_cur)/float(eps_30)-1)*100 if eps_cur is not None and eps_30 not in (None,0) else None),
+              "revision_90d_pct":((float(eps_cur)/float(eps_90)-1)*100 if eps_cur is not None and eps_90 not in (None,0) else None),
+              "analyst_count":n,"period":period}
+        if rev_avg is not None:
+            out['revenue']={"consensus":rev_avg,"low":rev_low,"high":rev_high,"growth":_unwrap_quote_value(re_.get('growth')),"period":period}
+        if out['eps'] or out['revenue']: break
+    dates=raw.get('earnings_dates') or []
+    future=[]
+    for x in dates:
+        val=x.get('raw') if isinstance(x,dict) else x
+        try:
+            dt=pd.Timestamp(val)
+            dt=dt.tz_localize('UTC') if dt.tzinfo is None else dt.tz_convert('UTC')
+            if dt>pd.Timestamp.now(tz='UTC'): future.append(dt)
+        except Exception: pass
+    if future: out['next_earnings_date']=min(future).isoformat()
+    out['available']=bool(out['eps'].get('consensus') is not None or out['revenue'].get('consensus') is not None)
+    return out
+
+
 def _parse_trend(symbol):
     out={"available":False,"source":"Yahoo Finance / earnings trend",
          "next_earnings_date":None,"eps":{},"revenue":{},"error":None}
@@ -113,6 +186,10 @@ def _parse_trend(symbol):
         out["available"]=bool(out["eps"].get("consensus") is not None or out["revenue"].get("consensus") is not None)
     except Exception as e:
         out["error"]=str(e)[:180]
+    if not out["available"]:
+        fb=_trend_from_yahoo_summary(symbol)
+        if fb.get("available") or fb.get("next_earnings_date"):
+            return fb
     return out
 
 
@@ -246,17 +323,17 @@ def analyze_whisper(symbol):
     out={
       "ok":True,"symbol":requested,"as_of":datetime.now(timezone.utc).isoformat(),
       "next_earnings_date":trend.get("next_earnings_date"),
-      "model":"AEL MARKET-IMPLIED WHISPER™ v1",
+      "model":"AEL Market-Implied Whisper v1",
       "status":"inferred" if (eps_implied is not None or rev_implied is not None) else "unavailable",
       "confidence_pct":confidence,
-      "revenue":{"consensus":rev_cons,"implied":rev_implied,"implied_surprise_pct":rev_surprise,"low":rev.get("low"),"high":rev.get("high"),"growth":rev.get("growth"),"evidence":rev_parts},
-      "eps":{"consensus":eps_cons,"implied":eps_implied,"implied_surprise_pct":eps_surprise,"low":eps.get("low"),"high":eps.get("high"),"evidence":eps_parts},
+      "revenue":{"consensus":rev_cons,"implied":rev_implied,"implied_surprise_pct":rev_surprise,"low":rev.get("low"),"high":rev.get("high"),"growth":rev.get("growth"),"evidence":rev_parts,"status":"inferred" if rev_implied is not None else "unavailable","reason":"基于可验证一致预期与公开市场信号推断。" if rev_implied is not None else "缺少可验证的下一季营收一致预期，暂不生成数值。"},
+      "eps":{"consensus":eps_cons,"implied":eps_implied,"implied_surprise_pct":eps_surprise,"low":eps.get("low"),"high":eps.get("high"),"evidence":eps_parts,"status":"inferred" if eps_implied is not None else "unavailable","reason":"基于可验证一致预期与公开市场信号推断。" if eps_implied is not None else "缺少可验证的下一季 EPS 一致预期，暂不生成数值。"},
       "guidance":{"status":"unavailable","revenue":None,"eps":None,"margin":None,"reason":"当前版本未取得可验证的公司管理层下一季度指导；不以卖方共识或模型值冒充 Guidance。"},
       "market_beat_threshold":{"revenue":rev_implied,"eps":eps_implied},
       "market_signals":market,
       "historical_surprise":hist,
       "sources":{"consensus":"Yahoo earnings trend","history":"Yahoo historical earnings dates","market":"Yahoo price + listed options"},
-      "method_note":"AEL MARKET-IMPLIED WHISPER™（Mr.chen's original Earnings Whisper Method）是公开数据推断，不是 Earnings Whispers 私有 Whisper，也不是私人买方模型。核心输出由一致预期 + 历史实际财报惊喜 + 近期预测修正 + 财报前价格/成交量 + 事件期权IV偏斜共同推断；每个贡献可拆解。缺失项不补值。Guidance 只有在取得可验证管理层指引时才显示。"
+      "method_note":"AEL Implied Whisper 是公开数据推断，不是 Earnings Whispers 私有 Whisper，也不是私人买方模型。核心输出由一致预期 + 历史实际财报惊喜 + 近期预测修正 + 财报前价格/成交量 + 事件期权IV偏斜共同推断；每个贡献可拆解。缺失项不补值。Guidance 只有在取得可验证管理层指引时才显示。"
     }
     with _LOCK:_CACHE[requested]=(now,out)
     return out
