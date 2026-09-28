@@ -22,10 +22,11 @@ from pro_backtest import run_backtest
 from pro_expectation import analyze_expectation
 from pro_whisper import analyze_whisper, invalidate_whisper_cache
 from pro_whisper_backtest import run_whisper_backtest
+from ael_treasury import analyze_treasury
 from asset_data import get_asset, get_asset_index, get_asset_news
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.6.4-AEL-WHISPER-BACKTEST-CALIBRATION'
+APP_VERSION = '2.6.7-AEL-TREASURY-LONG-END'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -246,6 +247,14 @@ def pro_backtest(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'回测数据获取失败：{exc}')
 
+
+@app.get('/api/pro/treasury')
+def pro_treasury():
+    # Independent, lazy Pro module. Failures never affect macro or stock core.
+    try:
+        return analyze_treasury()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'美国国债研究失败：{str(exc)[:180]}')
 
 @app.get('/api/pro/macro')
 def pro_macro():
