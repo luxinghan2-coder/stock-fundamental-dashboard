@@ -14,9 +14,10 @@ import yfinance as yf
 import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 from pro_options import router as pro_options_router
+from pro_factor import analyze_factor
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.15-PRO'
+APP_VERSION = '2.5.17-PRO-UNIVERSE'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -104,6 +105,60 @@ def stock_core(symbol: str):
         return build_dashboard(symbol, include_slow=False)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'核心数据获取失败：{exc}')
+
+@app.get('/api/pro/factors/analyze/{symbol}')
+def pro_factor_analyze(
+    symbol: str,
+    value_weight: float = Query(20, ge=0, le=100),
+    quality_weight: float = Query(25, ge=0, le=100),
+    growth_weight: float = Query(15, ge=0, le=100),
+    momentum_weight: float = Query(20, ge=0, le=100),
+    risk_weight: float = Query(10, ge=0, le=100),
+    liquidity_weight: float = Query(10, ge=0, le=100),
+):
+    try:
+        weights = {
+            'value': value_weight, 'quality': quality_weight, 'growth': growth_weight,
+            'momentum': momentum_weight, 'risk': risk_weight, 'liquidity': liquidity_weight,
+        }
+        return analyze_factor(symbol, weights)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Factor Lab 数据获取失败：{exc}')
+
+
+@app.get('/api/pro/universe')
+def pro_universe(
+    market: str = Query('us', pattern='^(us|hk|cn)$'),
+):
+    """Read-only Pro universe view built from the same cached core-index pool.
+    It never broadens the pool and never mutates Lite scan rules.
+    """
+    try:
+        rows = _fetch_index_universe(market)
+        cfg = INDEX_UNIVERSES[market]
+        return {
+            'market': market,
+            'label': cfg['label'],
+            'count': len(rows),
+            'source': 'AEL core-index constituent cache',
+            'cache_ttl_seconds': INDEX_UNIVERSE_CACHE_TTL,
+            'as_of': datetime.now(timezone.utc).isoformat(),
+            'symbols': [
+                {
+                    'symbol': r.get('symbol'),
+                    'company': r.get('company') or r.get('symbol'),
+                    'market': market,
+                }
+                for r in rows
+            ],
+            'data_quality': {
+                'missing_company_names': sum(1 for r in rows if not r.get('company')),
+                'empty_universe': len(rows) == 0,
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Universe 数据获取失败：{exc}')
+
 
 @app.get('/api/stock/details/{symbol}')
 def stock_details(symbol: str):
