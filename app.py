@@ -20,10 +20,10 @@ from pro_risk import analyze_risk, analyze_portfolio
 from pro_macro import analyze_macro
 from pro_backtest import run_backtest
 from pro_expectation import analyze_expectation
-from asset_data import get_asset, get_asset_index
+from asset_data import get_asset, get_asset_index, get_asset_news
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.20.7-MULTI-ASSET-BUY-SIDE'
+APP_VERSION = '2.5.21.2-PRO-ONCHAIN-EQUITY-BUYSIDE-REGRESSION'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -128,6 +128,15 @@ def asset_core(symbol: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'多资产行情获取失败：{str(exc)[:180]}')
+
+
+@app.get('/api/asset/news/{symbol}')
+def asset_news(symbol: str):
+    # Optional/lazy only. News never blocks the multi-asset quote or stock core.
+    try:
+        return get_asset_news(symbol)
+    except Exception as exc:
+        return {'ok': False, 'symbol': symbol.upper(), 'news': [], 'error': str(exc)[:180]}
 
 
 @app.get('/api/pro/expectation/{symbol}')
