@@ -886,6 +886,7 @@ def technical_analysis(history, fib=None, pivots=None):
 
 _MORNINGSTAR_CACHE = {}
 _MORNINGSTAR_CACHE_TTL = 6 * 60 * 60
+_MORNINGSTAR_NEGATIVE_TTL = 30 * 60
 
 
 def _morningstar_quote_url(symbol: str, exchange: str | None = None):
@@ -972,13 +973,54 @@ def _yahoo_morningstar_fields(symbol: str):
     """Fast optional Yahoo quoteSummary fallback for Morningstar fields."""
     try:
         url=f'https://query2.finance.yahoo.com/v10/finance/quoteSummary/{requests.utils.quote(clean_symbol(symbol))}'
-        r=requests.get(url,params={'modules':'defaultKeyStatistics,summaryDetail'},headers={'User-Agent':'Mozilla/5.0 (AEL; Morningstar fallback)'},timeout=2.5)
+        r=requests.get(url,params={'modules':'defaultKeyStatistics,summaryDetail'},headers={'User-Agent':'Mozilla/5.0 (AEL; Morningstar fallback)'},timeout=2.0)
         r.raise_for_status(); data=r.json() or {}
         overall=_extract_nested_field(data,['morningStarOverallRating','morningstarOverallRating'])
         risk=_extract_nested_field(data,['morningStarRiskRating','morningstarRiskRating'])
         return finite(overall),finite(risk)
     except Exception:
         return None,None
+
+def _morningstar_search_rating(symbol: str, exchange: str | None = None):
+    """Fast public Morningstar search endpoint fallback.
+
+    This endpoint is used only to retrieve an explicitly exposed starRating.
+    No rating is reconstructed from price/fair value or other AEL metrics.
+    """
+    try:
+        fields='ticker,name,starRating,StarRatingM255,uncertaintyRating,exchangeCode'
+        r=requests.get(
+            'https://www.morningstar.com/api/v2/search',
+            params={'q':clean_symbol(symbol),'fields':fields,'limit':10},
+            headers={'User-Agent':'Mozilla/5.0 (AEL Lite Morningstar)','Accept':'application/json, text/plain, */*','Referer':'https://www.morningstar.com/'},
+            timeout=2.5,
+        )
+        if r.status_code in (202,403,429):
+            return None,None,'waf_or_rate_limited'
+        r.raise_for_status()
+        payload=r.json() or {}
+        results=payload.get('results') or []
+        target=str(clean_symbol(symbol)).upper().replace('-','.')
+        for item in results:
+            meta=item.get('meta') or {}
+            fields_obj=item.get('fields') or {}
+            ticker=str(meta.get('ticker') or fields_obj.get('ticker',{}).get('value') or '').upper().replace('-','.')
+            if ticker and ticker != target: continue
+            def fv(name):
+                v=fields_obj.get(name)
+                if isinstance(v,dict): v=v.get('value')
+                try:
+                    return int(float(v)) if v is not None and str(v) != '' else None
+                except Exception:
+                    return None
+            rating=fv('starRating')
+            if rating is None: rating=fv('StarRatingM255')
+            if rating is not None and 1 <= rating <= 5:
+                return rating,None,'morningstar_search_api'
+        return None,None,'not_exposed'
+    except Exception:
+        return None,None,'source_error'
+
 
 def morningstar_stock_rating(symbol: str, exchange: str | None = None):
     """Lazy, cached public-page lookup for Morningstar's stock star rating.
@@ -989,23 +1031,28 @@ def morningstar_stock_rating(symbol: str, exchange: str | None = None):
     key=(clean_symbol(symbol), str(exchange or '').upper())
     now=time.time() if 'time' in globals() else pd.Timestamp.utcnow().timestamp()
     cached=_MORNINGSTAR_CACHE.get(key)
-    if cached and now-cached.get('ts',0) < _MORNINGSTAR_CACHE_TTL:
+    if cached and now-cached.get('ts',0) < cached.get('ttl', _MORNINGSTAR_CACHE_TTL):
         return cached['data']
     url=_morningstar_quote_url(symbol, exchange)
     data={'symbol':clean_symbol(symbol),'rating':None,'uncertainty':None,'available':False,'status':'not_exposed',
           'as_of':None,'url':url,'source':'Morningstar公开股票报价页',
           'note':'仅在公开页面实际暴露1–5星时显示；未暴露时不推断、不补值。'}
-    # First: fast Yahoo quoteSummary fallback. It is independent of the Lite core and
-    # occasionally exposes Morningstar fields even when the public Morningstar page
-    # hides the numeric rating behind client-side rendering/subscription controls.
+    # First: Morningstar's own public search endpoint. It can expose starRating
+    # even when the quote page is rendered dynamically.
+    ms_rating, ms_risk, ms_status = _morningstar_search_rating(symbol, exchange)
+    if ms_rating is not None:
+        data.update({'rating':ms_rating,'uncertainty':ms_risk,'available':True,'status':ms_status,'source':'Morningstar公开搜索接口'})
+        _MORNINGSTAR_CACHE[key]={'ts':now,'ttl':_MORNINGSTAR_CACHE_TTL,'data':data}
+        return data
+    # Second: fast Yahoo quoteSummary fallback. It is independent of the Lite core.
     yo,yr=_yahoo_morningstar_fields(symbol)
     if yo is not None or yr is not None:
         data.update({'rating':yo,'uncertainty':yr,'available':yo is not None,'status':'yahoo_morningstar_fields','source':'Yahoo Finance Morningstar字段'})
     if data['available']:
-        _MORNINGSTAR_CACHE[key]={'ts':now,'data':data}
+        _MORNINGSTAR_CACHE[key]={'ts':now,'ttl':_MORNINGSTAR_CACHE_TTL,'data':data}
         return data
     try:
-        r=requests.get(url,headers={'User-Agent':'Mozilla/5.0 (AEL; stock research)'},timeout=3.5)
+        r=requests.get(url,headers={'User-Agent':'Mozilla/5.0 (AEL; stock research)'},timeout=2.5)
         r.raise_for_status()
         html=r.text
         rating=_parse_morningstar_rating(html)
@@ -1017,7 +1064,7 @@ def morningstar_stock_rating(symbol: str, exchange: str | None = None):
     except Exception as exc:
         data['status']='source_unavailable'
         data['note']=f'公开页面暂不可访问：{str(exc)[:160]}'
-    _MORNINGSTAR_CACHE[key]={'ts':now,'data':data}
+    _MORNINGSTAR_CACHE[key]={'ts':now,'ttl':(_MORNINGSTAR_CACHE_TTL if data.get('available') else _MORNINGSTAR_NEGATIVE_TTL),'data':data}
     return data
 
 def analyst_view(ticker, info=None):

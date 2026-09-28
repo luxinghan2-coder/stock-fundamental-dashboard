@@ -26,7 +26,7 @@ from ael_treasury import analyze_treasury
 from asset_data import get_asset, get_asset_index, get_asset_news
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.6.10-AEL-RESEARCH-WORKFLOW'
+APP_VERSION = '2.6.11-LITE-SCAN-MORNINGSTAR-REPAIR'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -43,7 +43,7 @@ DEFAULT_SCAN_UNIVERSE = [
 # V2.5.4: filter the universe before history download, then scan history in
 # bounded parallel batches. Four workers avoids the latency of serial scanning
 # without turning the Yahoo session into an uncontrolled request fan-out.
-SCAN_BATCH_SIZE = max(50, min(250, int(os.getenv('AEL_SCAN_BATCH_SIZE', '250'))))
+SCAN_BATCH_SIZE = max(50, min(250, int(os.getenv('AEL_SCAN_BATCH_SIZE', '200'))))
 SCAN_WORKERS = max(1, min(6, int(os.getenv('AEL_SCAN_WORKERS', '4'))))
 SCAN_CACHE_TTL = int(os.getenv('AEL_SCAN_CACHE_TTL', '900'))
 UNIVERSE_CACHE_TTL = int(os.getenv('AEL_UNIVERSE_CACHE_TTL', '86400'))
@@ -73,6 +73,12 @@ INDEX_UNIVERSES = {
     'cn': {'label': '中证500 + 科创板', 'codes': ['csi500'], 'star_from_yahoo': True},
 }
 INDEX_CONSTITUENT_BASE = 'https://yfiua.github.io/index-constituents/constituents-{code}.csv'
+US_SECTOR_SOURCES = [
+    ('sp500', 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv'),
+    ('nasdaq100', 'https://raw.githubusercontent.com/Gary-Strauss/NASDAQ100_Constituents/main/data/nasdaq100_constituents.csv'),
+]
+SECTOR_CACHE_TTL = int(os.getenv('AEL_SECTOR_CACHE_TTL', '86400'))
+_SECTOR_CACHE = {}
 
 SCAN_GROUPS = {
     'all': {'label': '核心指数池', 'industries': []},
@@ -97,7 +103,7 @@ FUNDAMENTAL_WORKERS = max(1, min(10, int(os.getenv('AEL_FUNDAMENTAL_WORKERS', '8
 FUNDAMENTAL_CANDIDATES = max(60, min(200, int(os.getenv('AEL_FUNDAMENTAL_CANDIDATES', '160'))))
 FUNDAMENTAL_FIRST_PASS = max(40, min(FUNDAMENTAL_CANDIDATES, int(os.getenv('AEL_FUNDAMENTAL_FIRST_PASS', '80'))))
 FUNDAMENTAL_MIN_PASSED = max(20, min(20, int(os.getenv('AEL_FUNDAMENTAL_MIN_PASSED', '20'))))
-SCAN_HISTORY_PERIOD = os.getenv('AEL_SCAN_HISTORY_PERIOD', '15mo')
+SCAN_HISTORY_PERIOD = os.getenv('AEL_SCAN_HISTORY_PERIOD', '1y')
 # Lite quality controls: keep hard gates conservative, then rank by business quality
 # so technical heat alone cannot push speculative/junk names into TOP20.
 SPECULATION_HARD_LIMIT = float(os.getenv('AEL_LITE_SPECULATION_HARD_LIMIT', '80'))
@@ -405,6 +411,36 @@ def _extract_symbols_from_table(df, market):
     return symbols
 
 
+def _fetch_sector_metadata_us():
+    cache=_SECTOR_CACHE.get('us')
+    if cache and time()-cache['ts'] < SECTOR_CACHE_TTL:
+        return cache['data']
+    data={}
+    for source,url in US_SECTOR_SOURCES:
+        try:
+            r=requests.get(url,headers={'User-Agent':'AEL-Lite/2.6.11'},timeout=5)
+            r.raise_for_status()
+            df=pd.read_csv(BytesIO(r.content),dtype=str)
+            cols={str(c).strip().lower():c for c in df.columns}
+            symcol=next((cols[k] for k in ('symbol','ticker') if k in cols),None)
+            sec_col=next((cols[k] for k in ('gics sector','sector','gics_sector') if k in cols),None)
+            sub_col=next((cols[k] for k in ('gics sub-industry','sub_industry','gics_sub_industry') if k in cols),None)
+            name_col=next((cols[k] for k in ('security','company','name') if k in cols),None)
+            if not symcol: continue
+            for _,row in df.iterrows():
+                sym=str(row.get(symcol) or '').strip().upper().replace('.', '-')
+                if not sym: continue
+                sec=str(row.get(sec_col) or '').strip() if sec_col else ''
+                sub=str(row.get(sub_col) or '').strip() if sub_col else ''
+                name=str(row.get(name_col) or '').strip() if name_col else ''
+                if sec or sub or name:
+                    data[sym]={'sector':sec or '未分类','industry':sub or '未分类','company':name or sym,'sector_source':source}
+        except Exception:
+            continue
+    _SECTOR_CACHE['us']={'ts':time(),'data':data}
+    return data
+
+
 def _fetch_index_universe(market):
     cache=_UNIVERSE_CACHE.get(('INDEX',market))
     if cache and time()-cache['ts'] < INDEX_UNIVERSE_CACHE_TTL:
@@ -412,11 +448,22 @@ def _fetch_index_universe(market):
     import re
     symbols=set(); names={}; source_parts=[]
     cfg=INDEX_UNIVERSES[market]
-    headers={'User-Agent':'AEL/2.5.9 index-universe'}
+    headers={'User-Agent':'AEL-Lite/2.6.11 index-universe'}
+    # US: use current public constituent tables with sector metadata first;
+    # yfiua remains a fallback for membership if either table is temporarily unavailable.
+    if market=='us':
+        secmeta=_fetch_sector_metadata_us()
+        for sym,meta in secmeta.items():
+            if meta.get('sector') or meta.get('industry'):
+                symbols.add(sym); names[sym]=meta.get('company') or sym
+        if symbols:
+            source_parts.extend(['S&P500/GICS','NASDAQ100/GICS'])
     for code in cfg.get('codes',[]):
+        if market=='us' and symbols and code in {'sp500','nasdaq100'}:
+            continue
         url=INDEX_CONSTITUENT_BASE.format(code=code)
         try:
-            r=requests.get(url,headers=headers,timeout=12)
+            r=requests.get(url,headers=headers,timeout=5)
             r.raise_for_status()
             df=pd.read_csv(BytesIO(r.content),dtype=str)
             sym_col=next((c for c in df.columns if str(c).lower() in {'symbol','ticker','code'}),df.columns[0])
@@ -430,9 +477,6 @@ def _fetch_index_universe(market):
         except Exception:
             continue
     if market=='cn' and cfg.get('star_from_yahoo'):
-        # STAR Market is defined by the 688xxx Shanghai STAR listing prefix.
-        # This directory call is cached for 24h and is only used to build the
-        # universe; the actual scan still downloads history in batches.
         try:
             cn_rows=_discover_market('cn', industries=None)
             for r in cn_rows:
@@ -442,10 +486,17 @@ def _fetch_index_universe(market):
             source_parts.append('STAR')
         except Exception:
             pass
-    rows=[{'symbol':sym,'company':names.get(sym,sym),'sector':'未分类','industry':'未分类','exchange':'','currency':'','market_cap':None,'market':market,'index_universe':INDEX_UNIVERSES[market]['label']} for sym in sorted(symbols)]
+    secmeta=_fetch_sector_metadata_us() if market=='us' else {}
+    rows=[]
+    for sym in sorted(symbols):
+        meta=secmeta.get(sym,{})
+        rows.append({'symbol':sym,'company':meta.get('company') or names.get(sym,sym),
+                     'sector':meta.get('sector') or '未分类','industry':meta.get('industry') or '未分类',
+                     'exchange':'','currency':'','market_cap':None,'market':market,
+                     'index_universe':INDEX_UNIVERSES[market]['label'],
+                     'sector_source':meta.get('sector_source') or ('index constituent source' if source_parts else 'unknown')})
     _UNIVERSE_CACHE[('INDEX',market)]={'ts':time(),'rows':rows}
     return rows
-
 
 def _discover_market(region: str, industries=None):
     industries=tuple(industries or ())
@@ -512,6 +563,35 @@ def _filter_primary_universe(rows, market):
         row['market']=market
         primary.append(row)
     return primary, otc, rejected_cap
+
+
+def _enrich_rows_from_screener(rows):
+    """Best-effort bulk enrichment. One/two Yahoo screener pages per market, never per symbol."""
+    by_market={}
+    for r in rows:
+        by_market.setdefault(r.get('market') or market_of(r.get('symbol','')),[]).append(r)
+    for mk,items in by_market.items():
+        wanted={str(r.get('symbol') or '').upper() for r in items}
+        if not wanted: continue
+        region={'us':'us','hk':'hk','cn':'cn'}.get(mk,mk)
+        # The screener is already bounded to large caps for Lite. Keep pages small
+        # and stop once enough symbols have been found; missing fields remain missing.
+        try:
+            query=yf.EquityQuery('and',[yf.EquityQuery('eq',['region',region]),yf.EquityQuery('gte',['intradaymarketcap',MARKET_CAP_MIN.get(mk,0)])])
+            result=yf.screen(query,offset=0,size=250,sortField='intradaymarketcap',sortAsc=False)
+            quotes=result.get('quotes') or []
+            meta={str(q.get('symbol') or '').upper():q for q in quotes if str(q.get('symbol') or '').upper() in wanted}
+            for r in items:
+                q=meta.get(str(r.get('symbol') or '').upper())
+                if not q: continue
+                r['sector']=q.get('sector') or r.get('sector') or '未分类'
+                r['industry']=q.get('industry') or r.get('industry') or '未分类'
+                r['company']=q.get('longName') or q.get('shortName') or r.get('company') or r.get('symbol')
+                r['market_cap']=q.get('marketCap') or q.get('intradayMarketCap') or r.get('market_cap')
+                r['screener_info']={k:q.get(k) for k in ('returnOnEquity','profitMargins','operatingMargins','freeCashflow','operatingCashflow','debtToEquity','totalStockholderEquity','trailingEps','totalRevenue','netIncomeToCommon','revenueGrowth','earningsGrowth','beta','marketCap') if q.get(k) is not None}
+        except Exception:
+            continue
+    return rows
 
 
 def _scan_universe(markets: str, group: str = 'all'):
@@ -596,8 +676,16 @@ def _fundamental_gate(symbol, market=None, market_cap_hint=None, sector=None, in
     if cache_market_ok and time()-cached['ts'] < _FUNDAMENTAL_CACHE_TTL:
         return cached['ok'], cached['data']
     try:
-        t=yf.Ticker(symbol)
-        info=t.info or {}
+        hint = tech if isinstance(tech, dict) else {}
+        # Yahoo screener rows may already contain the key fields; use them before
+        # falling back to a per-symbol Ticker.info request. This is the main Lite
+        # speed fix: the scanner should not turn 500 names into 500 serial API calls.
+        info_hint = hint.get('screener_info') if isinstance(hint.get('screener_info'), dict) else {}
+        if info_hint:
+            info=dict(info_hint)
+        else:
+            t=yf.Ticker(symbol)
+            info=t.info or {}
         def num(key):
             try:
                 v=info.get(key)
@@ -676,10 +764,10 @@ def _extract_history(frame, symbol):
 
 
 def _scan_history_batch(symbols):
-    if not symbols: return {}, {}
+    if not symbols: return {}, {}, []
     try:
         data=yf.download(symbols, period=SCAN_HISTORY_PERIOD, interval='1d', auto_adjust=False,
-                         group_by='ticker', threads=False, progress=False, repair=False, timeout=20)
+                         group_by='ticker', threads=False, progress=False, repair=False, timeout=8)
         histories={s:_extract_history(data,s) for s in symbols}
         errors={s:'历史行情为空或字段不完整' for s,h in histories.items() if h is None}
         return histories, errors
@@ -726,6 +814,7 @@ def _scan_batch(rows):
                 'market':row.get('market') or market_of(symbol),
                 'sector':row.get('sector') or '未分类','industry':row.get('industry') or '未分类',
                 'market_cap':row.get('market_cap'),
+                'screener_info':row.get('screener_info') or {},
                 'fundamental_ok':None,
                 'fundamental_status':'待候选池验证',
                 'roe':None,'revenue':None,'net_income':None,'fcf':None,
@@ -932,6 +1021,7 @@ def _job_snapshot(job):
 def _run_scan_job(job):
     try:
         rows,source,otc_counts,cap_rejected=_scan_universe(job['markets'], job.get('scan_group','all'))
+        rows=_enrich_rows_from_screener(rows)
         selected=job['selected_markets']
         rows=[r for r in rows if r.get('market') in selected]
         with _SCAN_LOCK:
