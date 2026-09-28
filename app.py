@@ -316,6 +316,23 @@ def _scan_history_batch(symbols):
 def _scan_batch(rows):
     symbols=[r['symbol'] for r in rows]
     histories, errors=_scan_history_batch(symbols)
+    daily_moves=[]
+    for row in rows:
+        symbol=row['symbol']; history=histories.get(symbol)
+        if history is None or len(history)<2: continue
+        try:
+            closes=pd.to_numeric(history['Close'], errors='coerce').dropna()
+            if len(closes)<2: continue
+            latest=float(closes.iloc[-1]); prev=float(closes.iloc[-2])
+            if prev == 0: continue
+            latest_date=str(pd.Timestamp(closes.index[-1]).date())
+            daily_moves.append({
+                'symbol':symbol,'market':row.get('market') or market_of(symbol),
+                'sector':row.get('sector') or '未分类','industry':row.get('industry') or '未分类',
+                'change_pct':(latest/prev-1.0)*100.0,'latest_trade_date':latest_date
+            })
+        except Exception:
+            continue
     out=[]
     for row in rows:
         symbol=row['symbol']; history=histories.get(symbol)
@@ -353,7 +370,40 @@ def _scan_batch(rows):
         except Exception as exc:
             errors[symbol]=f'技术指标计算失败：{str(exc)[:180]}'
             continue
-    return out, errors
+    return out, errors, daily_moves
+
+
+def _daily_sector_performance(moves, selected_markets, scan_group='all', group_label='全市场'):
+    """Latest trading-day breadth/performance from all market-cap-eligible names.
+    For full-market scans, rank Yahoo sectors; for an explicit group, show the
+    selected group as one independent performance bucket. No fundamental gate
+    is applied here, so this describes the actual eligible sector universe, not
+    only the quality-screened names.
+    """
+    buckets={}
+    for x in moves:
+        market=x.get('market')
+        if market not in selected_markets: continue
+        key=(market, (x.get('sector') or '未分类') if scan_group=='all' else group_label)
+        buckets.setdefault(key,[]).append(x)
+    result={m:[] for m in selected_markets}
+    for (market,name), items in buckets.items():
+        changes=[float(x['change_pct']) for x in items if x.get('change_pct') is not None]
+        if not changes: continue
+        changes.sort()
+        n=len(changes); med=changes[n//2] if n%2 else (changes[n//2-1]+changes[n//2])/2
+        up=sum(1 for v in changes if v>0); down=sum(1 for v in changes if v<0); flat=n-up-down
+        dates=[x.get('latest_trade_date') for x in items if x.get('latest_trade_date')]
+        result[market].append({
+            'sector':name,'latest_trade_date':max(dates) if dates else None,
+            'average_change_pct':round(sum(changes)/n,2),'median_change_pct':round(med,2),
+            'up_pct':round(up/n*100,1),'down_pct':round(down/n*100,1),'flat_pct':round(flat/n*100,1),
+            'stocks_with_data':n
+        })
+    for market in result:
+        result[market].sort(key=lambda x:(x['average_change_pct'],x['median_change_pct'],x['sector']),reverse=True)
+        for i,x in enumerate(result[market],1): x['rank']=i
+    return result
 
 
 def _rank_results(rows, limit=20):
@@ -416,6 +466,7 @@ def _job_snapshot(job):
             'universe_source':job.get('universe_source'),
             'results_by_market':_rank_results(partial,20),
             'sector_rotation':{mk:_sector_rank([x for x in partial if x.get('market')==mk],10) for mk in selected},
+            'daily_sector_performance':_daily_sector_performance(job.get('daily_moves',[]), selected, job.get('scan_group','all'), SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label']),
             'universe_size':job.get('total',0),'selected_markets':selected,
             'error':job.get('error'),'error_count':len(job.get('scan_errors',{})),'recent_errors':list(job.get('scan_errors',{}).items())[-8:]
         }
@@ -456,12 +507,13 @@ def _run_scan_job(job):
                         if job['cancel_event'].is_set():
                             continue
                         try:
-                            batch_results,batch_errors=future.result()
+                            batch_results,batch_errors,batch_moves=future.result()
                         except Exception as exc:
                             batch_results=[]
                             batch_errors={r['symbol']:f'批次扫描失败：{str(exc)[:180]}' for r in batch_rows}
                         with _SCAN_LOCK:
                             job['rows'].extend(batch_results)
+                            job['daily_moves'].extend(batch_moves)
                             job['scan_errors'].update(batch_errors)
                             job['completed'] += batch_size
                             job['current_sector_completed'] += batch_size
@@ -484,6 +536,7 @@ def _run_scan_job(job):
                                      'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':'ROE + revenue + net income + FCF must all be real data'},
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
                     'results_by_market':ranked,'sector_rotation':{mk:_sector_rank([x for x in job['rows'] if x.get('market')==mk],10) for mk in job['selected_markets']},
+                    'daily_sector_performance':_daily_sector_performance(job.get('daily_moves',[]), job['selected_markets'], job.get('scan_group','all'), SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label']),
                     'results':[row for mk in job['selected_markets'] for row in ranked.get(mk,[])], 'cached':False}}
     except Exception as exc:
         with _SCAN_LOCK:
@@ -520,7 +573,7 @@ def market_scan_start(markets: str = Query('us,hk,cn'), group: str = Query('all'
              'started_at':datetime.now(timezone.utc).isoformat(),'updated_at':time(),'total':0,'completed':0,'rows':[],
              'current_market':None,'current_sector':None,'current_sector_completed':0,'current_sector_total':0,
              'otc_counts':{'us':0,'hk':0,'cn':0},'cap_rejected':{'us':0,'hk':0,'cn':0},
-             'scan_errors':{},
+             'scan_errors':{},'daily_moves':[],
              'cancel_event':threading.Event(),'cache_key':cache_key,'error':None}
         _SCAN_JOBS[job['id']]=job
     threading.Thread(target=_run_scan_job,args=(job,),daemon=True,name=f'ael-scan-{job["id"]}').start()
