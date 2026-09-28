@@ -14,7 +14,7 @@ import pandas as pd
 from metrics import technical_analysis, fibonacci_levels, pivot_levels, resonance_levels, technical_price_chart
 
 ASSET_INDEX = [
-    {"symbol":"XAUUSD","provider_symbol":"XAUUSD=X","name":"Gold Spot / USD","cn":"黄金","asset_type":"商品","market":"Spot","currency":"USD","icon":"🥇"},
+    {"symbol":"XAUUSD","provider_symbol":"GC=F","provider_fallbacks":["XAUUSD=X"],"name":"Gold Futures / USD","cn":"黄金","asset_type":"商品","market":"Spot","currency":"USD","icon":"🥇"},
     {"symbol":"XAGUSD","provider_symbol":"SI=F","name":"Silver Spot / USD","cn":"白银","asset_type":"商品","market":"Spot","currency":"USD","icon":"🥈"},
     {"symbol":"WTI","provider_symbol":"CL=F","name":"WTI Crude Oil","cn":"WTI原油","asset_type":"商品","market":"NYMEX","currency":"USD","icon":"🛢️"},
     {"symbol":"BRENT","provider_symbol":"BZ=F","name":"Brent Crude Oil","cn":"布伦特原油","asset_type":"商品","market":"ICE","currency":"USD","icon":"🛢️"},
@@ -51,7 +51,7 @@ def find_asset(query):
     exact=next((x for x in ASSET_INDEX if x['symbol'].lower()==q or x['cn'].lower()==q or x['name'].lower()==q),None)
     if exact:return dict(exact)
     aliases={
-      'gold':'XAUUSD','黄金期货':'XAUUSD','黄金现货':'XAUUSD','xau':'XAUUSD','xauusd':'XAUUSD',
+      'gold':'XAUUSD','黄金期货':'XAUUSD','黄金现货':'XAUUSD','xau':'XAUUSD','xauusd':'XAUUSD','xauusd=x':'XAUUSD','gc=f':'XAUUSD',
       'btc':'BTCUSD','bitcoin':'BTCUSD','比特币':'BTCUSD','btcusd':'BTCUSD',
       'eth':'ETHUSD','ethereum':'ETHUSD','ethusd':'ETHUSD',
       '原油期货':'WTI','wti':'WTI','oil':'WTI','crude oil':'WTI','石油':'WTI','原油':'WTI',
@@ -139,29 +139,34 @@ def get_asset(symbol):
         c=_CACHE.get(symbol)
         if c and now-c[0]<TTL:return c[1]
     provider_symbol=meta.get('provider_symbol') or symbol
+    provider_candidates=[provider_symbol] + [x for x in (meta.get('provider_fallbacks') or []) if x and x != provider_symbol]
     h=None
     source=None
     first_error=None
-    # Primary source: yfinance. Keep this isolated to the multi-asset route.
-    try:
-        # 2y is still one request and ensures MA250 can be calculated.
-        h=yf.Ticker(provider_symbol).history(period='2y',interval='1d',auto_adjust=False)
-        if h is not None and not h.empty:
-            source='yfinance'
-    except Exception as exc:
-        first_error=str(exc)[:180]
-
-    # Real-data fallback: Yahoo Chart API. This must run when yfinance is empty
-    # OR throws, rather than returning early. Never fabricate/estimate prices.
-    if h is None or h.empty:
+    # Try each real provider symbol in order. Gold intentionally uses GC=F first
+    # because Yahoo exposes the gold futures history there; XAUUSD=X is fallback.
+    for candidate in provider_candidates:
         try:
-            h=_yahoo_chart_history(provider_symbol, days=730)
+            h=yf.Ticker(candidate).history(period='2y',interval='1d',auto_adjust=False)
             if h is not None and not h.empty:
-                source='Yahoo Chart API'
+                provider_symbol=candidate
+                source='yfinance'
+                break
         except Exception as exc:
-            fallback_error=str(exc)[:180]
             if not first_error:
-                first_error=fallback_error
+                first_error=str(exc)[:180]
+        h=None
+
+        try:
+            h=_yahoo_chart_history(candidate, days=730)
+            if h is not None and not h.empty:
+                provider_symbol=candidate
+                source='Yahoo Chart API'
+                break
+        except Exception as exc:
+            if not first_error:
+                first_error=str(exc)[:180]
+
 
     try:
         if h is None or h.empty:
