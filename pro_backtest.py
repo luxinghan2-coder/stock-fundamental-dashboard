@@ -36,29 +36,36 @@ def _clean_symbols(symbols: List[str]) -> List[str]:
     return out[:80]
 
 
-def _download(symbols: List[str], benchmark: str, period: str) -> Tuple[pd.DataFrame, List[str]]:
+def _download(symbols: List[str], benchmark: str, period: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     tickers = _clean_symbols(symbols + [benchmark])
     if not tickers:
-        return pd.DataFrame(), []
-    kwargs = dict(period="max" if period == "max" else period, auto_adjust=True,
+        return pd.DataFrame(), pd.DataFrame(), []
+    # Raw Close = 价格收益；Adj Close = 含分红再投资的全收益序列。
+    # 同一次下载同时取得两套序列，避免分别请求导致交易日期错位。
+    kwargs = dict(period="max" if period == "max" else period, auto_adjust=False,
                   progress=False, threads=False, group_by="column")
     data = yf.download(tickers=tickers, **kwargs)
     if data is None or data.empty:
-        return pd.DataFrame(), tickers
+        return pd.DataFrame(), pd.DataFrame(), tickers
     if isinstance(data.columns, pd.MultiIndex):
-        if "Close" in data.columns.get_level_values(0):
-            prices = data["Close"].copy()
-        elif "Adj Close" in data.columns.get_level_values(0):
-            prices = data["Adj Close"].copy()
-        else:
-            return pd.DataFrame(), tickers
+        levels = set(data.columns.get_level_values(0))
+        if "Close" not in levels:
+            return pd.DataFrame(), pd.DataFrame(), tickers
+        raw = data["Close"].copy()
+        adj = data["Adj Close"].copy() if "Adj Close" in levels else raw.copy()
     else:
-        col = "Close" if "Close" in data.columns else "Adj Close"
-        prices = data[[col]].copy()
-        prices.columns = [tickers[0]]
-    prices = prices.replace([np.inf, -np.inf], np.nan).sort_index()
-    prices = prices.ffill(limit=3)
-    return prices, tickers
+        if "Close" not in data.columns:
+            return pd.DataFrame(), pd.DataFrame(), tickers
+        raw = data[["Close"]].copy()
+        raw.columns = [tickers[0]]
+        if "Adj Close" in data.columns:
+            adj = data[["Adj Close"]].copy()
+            adj.columns = [tickers[0]]
+        else:
+            adj = raw.copy()
+    raw = raw.replace([np.inf, -np.inf], np.nan).sort_index().ffill(limit=3)
+    adj = adj.replace([np.inf, -np.inf], np.nan).sort_index().ffill(limit=3)
+    return raw, adj, tickers
 
 
 def _annualized_return(equity: pd.Series) -> Optional[float]:
@@ -147,7 +154,7 @@ def _weights_for_date(prices: pd.DataFrame, date: pd.Timestamp, strategy: str, l
 
 
 def _simulate(prices: pd.DataFrame, benchmark: str, strategy: str, lookback: int,
-              top_k: int, rebalance: str, cost_bps: float) -> Dict:
+              top_k: int, rebalance: str, cost_bps: float, signal_prices: Optional[pd.DataFrame] = None) -> Dict:
     if prices.empty or benchmark not in prices.columns:
         return {"error": "缺少基准历史数据"}
     prices = prices.dropna(how="all")
@@ -173,7 +180,9 @@ def _simulate(prices: pd.DataFrame, benchmark: str, strategy: str, lookback: int
         asset_ret = (px_today[asset_cols] / px_prev[asset_cols] - 1).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         bench_ret = px_today[benchmark] / px_prev[benchmark] - 1 if pd.notna(px_today[benchmark]) and pd.notna(px_prev[benchmark]) else 0.0
         if i == 0 or i % rebal_days == 0:
-            new_w = _weights_for_date(prices.iloc[:start_idx + i + 1], prices.index[start_idx + i], strategy, lookback, top_k)
+            signal = signal_prices if signal_prices is not None else prices
+            signal = signal.reindex(prices.index)
+            new_w = _weights_for_date(signal.iloc[:start_idx + i + 1], prices.index[start_idx + i], strategy, lookback, top_k)
             new_w = new_w.reindex(asset_cols).fillna(0.0)
             if new_w.sum() > 0:
                 new_w = new_w / new_w.sum()
@@ -325,23 +334,29 @@ def run_backtest(symbols: List[str], benchmark: str = "SPY", strategy: str = "mo
     cost_bps = max(0.0, min(200.0, float(cost_bps)))
     if len(symbols) < 2:
         return {"ok": False, "error": "至少输入2只股票组成研究股票池。"}
-    prices, requested = _download(symbols, benchmark, period)
-    if prices.empty:
+    raw_prices, total_prices, requested = _download(symbols, benchmark, period)
+    if raw_prices.empty:
         return {"ok": False, "error": "暂无足够历史行情数据，请检查股票代码或数据源。", "data_quality": {"requested": requested}}
-    available = [s for s in symbols if s in prices.columns and prices[s].notna().sum() >= 80]
+    # 可用性以原始 Close 为准；全收益序列若个别股票缺失，会单独标记。
+    available = [s for s in symbols if s in raw_prices.columns and raw_prices[s].notna().sum() >= 80]
     missing = [s for s in symbols if s not in available]
-    if benchmark not in prices.columns or prices[benchmark].notna().sum() < 80:
+    if benchmark not in raw_prices.columns or raw_prices[benchmark].notna().sum() < 80:
         return {"ok": False, "error": f"基准 {benchmark} 历史数据不足。", "data_quality": {"available_symbols": available, "missing_symbols": missing}}
-    prices = prices[available + [benchmark]].dropna(how="all")
+    raw_prices = raw_prices[available + [benchmark]].dropna(how="all")
+    total_prices = total_prices.reindex(raw_prices.index)[available + [benchmark]].dropna(how="all")
     if len(available) < 2:
         return {"ok": False, "error": "可用股票少于2只，无法形成组合。", "data_quality": {"available_symbols": available, "missing_symbols": missing}}
-    sim = _simulate(prices, benchmark, strategy, lookback, top_k, rebalance, cost_bps)
-    if sim.get("error"):
-        return {"ok": False, "error": sim["error"], "data_quality": {"available_symbols": available, "missing_symbols": missing}}
+    sim_price = _simulate(raw_prices, benchmark, strategy, lookback, top_k, rebalance, cost_bps, signal_prices=raw_prices)
+    sim_total = _simulate(total_prices, benchmark, strategy, lookback, top_k, rebalance, cost_bps, signal_prices=raw_prices)
+    sim = sim_total
+    if sim.get("error") or sim_price.get("error"):
+        err = sim.get("error") or sim_price.get("error")
+        return {"ok": False, "error": err, "data_quality": {"available_symbols": available, "missing_symbols": missing}}
     m = sim["metrics"]
+    m_price = sim_price["metrics"]
     strict = validation == "strict"
     wf = _walk_forward(prices, benchmark, strategy, top_k, rebalance, cost_bps) if strict else {"available": False, "reason": "标准模式不运行样本外参数选择。"}
-    sensitivity = _sensitivity(prices, benchmark, strategy, top_k, rebalance, cost_bps)
+    sensitivity = _sensitivity(raw_prices, benchmark, strategy, top_k, rebalance, cost_bps)
     # Quality flags are descriptive, not a strategy score.
     checks = [
         {"name": "未来数据泄漏", "status": "通过", "detail": "权重只使用再平衡日前可见的历史价格。"},
@@ -365,11 +380,14 @@ def run_backtest(symbols: List[str], benchmark: str = "SPY", strategy: str = "mo
         "benchmark": benchmark,
         "period": {"requested": period, "start": sim["equity"].index[0].strftime("%Y-%m-%d"), "end": sim["equity"].index[-1].strftime("%Y-%m-%d")},
         "metrics": m,
+        "price_metrics": m_price,
         "summary": summary,
         "equity_curve": _to_points(sim["equity"]),
+        "price_equity_curve": _to_points(sim_price["equity"]),
         "benchmark_curve": _to_points(sim["benchmark_equity"]),
+        "price_benchmark_curve": _to_points(sim_price["benchmark_equity"]),
         "drawdown_curve": _drawdown_points(sim["equity"]),
-        "contribution": _monthly_contribution(prices[available], strategy, lookback, top_k, rebalance, cost_bps, min(max(lookback + 2, 30), len(prices)-2)),
+        "contribution": _monthly_contribution(raw_prices[available], strategy, lookback, top_k, rebalance, cost_bps, min(max(lookback + 2, 30), len(raw_prices)-2)),
         "sensitivity": sensitivity,
         "validation": {"mode": validation, "checks": checks, "walk_forward": wf},
         "data_quality": {
@@ -377,8 +395,9 @@ def run_backtest(symbols: List[str], benchmark: str = "SPY", strategy: str = "mo
             "available_symbols": available,
             "missing_symbols": missing,
             "available_count": len(available),
-            "history_rows": len(prices),
+            "history_rows": len(raw_prices),
             "source": "Yahoo Finance via yfinance",
+            "total_return_source": "Yahoo Adj Close（含分红调整；用于全收益/分红再投资展示）",
         },
-        "method_note": "这是价格型研究回测。当前股票池使用现有/用户输入成分，不等同于历史真实指数成分；基本面因子将在具备点时数据后接入。历史回测不保证未来表现。",
+        "method_note": "收益曲线同时提供价格收益与分红再投资全收益。策略换仓信号使用原始 Close；全收益曲线使用 Yahoo Adj Close，以隔离分红再投资对结果的影响。当前股票池使用现有/用户输入成分，不等同于历史真实指数成分；基本面因子将在具备点时数据后接入。历史回测不保证未来表现。",
     }
