@@ -15,9 +15,11 @@ import pandas as pd
 from metrics import build_dashboard, technical_analysis, fibonacci_levels, pivot_levels
 from pro_options import router as pro_options_router
 from pro_factor import analyze_factor
+from pro_risk import analyze_risk
+from pro_macro import analyze_macro
 
 BASE = Path(__file__).resolve().parent
-APP_VERSION = '2.5.17-PRO-UNIVERSE'
+APP_VERSION = '2.5.19-PRO-MACRO-FED'
 app = FastAPI(title='AEL 股票基本面驾驶舱', version=APP_VERSION)
 # Pro is an extension layer. It has independent routes and never changes Lite scan/core logic.
 app.include_router(pro_options_router)
@@ -124,6 +126,23 @@ def pro_factor_analyze(
         return analyze_factor(symbol, weights)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f'Factor Lab 数据获取失败：{exc}')
+
+
+@app.get('/api/pro/risk/analyze/{symbol}')
+def pro_risk_analyze(symbol: str, benchmark: str = Query('SPY'), period: str = Query('2y', pattern='^(1y|2y|5y|max)$')):
+    try:
+        return analyze_risk(symbol, benchmark, period)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'Risk Lab 数据获取失败：{exc}')
+
+
+@app.get('/api/pro/macro')
+def pro_macro():
+    """Macro/Fed research endpoint. It is read-only and never changes Lite scores."""
+    try:
+        return analyze_macro()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f'宏观/Fed 数据获取失败：{exc}')
 
 
 @app.get('/api/pro/universe')
@@ -388,16 +407,17 @@ def _scan_universe(markets: str, group: str = 'all'):
     if industries:
         source='Yahoo Finance industry screener → market-cap filter → OTC isolation'
     else:
-        source='固定核心指数成分池 → 批量历史行情 → ROE硬门槛'
+        source='固定核心指数成分池 → 批量历史行情 → ROE + 市值硬门槛'
     return rows, source, otc_counts, cap_rejected
 
-def _fundamental_gate(symbol):
-    """Fast Lite fundamental gate: real Yahoo ROE only, with a hard threshold.
+def _fundamental_gate(symbol, market=None, market_cap_hint=None):
+    """Fast Lite qualification gate: real Yahoo ROE + market-cap hard gates.
     No financial statements are downloaded during MARKET SCAN. Full fundamentals
-    remain available in SINGLE. Missing/invalid ROE never passes by estimation.
+    remain available in SINGLE. Missing/invalid values never pass by estimation.
     """
     cached=_FUNDAMENTAL_CACHE.get(symbol)
-    if cached and time()-cached['ts'] < _FUNDAMENTAL_CACHE_TTL:
+    cache_market_ok=(cached and cached.get('market')==market and cached.get('market_cap_hint')==market_cap_hint)
+    if cache_market_ok and time()-cached['ts'] < _FUNDAMENTAL_CACHE_TTL:
         return cached['ok'], cached['data']
     try:
         t=yf.Ticker(symbol)
@@ -408,13 +428,25 @@ def _fundamental_gate(symbol):
             roe=float(raw)*100 if raw is not None else None
         except Exception:
             roe=None
-        ok=roe is not None and roe >= ROE_MIN_PCT
-        data={'roe':roe,'roe_min_pct':ROE_MIN_PCT}
-        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':ok,'data':data}
+        market_cap=market_cap_hint
+        if market_cap is None:
+            try:
+                market_cap=float(info.get('marketCap')) if info.get('marketCap') is not None else None
+            except Exception:
+                market_cap=None
+        roe_ok=roe is not None and roe >= ROE_MIN_PCT
+        cap_ok=True if market not in MARKET_CAP_MIN else (market_cap is not None and market_cap >= MARKET_CAP_MIN[market])
+        ok=roe_ok and cap_ok
+        data={'roe':roe,'roe_min_pct':ROE_MIN_PCT,'market_cap':market_cap,
+              'market_cap_min':MARKET_CAP_MIN.get(market),'market_cap_currency':MARKET_CAP_CURRENCY.get(market),
+              'roe_ok':roe_ok,'market_cap_ok':cap_ok}
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':ok,'data':data,'market':market,'market_cap_hint':market_cap_hint}
         return ok, data
     except Exception as exc:
-        data={'roe':None,'roe_min_pct':ROE_MIN_PCT,'error':str(exc)[:180]}
-        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data}
+        data={'roe':None,'roe_min_pct':ROE_MIN_PCT,'market_cap':None,
+              'market_cap_min':MARKET_CAP_MIN.get(market),'market_cap_currency':MARKET_CAP_CURRENCY.get(market),
+              'roe_ok':False,'market_cap_ok':False,'error':str(exc)[:180]}
+        _FUNDAMENTAL_CACHE[symbol]={'ts':time(),'ok':False,'data':data,'market':market,'market_cap_hint':market_cap_hint}
         return False, data
 
 
@@ -517,7 +549,8 @@ def _apply_fundamental_gate(rows, errors):
         items.sort(key=lambda x:(float(x.get('composite_score',-1)), float(x.get('strength',-1)), float(x.get('value_score',-1)), str(x.get('symbol',''))), reverse=True)
         candidates.extend(items[:FUNDAMENTAL_CANDIDATES])
     def check(row):
-        ok,data=_fundamental_gate(row.get('symbol',''))
+        mk=row.get('market') or market_of(row.get('symbol',''))
+        ok,data=_fundamental_gate(row.get('symbol',''), mk, row.get('market_cap'))
         return row,ok,data
     passed=[]
     with ThreadPoolExecutor(max_workers=FUNDAMENTAL_WORKERS, thread_name_prefix='ael-fund') as pool:
@@ -526,13 +559,18 @@ def _apply_fundamental_gate(rows, errors):
             row,ok,data=future.result()
             symbol=row.get('symbol','')
             if not ok:
-                errors[symbol]=f'基本面资格过滤未通过：ROE必须达到{ROE_MIN_PCT:g}%'
+                reasons=[]
+                if not data.get('roe_ok'): reasons.append(f'ROE < {ROE_MIN_PCT:g}% 或暂无数据')
+                if not data.get('market_cap_ok'):
+                    cap_min=float(data.get('market_cap_min') or 0)/1e9
+                    reasons.append(f'市值 < {cap_min:g}B {data.get("market_cap_currency") or ""} 或暂无数据')
+                errors[symbol]='基本面/市值资格过滤未通过：'+'；'.join(reasons)
                 continue
             row=dict(row)
             row.update({
                 'fundamental_ok':True,
                 'fundamental_status':f'ROE ≥ {ROE_MIN_PCT:g}%',
-                'roe':data.get('roe'),'revenue':None,'net_income':None,'fcf':None
+                'roe':data.get('roe'),'revenue':None,'net_income':None,'fcf':None,'market_cap':data.get('market_cap')
             })
             passed.append(row)
     passed.sort(key=lambda x:(str(x.get('market','')), -float(x.get('composite_score',-1)), -float(x.get('strength',-1)), -float(x.get('value_score',-1)), str(x.get('symbol',''))))
@@ -626,7 +664,7 @@ def _job_snapshot(job):
             'current_market':job.get('current_market'),'current_sector':job.get('current_sector'),
             'current_sector_completed':job.get('current_sector_completed',0),'current_sector_total':job.get('current_sector_total',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{}),
-            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% (hard gate)'},
+            'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% + market cap minimum (hard gate)'},
             'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],
             'universe_source':job.get('universe_source'),
@@ -714,8 +752,8 @@ def _run_scan_job(job):
             if not cancelled:
                 _SCAN_CACHE[cache_key]={'ts':time(),'data':{
                     'ok':True,'scan':{'markets':job['selected_markets'],'universe_size':job['total'],'matched':sum(len(v) for v in ranked.values()),
-                                     'top_n':20,'rules':'核心指数成分池→批量历史行情→高性价比50%+动能50%→ROE硬门槛→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
-                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% (hard gate)'},
+                                     'top_n':20,'rules':'核心指数成分池→批量历史行情→高性价比50%+动能50%→ROE + 市值硬门槛→各市场独立TOP20；缺失数据不估算','ttl_seconds':SCAN_CACHE_TTL,
+                                     'scanner':'background filtered + parallel batched scan + fundamental gate','scan_group':job.get('scan_group','all'),'scan_group_label':SCAN_GROUPS.get(job.get('scan_group','all'),SCAN_GROUPS['all'])['label'],'scan_config':{'batch_size':SCAN_BATCH_SIZE,'workers':SCAN_WORKERS,'fundamental_workers':FUNDAMENTAL_WORKERS,'fundamental_candidates_per_market':FUNDAMENTAL_CANDIDATES,'market_cap_min':MARKET_CAP_MIN,'fundamental_gate':f'ROE >= {ROE_MIN_PCT:g}% + market cap minimum (hard gate)'},
             'fundamental_candidates':job.get('fundamental_candidates',0),'fundamental_passed':job.get('fundamental_passed',0),
             'otc_counts':job.get('otc_counts',{}),'cap_rejected':job.get('cap_rejected',{})},
                     'results_by_market':ranked,'sector_rotation':{mk:_sector_rank([x for x in job['rows'] if x.get('market')==mk],10) for mk in job['selected_markets']},
